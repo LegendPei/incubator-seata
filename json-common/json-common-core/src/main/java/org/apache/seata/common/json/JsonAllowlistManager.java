@@ -27,6 +27,10 @@ public class JsonAllowlistManager {
 
     private static final JsonAllowlistManager INSTANCE = new JsonAllowlistManager();
 
+    private static final int MAX_CLASS_NAME_LENGTH = 1024;
+
+    private static final int MAX_CACHE_SIZE = 4096;
+
     /**
      * Built-in exact match allowlist
      */
@@ -107,10 +111,18 @@ public class JsonAllowlistManager {
      * Check if a class is allowed for deserialization
      */
     public boolean isAllowed(String className) {
-        if (className == null) {
+        if (className == null || className.length() > MAX_CLASS_NAME_LENGTH) {
             return false;
         }
-        return cache.computeIfAbsent(className, this::doCheck);
+        if (cache.get(className) != null) {
+            return true;
+        }
+
+        boolean allowed = doCheck(className);
+        if (allowed) {
+            cacheAllowedClass(className);
+        }
+        return allowed;
     }
 
     /**
@@ -141,6 +153,14 @@ public class JsonAllowlistManager {
         }
         String componentClassName = extractArrayComponentClassName(className);
         return componentClassName != null && isExactOrPrefixAllowed(componentClassName);
+    }
+
+    private void cacheAllowedClass(String className) {
+        synchronized (cache) {
+            if (cache.size() < MAX_CACHE_SIZE) {
+                cache.put(className, Boolean.TRUE);
+            }
+        }
     }
 
     /**
