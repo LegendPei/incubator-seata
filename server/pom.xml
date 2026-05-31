@@ -194,10 +194,9 @@
             <artifactId>h2</artifactId>
             <scope>test</scope>
         </dependency>
-       <!--  if you run seata-server in IDE and use mysql8 as session store, please rewrite version to ${mysql8.jdbc.version}-->
         <dependency>
-            <groupId>mysql</groupId>
-            <artifactId>mysql-connector-java</artifactId>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
             <scope>test</scope>
         </dependency>
 <!--        <dependency>
@@ -335,31 +334,6 @@
                             <skip>${dependencies.copy.skip}</skip>
                         </configuration>
                     </execution>
-                    <execution>
-                        <id>copy-mysql</id>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>copy</goal>
-                        </goals>
-                        <configuration>
-                            <artifactItems>
-                                <artifactItem>
-                                    <groupId>mysql</groupId>
-                                    <artifactId>mysql-connector-java</artifactId>
-                                    <version>${mysql.jdbc.version}</version>
-                                </artifactItem>
-                                <artifactItem>
-                                    <groupId>mysql</groupId>
-                                    <artifactId>mysql-connector-java</artifactId>
-                                    <version>${mysql8.jdbc.version}</version>
-                                </artifactItem>
-                            </artifactItems>
-                            <outputDirectory>
-                                ${project.build.directory}/lib/jdbc
-                            </outputDirectory>
-                            <skip>${mysql.copy.skip}</skip>
-                        </configuration>
-                    </execution>
                 </executions>
             </plugin>
             <plugin>
@@ -419,10 +393,6 @@
                     </container>
                     <extraDirectories>
                         <paths>
-                            <path>
-                                <from>target/lib/jdbc</from>
-                                <into>/seata-server/libs/jdbc</into>
-                            </path>
                             <path>
                                 <from>src/main/resources/docker</from>
                                 <includes>seata-server-entrypoint.sh</includes>
@@ -494,8 +464,6 @@
         <profile>
             <id>release-seata</id>
             <properties>
-                <mysql.jdbc.version>5.1.42</mysql.jdbc.version>
-                <mysql8.jdbc.version>8.0.27</mysql8.jdbc.version>
                 <dependencies.copy.skip>false</dependencies.copy.skip>
             </properties>
             <build>

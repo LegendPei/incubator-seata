@@ -18,9 +18,8 @@ package org.apache.seata.rm.datasource.xa;
 
 import com.alibaba.druid.pool.DruidDataSource;
 import com.kingbase8.xa.KBXAConnection;
-import com.mysql.jdbc.JDBC4MySQLConnection;
-import com.mysql.jdbc.jdbc2.optional.JDBC4ConnectionWrapper;
-import com.mysql.jdbc.jdbc2.optional.MysqlXAConnection;
+import com.mysql.cj.jdbc.JdbcConnection;
+import com.mysql.cj.jdbc.MysqlXAConnection;
 import com.oscar.xa.Jdbc3XAConnection;
 import org.apache.seata.core.constants.DBType;
 import org.apache.seata.core.context.RootContext;
@@ -73,9 +72,9 @@ public class DataSourceProxyXATest {
     @Test
     public void testGetConnection() throws SQLException, ClassNotFoundException {
         XAConnection xaConnection =
-                testGetXaConnection(MysqlXAConnection.class, "jdbc:mysql:xxx", JDBC4MySQLConnection.class.getName());
+                testGetXaConnection(MysqlXAConnection.class, "jdbc:mysql:xxx", JdbcConnection.class.getName());
         Connection connectionInXA = xaConnection.getConnection();
-        Assertions.assertTrue(connectionInXA instanceof JDBC4ConnectionWrapper);
+        Assertions.assertTrue(connectionInXA instanceof JdbcConnection);
         tearDown();
     }
 
@@ -166,7 +165,7 @@ public class DataSourceProxyXATest {
                     .when(() -> CombineConnectionHolder.get(any(DataSource.class)))
                     .thenReturn(combineConn);
             Driver driver = mock(Driver.class);
-            JDBC4MySQLConnection connection = mock(JDBC4MySQLConnection.class);
+            JdbcConnection connection = mock(JdbcConnection.class);
             Mockito.when(connection.getAutoCommit()).thenReturn(true);
             DatabaseMetaData metaData = mock(DatabaseMetaData.class);
             Mockito.when(metaData.getURL()).thenReturn("jdbc:mysql:xxx");
