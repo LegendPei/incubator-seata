@@ -272,6 +272,18 @@ public class JsonAllowlistManagerTest {
     }
 
     @Test
+    public void testCheckClass_overlongNameIsTruncatedInMessage() {
+        JsonAllowlistManager manager = JsonAllowlistManager.getInstance();
+        String className = buildClassName(1100);
+
+        assertThatThrownBy(() -> manager.checkClass(className))
+                .isInstanceOf(SecurityException.class)
+                .hasMessageContaining("not in JSON deserialization allowlist")
+                .hasMessageContaining("truncated, length=1100")
+                .hasMessageNotContaining(className);
+    }
+
+    @Test
     public void testCheckClass_userAllowed() {
         JsonAllowlistManager manager = JsonAllowlistManager.getInstance();
 

@@ -29,6 +29,8 @@ public class JsonAllowlistManager {
 
     private static final int MAX_CLASS_NAME_LENGTH = 1024;
 
+    private static final int MAX_REPORTED_CLASS_NAME_LENGTH = 256;
+
     private static final int MAX_CACHE_SIZE = 4096;
 
     /**
@@ -130,8 +132,8 @@ public class JsonAllowlistManager {
      */
     public void checkClass(String className) {
         if (!isAllowed(className)) {
-            throw new SecurityException("Class not in JSON deserialization allowlist: " + className
-                    + ". Please add it to seata.json.allowlist configuration.");
+            throw new SecurityException("Class not in JSON deserialization allowlist: "
+                    + formatClassNameForMessage(className) + ". Please add it to seata.json.allowlist configuration.");
         }
     }
 
@@ -161,6 +163,16 @@ public class JsonAllowlistManager {
                 cache.put(className, Boolean.TRUE);
             }
         }
+    }
+
+    private String formatClassNameForMessage(String className) {
+        if (className == null || className.length() <= MAX_REPORTED_CLASS_NAME_LENGTH) {
+            return String.valueOf(className);
+        }
+        return className.substring(0, MAX_REPORTED_CLASS_NAME_LENGTH)
+                + "...(truncated, length="
+                + className.length()
+                + ")";
     }
 
     /**
