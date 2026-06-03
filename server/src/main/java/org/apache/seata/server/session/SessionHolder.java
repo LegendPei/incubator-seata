@@ -34,6 +34,7 @@ import org.apache.seata.core.store.DistributedLocker;
 import org.apache.seata.server.cluster.raft.RaftServerManager;
 import org.apache.seata.server.cluster.raft.context.SeataClusterContext;
 import org.apache.seata.server.lock.distributed.DistributedLockerFactory;
+import org.apache.seata.server.store.FileStoreEngine;
 import org.apache.seata.server.store.StoreConfig;
 import org.apache.seata.server.store.VGroupMappingStoreManager;
 import org.slf4j.Logger;
@@ -121,6 +122,10 @@ public class SessionHolder {
                 RaftServerManager.init();
                 RaftServerManager.start();
             } else {
+                FileStoreEngine fileStoreEngine = StoreConfig.getFileEngine();
+                if (FileStoreEngine.ROCKSDB == fileStoreEngine) {
+                    throw new StoreException("RocksDB file engine is not implemented in Phase1");
+                }
                 String vGroupMappingStorePath =
                         CONFIG.getConfig(ConfigurationKeys.STORE_FILE_DIR, DEFAULT_VGROUP_MAPPING_STORE_FILE_DIR)
                                 + separator

@@ -17,6 +17,7 @@
 package org.apache.seata.server.session;
 
 import org.apache.seata.common.XID;
+import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.store.SessionMode;
 import org.apache.seata.core.constants.ConfigurationKeys;
 import org.apache.seata.server.BaseSpringBootTest;
@@ -76,8 +77,23 @@ public class SessionHolderTest extends BaseSpringBootTest {
         }
     }
 
+    @Test
+    @Order(2)
+    public void testRocksDBFileEngineFailFastInPhase1() {
+        System.setProperty(ConfigurationKeys.STORE_FILE_ENGINE, "rocksdb");
+        try {
+            StoreException exception =
+                    Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+            Assertions.assertTrue(exception.getMessage().contains("RocksDB file engine is not implemented in Phase1"));
+        } finally {
+            System.clearProperty(ConfigurationKeys.STORE_FILE_ENGINE);
+            SessionHolder.destroy();
+        }
+    }
+
     @AfterEach
     public void after() {
+        System.clearProperty(ConfigurationKeys.STORE_FILE_ENGINE);
         final File actual = new File(pathname);
         if (actual.exists()) {
             actual.delete();
