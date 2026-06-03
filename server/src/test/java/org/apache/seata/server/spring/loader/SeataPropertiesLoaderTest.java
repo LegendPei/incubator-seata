@@ -18,6 +18,7 @@ package org.apache.seata.server.spring.loader;
 
 import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
+import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.server.store.StoreConfig;
@@ -29,17 +30,22 @@ import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.lang.reflect.Field;
+import java.util.Map;
 
 class SeataPropertiesLoaderTest {
 
+    private Object originalEnvironment;
+
     @BeforeEach
     void beforeEach() throws Exception {
+        originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
         clearConfig();
     }
 
     @AfterEach
     void afterEach() throws Exception {
         clearConfig();
+        restoreEnvironment();
     }
 
     @Test
@@ -60,6 +66,14 @@ class SeataPropertiesLoaderTest {
         Assertions.assertEquals("rocksdb", System.getProperty("lockMode"));
     }
 
+    @Test
+    void testLoadEffectiveLockModeRejectsMixedLockMode() {
+        System.setProperty(ConfigurationKeys.STORE_FILE_ENGINE, "rocksdb");
+        System.setProperty(ConfigurationKeys.STORE_LOCK_MODE, "file");
+
+        Assertions.assertThrows(StoreException.class, () -> new SeataPropertiesLoader().loadSessionAndLockModes());
+    }
+
     private void clearConfig() throws Exception {
         System.clearProperty("sessionMode");
         System.clearProperty("lockMode");
@@ -77,5 +91,17 @@ class SeataPropertiesLoaderTest {
         Field field = StoreConfig.class.getDeclaredField(fieldName);
         field.setAccessible(true);
         field.set(null, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void restoreEnvironment() throws Exception {
+        Field field = ObjectHolder.class.getDeclaredField("OBJECT_MAP");
+        field.setAccessible(true);
+        Map<String, Object> objectMap = (Map<String, Object>) field.get(ObjectHolder.INSTANCE);
+        if (originalEnvironment == null) {
+            objectMap.remove(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        } else {
+            objectMap.put(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, originalEnvironment);
+        }
     }
 }

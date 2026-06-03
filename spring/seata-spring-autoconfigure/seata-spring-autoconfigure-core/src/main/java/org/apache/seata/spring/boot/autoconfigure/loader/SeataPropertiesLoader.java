@@ -96,10 +96,15 @@ public class SeataPropertiesLoader implements ApplicationContextInitializer<Conf
             Optional<String> lockMode = invokeEnumMethod(storeConfigClass, "getEffectiveLockMode", "getName");
             sessionMode.ifPresent(value -> System.setProperty("sessionMode", value));
             lockMode.ifPresent(value -> System.setProperty("lockMode", value));
-        } catch (ClassNotFoundException
-                | NoSuchMethodException
-                | InvocationTargetException
-                | IllegalAccessException e) {
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+        } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException e) {
             // The exception is not printed because it is an expected behavior and does not affect the normal operation
             // of the program.
             // StoreConfig only exists on the server side
