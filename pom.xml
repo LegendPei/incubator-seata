@@ -191,6 +191,8 @@
             <properties>
                 <image.publish.skip>false</image.publish.skip>
                 <dependencies.copy.skip>false</dependencies.copy.skip>
+                <mysql.copy.skip>false</mysql.copy.skip>
+                <mysql.jdbc.version>8.2.0</mysql.jdbc.version>
                 <maven.git-commit-id.skip>false</maven.git-commit-id.skip>
             </properties>
         </profile>

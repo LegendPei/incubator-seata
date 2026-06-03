@@ -334,6 +334,26 @@
                             <skip>${dependencies.copy.skip}</skip>
                         </configuration>
                     </execution>
+                    <execution>
+                        <id>copy-mysql</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>com.mysql</groupId>
+                                    <artifactId>mysql-connector-j</artifactId>
+                                    <version>${mysql.jdbc.version}</version>
+                                </artifactItem>
+                            </artifactItems>
+                            <outputDirectory>
+                                ${project.build.directory}/lib/jdbc
+                            </outputDirectory>
+                            <skip>${mysql.copy.skip}</skip>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
             <plugin>
@@ -393,6 +413,10 @@
                     </container>
                     <extraDirectories>
                         <paths>
+                            <path>
+                                <from>target/lib/jdbc</from>
+                                <into>/seata-server/libs/jdbc</into>
+                            </path>
                             <path>
                                 <from>src/main/resources/docker</from>
                                 <includes>seata-server-entrypoint.sh</includes>
