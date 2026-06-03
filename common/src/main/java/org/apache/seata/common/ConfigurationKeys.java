@@ -139,6 +139,21 @@ public interface ConfigurationKeys {
     String STORE_FILE_DIR = STORE_FILE_PREFIX + "dir";
 
     /**
+     * The constant STORE_FILE_ENGINE
+     */
+    String STORE_FILE_ENGINE = STORE_FILE_PREFIX + "engine";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_PREFIX
+     */
+    String STORE_FILE_ROCKSDB_PREFIX = STORE_FILE_PREFIX + "rocksdb.";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_DIR
+     */
+    String STORE_FILE_ROCKSDB_DIR = STORE_FILE_ROCKSDB_PREFIX + "dir";
+
+    /**
      * The constant SERVICE_GROUP_MAPPING_PREFIX.
      */
     String SERVICE_GROUP_MAPPING_PREFIX = SERVICE_PREFIX + "vgroupMapping.";

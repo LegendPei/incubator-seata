@@ -14,57 +14,34 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.seata.common.store;
+package org.apache.seata.server.store;
 
-public enum LockMode {
+/**
+ * The file store engine inside file mode.
+ */
+public enum FileStoreEngine {
     /**
-     * The File store mode.
+     * The default file log engine.
      */
     FILE("file"),
     /**
-     * The Db store mode.
-     */
-    DB("db"),
-    /**
-     * The Redis store mode.
-     */
-    REDIS("redis"),
-    /**
-     * raft store
-     */
-    RAFT("raft"),
-    /**
-     * RocksDB lock mode for file store engine.
+     * The RocksDB engine.
      */
     ROCKSDB("rocksdb");
 
-    private String name;
+    private final String name;
 
-    LockMode(String name) {
+    FileStoreEngine(String name) {
         this.name = name;
     }
 
-    public static LockMode get(String name) {
-        for (LockMode mode : LockMode.values()) {
-            if (mode.getName().equalsIgnoreCase(name)) {
-                return mode;
+    public static FileStoreEngine get(String name) {
+        for (FileStoreEngine engine : FileStoreEngine.values()) {
+            if (engine.getName().equalsIgnoreCase(name)) {
+                return engine;
             }
         }
-        throw new IllegalArgumentException("unknown lock mode:" + name);
-    }
-
-    /**
-     * whether contains value of store mode
-     *
-     * @param name the mode name
-     * @return the boolean
-     */
-    public static boolean contains(String name) {
-        try {
-            return get(name) != null ? true : false;
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
+        throw new IllegalArgumentException("unknown file store engine:" + name);
     }
 
     public String getName() {

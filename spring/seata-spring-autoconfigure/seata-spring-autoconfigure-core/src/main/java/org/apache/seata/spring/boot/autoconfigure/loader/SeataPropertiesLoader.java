@@ -93,7 +93,7 @@ public class SeataPropertiesLoader implements ApplicationContextInitializer<Conf
         try {
             Class<?> storeConfigClass = Class.forName("org.apache.seata.server.store.StoreConfig");
             Optional<String> sessionMode = invokeEnumMethod(storeConfigClass, "getSessionMode", "getName");
-            Optional<String> lockMode = invokeEnumMethod(storeConfigClass, "getLockMode", "getName");
+            Optional<String> lockMode = invokeEnumMethod(storeConfigClass, "getEffectiveLockMode", "getName");
             sessionMode.ifPresent(value -> System.setProperty("sessionMode", value));
             lockMode.ifPresent(value -> System.setProperty("lockMode", value));
         } catch (ClassNotFoundException
