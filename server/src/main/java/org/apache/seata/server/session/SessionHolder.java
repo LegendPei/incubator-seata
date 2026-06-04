@@ -33,7 +33,12 @@ import org.apache.seata.core.store.DistributedLockDO;
 import org.apache.seata.core.store.DistributedLocker;
 import org.apache.seata.server.cluster.raft.RaftServerManager;
 import org.apache.seata.server.cluster.raft.context.SeataClusterContext;
+import org.apache.seata.server.lock.LockManager;
+import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.lock.distributed.DistributedLockerFactory;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
+import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
+import org.apache.seata.server.storage.rocksdb.migration.RocksDBMigrationService;
 import org.apache.seata.server.store.FileStoreEngine;
 import org.apache.seata.server.store.StoreConfig;
 import org.apache.seata.server.store.VGroupMappingStoreManager;
@@ -41,6 +46,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Paths;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -123,9 +129,6 @@ public class SessionHolder {
                 RaftServerManager.start();
             } else {
                 FileStoreEngine fileStoreEngine = StoreConfig.getFileEngine();
-                if (FileStoreEngine.ROCKSDB == fileStoreEngine) {
-                    throw new StoreException("RocksDB file engine is not implemented in Phase1");
-                }
                 String vGroupMappingStorePath =
                         CONFIG.getConfig(ConfigurationKeys.STORE_FILE_DIR, DEFAULT_VGROUP_MAPPING_STORE_FILE_DIR)
                                 + separator
@@ -142,15 +145,24 @@ public class SessionHolder {
                         SessionMode.FILE.getName(),
                         new Object[] {vGroupMappingStorePath});
 
-                ROOT_SESSION_MANAGER =
-                        EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
-                            ROOT_SESSION_MANAGER_NAME, sessionStorePath
-                        });
-                ROOT_SESSION_MANAGER =
-                        EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
-                            ROOT_SESSION_MANAGER_NAME, sessionStorePath
-                        });
-                reload(sessionMode);
+                if (FileStoreEngine.ROCKSDB == fileStoreEngine) {
+                    new RocksDBMigrationService()
+                            .migrate(
+                                    Paths.get(sessionStorePath, ROOT_SESSION_MANAGER_NAME),
+                                    RocksDBStoreEngineFactory.getInstance());
+                    ROOT_SESSION_MANAGER = EnhancedServiceLoader.load(
+                            SessionManager.class,
+                            FileStoreEngine.ROCKSDB.getName(),
+                            new Object[] {ROOT_SESSION_MANAGER_NAME});
+                    cleanRocksDBOrphanLocks();
+                    reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
+                } else {
+                    ROOT_SESSION_MANAGER =
+                            EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
+                                ROOT_SESSION_MANAGER_NAME, sessionStorePath
+                            });
+                    reload(sessionMode);
+                }
             }
         } else if (SessionMode.REDIS.equals(sessionMode)) {
             ROOT_SESSION_MANAGER = EnhancedServiceLoader.load(SessionManager.class, SessionMode.REDIS.getName());
@@ -163,14 +175,27 @@ public class SessionHolder {
         }
     }
 
+    private static void cleanRocksDBOrphanLocks() {
+        LockManager lockManager = LockerManagerFactory.getLockManager();
+        if (!(lockManager instanceof RocksDBLockManager)) {
+            return;
+        }
+        int cleaned = ((RocksDBLockManager) lockManager).cleanOrphanLocks();
+        if (cleaned > 0) {
+            LOGGER.warn("Cleaned RocksDB orphan locks, count:{}", cleaned);
+        }
+    }
+
     /**
      * Reload.
      *
      * @param sessionMode the mode of store
      */
     protected static void reload(SessionMode sessionMode) {
-        if (sessionMode == SessionMode.FILE) {
+        if (sessionMode == SessionMode.FILE && ROOT_SESSION_MANAGER instanceof Reloadable) {
             ((Reloadable) ROOT_SESSION_MANAGER).reload();
+            reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
+        } else if (sessionMode == SessionMode.FILE) {
             reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
         } else {
             reload(null, sessionMode);
@@ -214,6 +239,8 @@ public class SessionHolder {
                     case CommitFailed:
                     case RollbackFailed:
                     case TimeoutRollbackFailed:
+                    case CommitRetryTimeout:
+                    case RollbackRetryTimeout:
                         removeInErrorState(globalSession);
                         break;
                     case AsyncCommitting:
