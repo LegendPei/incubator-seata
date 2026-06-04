@@ -17,6 +17,7 @@
 package org.apache.seata.server.session;
 
 import org.apache.seata.common.Constants;
+import org.apache.seata.common.XID;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.common.store.SessionMode;
 import org.apache.seata.config.ConfigurationCache;
@@ -25,8 +26,11 @@ import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
 import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.lock.LockerManagerFactory;
+import org.apache.seata.server.storage.file.TransactionWriteStore;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
+import org.apache.seata.server.store.SessionStorable;
+import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -34,8 +38,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.mock.env.MockEnvironment;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Collections;
 import java.util.Map;
 
@@ -89,6 +97,19 @@ class SessionHolderRocksDBTest {
         Assertions.assertFalse(LockerManagerFactory.getLockManager().acquireLock(conflict));
     }
 
+    @Test
+    void testRocksDBFileEngineMigratesFileSessionLog() throws Exception {
+        configureRocksDBFileMode();
+        GlobalSession globalSession = globalSession(2001L);
+        appendFileLog(globalSession, LogOperation.GLOBAL_ADD);
+
+        SessionHolder.init(SessionMode.FILE);
+
+        GlobalSession actual = SessionHolder.getRootSessionManager().findGlobalSession(globalSession.getXid(), true);
+        Assertions.assertNotNull(actual);
+        Assertions.assertEquals(globalSession.getXid(), actual.getXid());
+    }
+
     private void configureRocksDBFileMode() {
         System.setProperty(
                 ConfigurationKeys.STORE_FILE_DIR, tempDir.resolve("file").toString());
@@ -99,9 +120,15 @@ class SessionHolderRocksDBTest {
     }
 
     private GlobalSession globalSession(BranchSession branchSession) {
-        GlobalSession globalSession = new GlobalSession("app", "group", "tx", 60000);
+        GlobalSession globalSession = globalSession(branchSession.getTransactionId());
         globalSession.setXid(branchSession.getXid());
-        globalSession.setTransactionId(branchSession.getTransactionId());
+        return globalSession;
+    }
+
+    private GlobalSession globalSession(long transactionId) {
+        GlobalSession globalSession = new GlobalSession("app", "group", "tx", 60000);
+        globalSession.setXid("127.0.0.1:8091:" + transactionId);
+        globalSession.setTransactionId(transactionId);
         globalSession.setStatus(GlobalStatus.Begin);
         return globalSession;
     }
@@ -115,6 +142,18 @@ class SessionHolderRocksDBTest {
         branchSession.setResourceId("jdbc:mysql://127.0.0.1/db");
         branchSession.setLockKey(lockKey);
         return branchSession;
+    }
+
+    private void appendFileLog(SessionStorable session, LogOperation logOperation) throws IOException {
+        byte[] data = new TransactionWriteStore(session, logOperation).encode();
+        ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES + data.length);
+        buffer.putInt(data.length);
+        buffer.put(data);
+        Path fileLog = tempDir.resolve("file")
+                .resolve(String.valueOf(XID.getPort()))
+                .resolve(SessionHolder.ROOT_SESSION_MANAGER_NAME);
+        Files.createDirectories(fileLog.getParent());
+        Files.write(fileLog, buffer.array(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
     @SuppressWarnings("unchecked")
