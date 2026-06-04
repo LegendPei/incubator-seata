@@ -80,6 +80,36 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testOpenRejectsUnsupportedFormatVersion() {
+        RocksDBStoreConfig config = config("metadata-unsupported", true);
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    "format_version".getBytes(StandardCharsets.UTF_8),
+                    Integer.toString(RocksDBStoreEngine.FORMAT_VERSION + 1).getBytes(StandardCharsets.UTF_8));
+        }
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, () -> RocksDBStoreEngine.open(config));
+
+        Assertions.assertTrue(exception.getMessage().contains("unsupported RocksDB format version"));
+    }
+
+    @Test
+    void testOpenRejectsInvalidFormatVersion() {
+        RocksDBStoreConfig config = config("metadata-invalid", true);
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    "format_version".getBytes(StandardCharsets.UTF_8),
+                    "invalid".getBytes(StandardCharsets.UTF_8));
+        }
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, () -> RocksDBStoreEngine.open(config));
+
+        Assertions.assertTrue(exception.getMessage().contains("invalid RocksDB format version metadata"));
+    }
+
+    @Test
     void testFactoryReturnsSharedInstanceForSamePath() {
         RocksDBStoreConfig config = config("factory", true);
 

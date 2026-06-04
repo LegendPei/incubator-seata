@@ -118,7 +118,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         if (value == null) {
             return null;
         }
-        GlobalSession globalSession = decodeGlobalSession(value);
+        GlobalSession globalSession = decodeGlobalSession(value, !withBranchSessions);
         if (withBranchSessions) {
             readBranchSessions(xid).forEach(globalSession::add);
         }
@@ -214,7 +214,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         List<GlobalSession> result = new ArrayList<>();
         for (RocksDBStoreEngine.RocksDBEntry entry :
                 storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])) {
-            GlobalSession globalSession = decodeGlobalSession(entry.getValue());
+            GlobalSession globalSession = decodeGlobalSession(entry.getValue(), sessionCondition.isLazyLoadBranch());
             if (matches(globalSession, sessionCondition)) {
                 if (!sessionCondition.isLazyLoadBranch()) {
                     readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
@@ -255,12 +255,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return RocksDBValueCodec.encode(RocksDBValueCodec.ValueType.BRANCH_SESSION, session.encode());
     }
 
-    private GlobalSession decodeGlobalSession(byte[] value) {
+    private GlobalSession decodeGlobalSession(byte[] value, boolean lazyLoadBranch) {
         RocksDBValueCodec.DecodedValue decodedValue = RocksDBValueCodec.decode(value);
         if (decodedValue.getType() != RocksDBValueCodec.ValueType.GLOBAL_SESSION) {
             throw new StoreException("unexpected RocksDB value type for global session:" + decodedValue.getType());
         }
-        GlobalSession globalSession = new GlobalSession();
+        GlobalSession globalSession = new GlobalSession(null, null, null, 0, lazyLoadBranch);
         globalSession.decode(decodedValue.getPayload());
         return globalSession;
     }

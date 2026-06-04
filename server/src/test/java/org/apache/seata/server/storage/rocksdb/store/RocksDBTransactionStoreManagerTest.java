@@ -25,10 +25,13 @@ import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionManager;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -48,17 +51,22 @@ class RocksDBTransactionStoreManagerTest {
     Path tempDir;
 
     private Object originalEnvironment;
+    private SessionManager originalRootSessionManager;
+    private Map<String, SessionManager> originalSessionManagerMap;
 
     @BeforeEach
-    void beforeEach() {
+    void beforeEach() throws Exception {
         originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
         ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
         ConfigurationCache.clear();
+        originalRootSessionManager = getRootSessionManager();
+        originalSessionManagerMap = getSessionManagerMap();
     }
 
     @AfterEach
     void afterEach() throws Exception {
         ConfigurationCache.clear();
+        restoreSessionHolder();
         restoreEnvironment();
     }
 
@@ -74,7 +82,7 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertNotNull(actual);
             Assertions.assertEquals(globalSession.getXid(), actual.getXid());
             Assertions.assertEquals(GlobalStatus.Begin, actual.getStatus());
-            Assertions.assertTrue(actual.getBranchSessions().isEmpty());
+            Assertions.assertTrue(actual.isLazyLoadBranch());
         }
     }
 
@@ -141,6 +149,33 @@ class RocksDBTransactionStoreManagerTest {
 
             Assertions.assertEquals(1, actual.size());
             Assertions.assertEquals(begin.getXid(), actual.get(0).getXid());
+        }
+    }
+
+    @Test
+    void testLazyReadLoadsRetryBranchesOnDemand() throws Exception {
+        try (RocksDBStoreEngine engine = open("lazy-retry-branches")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            setRootSessionManager(new RocksDBSessionManager("root.data", engine));
+            GlobalSession committing = globalSession("tx-commit-retry", GlobalStatus.CommitRetrying);
+            GlobalSession rollbacking = globalSession("tx-rollbacking", GlobalStatus.Rollbacking);
+            BranchSession committingBranch = branchSession(committing, 1L);
+            BranchSession rollbackingBranch = branchSession(rollbacking, 2L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committing);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, committingBranch);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbacking);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, rollbackingBranch);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.CommitRetrying, GlobalStatus.Rollbacking);
+            condition.setLazyLoadBranch(true);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(2, actual.size());
+            for (GlobalSession globalSession : actual) {
+                Assertions.assertTrue(globalSession.isLazyLoadBranch());
+                Assertions.assertEquals(1, globalSession.getBranchSessions().size());
+            }
         }
     }
 
@@ -227,5 +262,36 @@ class RocksDBTransactionStoreManagerTest {
         } else {
             objectMap.put(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, originalEnvironment);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, SessionManager> getSessionManagerMap() throws Exception {
+        Field field = SessionHolder.class.getDeclaredField("SESSION_MANAGER_MAP");
+        field.setAccessible(true);
+        return (Map<String, SessionManager>) field.get(null);
+    }
+
+    private SessionManager getRootSessionManager() throws Exception {
+        Field field = SessionHolder.class.getDeclaredField("ROOT_SESSION_MANAGER");
+        field.setAccessible(true);
+        return (SessionManager) field.get(null);
+    }
+
+    private void setRootSessionManager(SessionManager sessionManager) throws Exception {
+        Field rootField = SessionHolder.class.getDeclaredField("ROOT_SESSION_MANAGER");
+        rootField.setAccessible(true);
+        rootField.set(null, sessionManager);
+        Field mapField = SessionHolder.class.getDeclaredField("SESSION_MANAGER_MAP");
+        mapField.setAccessible(true);
+        mapField.set(null, null);
+    }
+
+    private void restoreSessionHolder() throws Exception {
+        Field rootField = SessionHolder.class.getDeclaredField("ROOT_SESSION_MANAGER");
+        rootField.setAccessible(true);
+        rootField.set(null, originalRootSessionManager);
+        Field mapField = SessionHolder.class.getDeclaredField("SESSION_MANAGER_MAP");
+        mapField.setAccessible(true);
+        mapField.set(null, originalSessionManagerMap);
     }
 }

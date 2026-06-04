@@ -66,31 +66,59 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     private RocksDBStoreEngine(RocksDBStoreConfig config) {
         this.config = config;
+        DBOptions openedDbOptions = null;
+        ColumnFamilyOptions openedColumnFamilyOptions = null;
+        ReadOptions openedReadOptions = null;
+        WriteOptions openedWriteOptions = null;
+        RocksDB openedDb = null;
+        List<ColumnFamilyHandle> openedHandles = new ArrayList<>();
+        Map<RocksDBColumnFamily, ColumnFamilyHandle> openedHandleMap = new EnumMap<>(RocksDBColumnFamily.class);
         try {
             Files.createDirectories(Paths.get(config.getDbPath()));
-            dbOptions = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
-            columnFamilyOptions = new ColumnFamilyOptions();
-            readOptions = new ReadOptions();
-            writeOptions = new WriteOptions().setDisableWAL(false).setSync(config.isSyncWrite());
+            openedDbOptions = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
+            openedColumnFamilyOptions = new ColumnFamilyOptions();
+            openedReadOptions = new ReadOptions();
+            openedWriteOptions = new WriteOptions().setDisableWAL(false).setSync(config.isSyncWrite());
 
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
             for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
-                descriptors.add(new ColumnFamilyDescriptor(columnFamily.getNameBytes(), columnFamilyOptions));
+                descriptors.add(new ColumnFamilyDescriptor(columnFamily.getNameBytes(), openedColumnFamilyOptions));
             }
 
-            List<ColumnFamilyHandle> openedHandles = new ArrayList<>();
-            db = RocksDB.open(dbOptions, config.getDbPath(), descriptors, openedHandles);
+            openedDb = RocksDB.open(openedDbOptions, config.getDbPath(), descriptors, openedHandles);
             for (int i = 0; i < RocksDBColumnFamily.values().length; i++) {
-                handles.put(RocksDBColumnFamily.values()[i], openedHandles.get(i));
+                openedHandleMap.put(RocksDBColumnFamily.values()[i], openedHandles.get(i));
             }
-            initMetadata();
+            initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
+            dbOptions = openedDbOptions;
+            columnFamilyOptions = openedColumnFamilyOptions;
+            readOptions = openedReadOptions;
+            writeOptions = openedWriteOptions;
+            db = openedDb;
+            handles.putAll(openedHandleMap);
             LOGGER.info(
                     "RocksDB file store engine opened, path:{}, columnFamilies:{}, formatVersion:{}, syncWrite:{}",
                     config.getDbPath(),
                     handles.keySet(),
                     FORMAT_VERSION,
                     config.isSyncWrite());
+        } catch (StoreException e) {
+            closeQuietly(
+                    openedHandles,
+                    openedDb,
+                    openedWriteOptions,
+                    openedReadOptions,
+                    openedColumnFamilyOptions,
+                    openedDbOptions);
+            throw e;
         } catch (Exception e) {
+            closeQuietly(
+                    openedHandles,
+                    openedDb,
+                    openedWriteOptions,
+                    openedReadOptions,
+                    openedColumnFamilyOptions,
+                    openedDbOptions);
             throw new StoreException(e, "open RocksDB file store engine failed, path:" + config.getDbPath());
         }
     }
@@ -188,14 +216,53 @@ public class RocksDBStoreEngine implements AutoCloseable {
         dbOptions.close();
     }
 
-    private void initMetadata() throws RocksDBException {
-        byte[] existing = db.get(handle(RocksDBColumnFamily.METADATA), FORMAT_VERSION_KEY);
+    private static void initMetadata(RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions)
+            throws RocksDBException {
+        byte[] existing = db.get(metadataHandle, FORMAT_VERSION_KEY);
         if (existing == null) {
             db.put(
-                    handle(RocksDBColumnFamily.METADATA),
+                    metadataHandle,
                     writeOptions,
                     FORMAT_VERSION_KEY,
                     Integer.toString(FORMAT_VERSION).getBytes(StandardCharsets.UTF_8));
+            return;
+        }
+        int existingFormatVersion;
+        try {
+            existingFormatVersion = Integer.parseInt(new String(existing, StandardCharsets.UTF_8));
+        } catch (NumberFormatException e) {
+            throw new StoreException(e, "invalid RocksDB format version metadata");
+        }
+        if (existingFormatVersion != FORMAT_VERSION) {
+            throw new StoreException(
+                    "unsupported RocksDB format version:" + existingFormatVersion + ", expected:" + FORMAT_VERSION);
+        }
+    }
+
+    private static void closeQuietly(
+            List<ColumnFamilyHandle> handles,
+            RocksDB db,
+            WriteOptions writeOptions,
+            ReadOptions readOptions,
+            ColumnFamilyOptions columnFamilyOptions,
+            DBOptions dbOptions) {
+        for (ColumnFamilyHandle handle : handles) {
+            handle.close();
+        }
+        if (db != null) {
+            db.close();
+        }
+        if (writeOptions != null) {
+            writeOptions.close();
+        }
+        if (readOptions != null) {
+            readOptions.close();
+        }
+        if (columnFamilyOptions != null) {
+            columnFamilyOptions.close();
+        }
+        if (dbOptions != null) {
+            dbOptions.close();
         }
     }
 

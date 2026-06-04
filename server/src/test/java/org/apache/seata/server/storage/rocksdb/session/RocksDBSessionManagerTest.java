@@ -121,9 +121,21 @@ class RocksDBSessionManagerTest {
             RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine);
             GlobalSession begin = globalSession("tx-begin", GlobalStatus.Begin);
             GlobalSession committed = globalSession("tx-committed", GlobalStatus.Committed);
+            GlobalSession commitRetryTimeout =
+                    globalSession("tx-commit-retry-timeout", GlobalStatus.CommitRetryTimeout);
+            GlobalSession rollbacked = globalSession("tx-rollbacked", GlobalStatus.Rollbacked);
+            GlobalSession rollbackRetryTimeout =
+                    globalSession("tx-rollback-retry-timeout", GlobalStatus.RollbackRetryTimeout);
+            GlobalSession timeoutRollbacked = globalSession("tx-timeout-rollbacked", GlobalStatus.TimeoutRollbacked);
+            GlobalSession finished = globalSession("tx-finished", GlobalStatus.Finished);
 
             sessionManager.addGlobalSession(begin);
             sessionManager.addGlobalSession(committed);
+            sessionManager.addGlobalSession(commitRetryTimeout);
+            sessionManager.addGlobalSession(rollbacked);
+            sessionManager.addGlobalSession(rollbackRetryTimeout);
+            sessionManager.addGlobalSession(timeoutRollbacked);
+            sessionManager.addGlobalSession(finished);
 
             SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
             condition.setLazyLoadBranch(true);
@@ -138,9 +150,14 @@ class RocksDBSessionManagerTest {
             Assertions.assertEquals(committed.getXid(), byTransactionId.get(0).getXid());
 
             Collection<GlobalSession> allSessions = sessionManager.allSessions();
-            Assertions.assertEquals(1, allSessions.size());
-            Assertions.assertEquals(
-                    begin.getXid(), allSessions.iterator().next().getXid());
+            Assertions.assertEquals(7, allSessions.size());
+            Assertions.assertTrue(contains(allSessions, begin));
+            Assertions.assertTrue(contains(allSessions, committed));
+            Assertions.assertTrue(contains(allSessions, commitRetryTimeout));
+            Assertions.assertTrue(contains(allSessions, rollbacked));
+            Assertions.assertTrue(contains(allSessions, rollbackRetryTimeout));
+            Assertions.assertTrue(contains(allSessions, timeoutRollbacked));
+            Assertions.assertTrue(contains(allSessions, finished));
         }
     }
 
@@ -181,6 +198,10 @@ class RocksDBSessionManagerTest {
         branchSession.setResourceId("jdbc:mysql://127.0.0.1/db");
         branchSession.setLockKey("t_order:1");
         return branchSession;
+    }
+
+    private boolean contains(Collection<GlobalSession> sessions, GlobalSession expected) {
+        return sessions.stream().anyMatch(session -> expected.getXid().equals(session.getXid()));
     }
 
     @SuppressWarnings("unchecked")
