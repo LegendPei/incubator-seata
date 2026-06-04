@@ -28,8 +28,6 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.SessionStorable;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
-import org.rocksdb.RocksDBException;
-import org.rocksdb.WriteBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -263,37 +261,17 @@ public class RocksDBMigrationService {
     }
 
     private boolean hasCurrentState(RocksDBStoreEngine storeEngine) {
-        return !storeEngine
-                        .prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])
-                        .isEmpty()
-                || !storeEngine
-                        .prefixScan(RocksDBColumnFamily.BRANCH_SESSION, new byte[0])
-                        .isEmpty()
-                || !storeEngine
-                        .prefixScan(RocksDBColumnFamily.LOCK, new byte[0])
-                        .isEmpty()
-                || !storeEngine
-                        .prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
-                        .isEmpty();
+        return storeEngine.prefixExists(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])
+                || storeEngine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, new byte[0])
+                || storeEngine.prefixExists(RocksDBColumnFamily.LOCK, new byte[0])
+                || storeEngine.prefixExists(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]);
     }
 
     private void clearCurrentState(RocksDBStoreEngine storeEngine) {
-        try (WriteBatch batch = new WriteBatch()) {
-            deleteAll(storeEngine, batch, RocksDBColumnFamily.GLOBAL_SESSION);
-            deleteAll(storeEngine, batch, RocksDBColumnFamily.BRANCH_SESSION);
-            deleteAll(storeEngine, batch, RocksDBColumnFamily.LOCK);
-            deleteAll(storeEngine, batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX);
-            storeEngine.write(batch);
-        } catch (RocksDBException e) {
-            throw new StoreException(e, "clear RocksDB current state before migration failed");
-        }
-    }
-
-    private void deleteAll(RocksDBStoreEngine storeEngine, WriteBatch batch, RocksDBColumnFamily columnFamily)
-            throws RocksDBException {
-        for (RocksDBStoreEngine.RocksDBEntry entry : storeEngine.prefixScan(columnFamily, new byte[0])) {
-            batch.delete(storeEngine.handle(columnFamily), entry.getKey());
-        }
+        storeEngine.deleteByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]);
+        storeEngine.deleteByPrefix(RocksDBColumnFamily.BRANCH_SESSION, new byte[0]);
+        storeEngine.deleteByPrefix(RocksDBColumnFamily.LOCK, new byte[0]);
+        storeEngine.deleteByPrefix(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]);
     }
 
     private String getMetadata(RocksDBStoreEngine storeEngine, String key) {

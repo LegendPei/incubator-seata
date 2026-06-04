@@ -68,6 +68,32 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testPrefixExistsAndDeleteByPrefix() {
+        try (RocksDBStoreEngine engine = open("delete-prefix", false)) {
+            byte[] value = "branch".getBytes(StandardCharsets.UTF_8);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-1", 1L), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-1", 2L), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-2", 1L), value);
+
+            Assertions.assertTrue(
+                    engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1")));
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("missing")));
+
+            engine.deleteByPrefix(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1"));
+
+            Assertions.assertFalse(
+                    engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1")));
+            Assertions.assertTrue(
+                    engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-2")));
+            Assertions.assertEquals(
+                    1,
+                    engine.prefixScan(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-2"))
+                            .size());
+        }
+    }
+
+    @Test
     void testMetadataInitialized() {
         try (RocksDBStoreEngine engine = open("metadata", true)) {
             byte[] formatVersion =

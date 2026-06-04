@@ -22,6 +22,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -56,7 +57,10 @@ public class RocksDBLocalLocks {
         if (keys == null || keys.isEmpty()) {
             return new LockScope(Collections.emptyList());
         }
-        List<byte[]> sortedKeys = new ArrayList<>(keys);
+        List<byte[]> sortedKeys = new ArrayList<>(keys.size());
+        for (byte[] key : keys) {
+            sortedKeys.add(Objects.requireNonNull(key, "key must not be null"));
+        }
         Collections.sort(sortedKeys, RocksDBLocalLocks::compare);
 
         List<ReentrantLock> acquiredLocks = new ArrayList<>();
@@ -79,12 +83,6 @@ public class RocksDBLocalLocks {
     private static int compare(byte[] left, byte[] right) {
         if (left == right) {
             return 0;
-        }
-        if (left == null) {
-            return -1;
-        }
-        if (right == null) {
-            return 1;
         }
         int length = Math.min(left.length, right.length);
         for (int i = 0; i < length; i++) {

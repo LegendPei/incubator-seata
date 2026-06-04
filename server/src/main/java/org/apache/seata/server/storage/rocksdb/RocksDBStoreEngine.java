@@ -39,6 +39,7 @@ import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Shared RocksDB engine for file store engine.
@@ -47,6 +48,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public static final int FORMAT_VERSION = 1;
 
+    private static final int DELETE_BATCH_SIZE = 1024;
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBStoreEngine.class);
     private static final byte[] FORMAT_VERSION_KEY = "format_version".getBytes(StandardCharsets.UTF_8);
 
@@ -181,6 +183,47 @@ public class RocksDBStoreEngine implements AutoCloseable {
             return entries;
         } catch (RocksDBException e) {
             throw new StoreException(e, "scan RocksDB failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public boolean prefixExists(RocksDBColumnFamily columnFamily, byte[] prefix) {
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+            iterator.seek(prefix);
+            boolean exists = iterator.isValid() && RocksDBKeyCodec.startsWith(iterator.key(), prefix);
+            iterator.status();
+            return exists;
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "check RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public void deleteByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        ColumnFamilyHandle columnFamilyHandle = handle(columnFamily);
+        while (true) {
+            int count = 0;
+            try (RocksIterator iterator = db.newIterator(columnFamilyHandle, readOptions);
+                    WriteBatch batch = new WriteBatch()) {
+                for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
+                    byte[] key = iterator.key();
+                    if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                        break;
+                    }
+                    batch.delete(columnFamilyHandle, copy(key));
+                    count++;
+                    if (count >= DELETE_BATCH_SIZE) {
+                        break;
+                    }
+                }
+                iterator.status();
+                if (count == 0) {
+                    return;
+                }
+                db.write(writeOptions, batch);
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "delete RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+            }
         }
     }
 
