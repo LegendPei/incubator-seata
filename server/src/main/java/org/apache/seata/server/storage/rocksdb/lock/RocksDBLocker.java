@@ -36,6 +36,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -216,6 +217,49 @@ public class RocksDBLocker extends AbstractLocker {
             storeEngine.write(batch);
         } catch (RocksDBException e) {
             throw new StoreException(e, "clean RocksDB locks failed");
+        }
+    }
+
+    public int cleanOrphanLocks() {
+        List<RocksDBStoreEngine.RocksDBEntry> indexEntries =
+                storeEngine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, EMPTY_VALUE);
+        if (CollectionUtils.isEmpty(indexEntries)) {
+            return 0;
+        }
+        int cleaned = 0;
+        try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
+                WriteBatch batch = new WriteBatch()) {
+            for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
+                byte[] lockKey = indexEntry.getValue();
+                byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
+                if (lockValue == null) {
+                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    cleaned++;
+                    continue;
+                }
+
+                LockDO existingLock = decodeLock(lockValue);
+                byte[] expectedIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
+                        existingLock.getXid(), existingLock.getBranchId(), lockKey);
+                if (!Arrays.equals(expectedIndexKey, indexEntry.getKey())) {
+                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    cleaned++;
+                    continue;
+                }
+
+                if (storeEngine.get(
+                                RocksDBColumnFamily.BRANCH_SESSION,
+                                RocksDBKeyCodec.encodeBranch(existingLock.getXid(), existingLock.getBranchId()))
+                        == null) {
+                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
+                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    cleaned++;
+                }
+            }
+            storeEngine.write(batch);
+            return cleaned;
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "clean RocksDB orphan locks failed");
         }
     }
 

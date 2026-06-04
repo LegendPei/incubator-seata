@@ -67,6 +67,11 @@ public class RocksDBMigrationService {
         if (MIGRATION_STATUS_COMPLETED.equals(migrationStatus)) {
             return false;
         }
+        if (StringUtils.isBlank(migrationStatus) && fileSessionLogReplayer.hasMigrationMarker(fileSessionLogPath)) {
+            throw new StoreException("file session logs were already migrated to RocksDB, but RocksDB migration "
+                    + "metadata is missing. Restore the RocksDB directory or remove the migration marker explicitly, "
+                    + "file:" + fileSessionLogPath);
+        }
         if (StringUtils.isNotBlank(migrationStatus) && !MIGRATION_STATUS_IN_PROGRESS.equals(migrationStatus)) {
             throw new StoreException("unknown RocksDB migration status:" + migrationStatus);
         }
@@ -92,6 +97,7 @@ public class RocksDBMigrationService {
         writeCurrentState(storeEngine, migrationState.globalSessions.values());
         putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
         storeEngine.flush();
+        fileSessionLogReplayer.markMigrated(fileSessionLogPath);
 
         LOGGER.info(
                 "Migrated file session logs to RocksDB, file:{}, records:{}, globalSessions:{}",

@@ -27,8 +27,11 @@ import org.apache.seata.core.model.LockStatus;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
+import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
+import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -178,6 +181,55 @@ class RocksDBLockManagerTest {
 
             Assertions.assertTrue(
                     engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty());
+            Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                    .isEmpty());
+        }
+    }
+
+    @Test
+    void testCleanOrphanLocksRemovesLockWithoutBranchSession() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-orphan")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession orphan = branchSession(1001L, 1L, "t_order:1");
+            BranchSession next = branchSession(1002L, 2L, "t_order:1");
+
+            Assertions.assertTrue(lockManager.acquireLock(orphan));
+            Assertions.assertFalse(lockManager.acquireLock(next));
+
+            Assertions.assertEquals(1, lockManager.cleanOrphanLocks());
+            Assertions.assertTrue(lockManager.acquireLock(next));
+        }
+    }
+
+    @Test
+    void testCleanOrphanLocksKeepsLockWithBranchSession() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-valid")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            BranchSession holder = branchSession(1001L, 1L, "t_order:1");
+            BranchSession conflict = branchSession(1002L, 2L, "t_order:1");
+
+            storeManager.writeSession(LogOperation.BRANCH_ADD, holder);
+            Assertions.assertTrue(lockManager.acquireLock(holder));
+
+            Assertions.assertEquals(0, lockManager.cleanOrphanLocks());
+            Assertions.assertFalse(lockManager.acquireLock(conflict));
+        }
+    }
+
+    @Test
+    void testCleanOrphanLocksDeletesStaleIndexWithoutLockValue() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-stale-index")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession holder = branchSession(1001L, 1L, "t_order:1");
+            byte[] lockKey = RocksDBKeyCodec.encodeRowLock(holder.getResourceId(), "t_order", "1");
+
+            engine.put(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndex(holder.getXid(), holder.getBranchId(), lockKey),
+                    lockKey);
+
+            Assertions.assertEquals(1, lockManager.cleanOrphanLocks());
             Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
                     .isEmpty());
         }

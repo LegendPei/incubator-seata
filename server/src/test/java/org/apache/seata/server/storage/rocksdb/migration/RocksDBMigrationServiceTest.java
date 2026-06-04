@@ -27,12 +27,14 @@ import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
+import org.apache.seata.server.storage.file.store.FileSessionLogReplayer;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.SessionStorable;
+import org.apache.seata.server.store.StoreConfig;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -95,6 +97,7 @@ class RocksDBMigrationServiceTest {
             Assertions.assertEquals(
                     branch.getBranchId(), actual.getBranchSessions().get(0).getBranchId());
             Assertions.assertNull(storeManager.readSession(committed.getXid(), true));
+            Assertions.assertTrue(Files.isRegularFile(migrationMarker(fileLog)));
 
             Assertions.assertFalse(migrationService.migrate(fileLog, engine));
         }
@@ -143,6 +146,31 @@ class RocksDBMigrationServiceTest {
         }
     }
 
+    @Test
+    void testMigratedFileLogsWithoutRocksDBMetadataFailFast() throws Exception {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        appendLog(fileLog, globalSession("tx-active", GlobalStatus.Begin), LogOperation.GLOBAL_ADD);
+        new FileSessionLogReplayer().markMigrated(fileLog);
+
+        try (RocksDBStoreEngine engine = open("rocksdb-migrated-marker")) {
+            StoreException exception = Assertions.assertThrows(
+                    StoreException.class, () -> new RocksDBMigrationService().migrate(fileLog, engine));
+            Assertions.assertTrue(exception.getMessage().contains("already migrated"));
+        }
+    }
+
+    @Test
+    void testReplayRejectsOversizedBody() throws Exception {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        appendFrameSize(fileLog, StoreConfig.getMaxBranchSessionSize() + 2);
+
+        try (RocksDBStoreEngine engine = open("rocksdb-oversized-frame")) {
+            StoreException exception = Assertions.assertThrows(
+                    StoreException.class, () -> new RocksDBMigrationService().migrate(fileLog, engine));
+            Assertions.assertTrue(exception.getMessage().contains("exceeds limit"));
+        }
+    }
+
     private RocksDBStoreEngine open(String name) {
         return RocksDBStoreEngine.open(
                 new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
@@ -172,6 +200,17 @@ class RocksDBMigrationServiceTest {
         buffer.put(data);
         Files.createDirectories(fileLog.getParent());
         Files.write(fileLog, buffer.array(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+
+    private void appendFrameSize(Path fileLog, int bodySize) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES);
+        buffer.putInt(bodySize);
+        Files.createDirectories(fileLog.getParent());
+        Files.write(fileLog, buffer.array(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+
+    private Path migrationMarker(Path fileLog) {
+        return fileLog.resolveSibling(fileLog.getFileName() + ".rocksdb_migrated");
     }
 
     private String getMigrationStatus(RocksDBStoreEngine engine) {

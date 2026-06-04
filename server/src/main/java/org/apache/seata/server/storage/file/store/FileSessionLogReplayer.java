@@ -19,10 +19,12 @@ package org.apache.seata.server.storage.file.store;
 import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.util.BufferUtils;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
+import org.apache.seata.server.store.StoreConfig;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -33,10 +35,31 @@ import java.nio.file.StandardOpenOption;
 public class FileSessionLogReplayer {
 
     private static final String HISTORY_FILE_POSTFIX = ".1";
+    private static final String MIGRATION_MARKER_POSTFIX = ".rocksdb_migrated";
     private static final int MARK_SIZE = Integer.BYTES;
 
     public boolean hasSessionLogs(Path currentLogPath) {
         return hasReadableData(historyLogPath(currentLogPath)) || hasReadableData(currentLogPath);
+    }
+
+    public boolean hasMigrationMarker(Path currentLogPath) {
+        return Files.isRegularFile(migrationMarkerPath(currentLogPath));
+    }
+
+    public void markMigrated(Path currentLogPath) {
+        Path markerPath = migrationMarkerPath(currentLogPath);
+        try {
+            if (markerPath.getParent() != null) {
+                Files.createDirectories(markerPath.getParent());
+            }
+            Files.write(
+                    markerPath,
+                    "migrated to rocksdb\n".getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            throw new StoreException(e, "mark file session log migrated failed, marker:" + markerPath);
+        }
     }
 
     public int replay(Path currentLogPath, TransactionWriteStoreVisitor visitor) {
@@ -60,6 +83,10 @@ public class FileSessionLogReplayer {
                 int bodySize = sizeBuffer.getInt();
                 if (bodySize <= 0) {
                     throw new StoreException("invalid file session log body size:" + bodySize + ", file:" + logPath);
+                }
+                if (bodySize > maxReplayBodySize()) {
+                    throw new StoreException("file session log body size exceeds limit:" + bodySize + ", max:"
+                            + maxReplayBodySize() + ", file:" + logPath);
                 }
 
                 ByteBuffer bodyBuffer = ByteBuffer.allocate(bodySize);
@@ -89,6 +116,14 @@ public class FileSessionLogReplayer {
 
     private Path historyLogPath(Path currentLogPath) {
         return currentLogPath.resolveSibling(currentLogPath.getFileName() + HISTORY_FILE_POSTFIX);
+    }
+
+    private Path migrationMarkerPath(Path currentLogPath) {
+        return currentLogPath.resolveSibling(currentLogPath.getFileName() + MIGRATION_MARKER_POSTFIX);
+    }
+
+    private int maxReplayBodySize() {
+        return Math.max(StoreConfig.getMaxGlobalSessionSize(), StoreConfig.getMaxBranchSessionSize()) + 1;
     }
 
     private boolean readFully(FileChannel fileChannel, ByteBuffer buffer) throws IOException {

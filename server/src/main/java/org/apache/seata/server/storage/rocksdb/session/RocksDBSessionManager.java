@@ -20,6 +20,7 @@ import org.apache.seata.common.loader.LoadLevel;
 import org.apache.seata.common.loader.Scope;
 import org.apache.seata.core.exception.TransactionException;
 import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.session.AbstractSessionManager;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
@@ -63,6 +64,14 @@ public class RocksDBSessionManager extends AbstractSessionManager {
     @Override
     public GlobalSession findGlobalSession(String xid, boolean withBranchSessions) {
         return transactionStoreManager.readSession(xid, withBranchSessions);
+    }
+
+    @Override
+    public void removeGlobalSession(GlobalSession session) throws TransactionException {
+        if (!LockerManagerFactory.getLockManager().releaseGlobalSessionLock(session)) {
+            throw new TransactionException("Release RocksDB global session lock failed, xid = " + session.getXid());
+        }
+        super.removeGlobalSession(session);
     }
 
     @Override
