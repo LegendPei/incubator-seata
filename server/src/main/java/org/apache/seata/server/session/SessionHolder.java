@@ -123,9 +123,6 @@ public class SessionHolder {
                 RaftServerManager.start();
             } else {
                 FileStoreEngine fileStoreEngine = StoreConfig.getFileEngine();
-                if (FileStoreEngine.ROCKSDB == fileStoreEngine) {
-                    throw new StoreException("RocksDB file engine is not implemented in Phase1");
-                }
                 String vGroupMappingStorePath =
                         CONFIG.getConfig(ConfigurationKeys.STORE_FILE_DIR, DEFAULT_VGROUP_MAPPING_STORE_FILE_DIR)
                                 + separator
@@ -142,15 +139,19 @@ public class SessionHolder {
                         SessionMode.FILE.getName(),
                         new Object[] {vGroupMappingStorePath});
 
-                ROOT_SESSION_MANAGER =
-                        EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
-                            ROOT_SESSION_MANAGER_NAME, sessionStorePath
-                        });
-                ROOT_SESSION_MANAGER =
-                        EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
-                            ROOT_SESSION_MANAGER_NAME, sessionStorePath
-                        });
-                reload(sessionMode);
+                if (FileStoreEngine.ROCKSDB == fileStoreEngine) {
+                    ROOT_SESSION_MANAGER = EnhancedServiceLoader.load(
+                            SessionManager.class,
+                            FileStoreEngine.ROCKSDB.getName(),
+                            new Object[] {ROOT_SESSION_MANAGER_NAME});
+                    reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode, false);
+                } else {
+                    ROOT_SESSION_MANAGER =
+                            EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
+                                ROOT_SESSION_MANAGER_NAME, sessionStorePath
+                            });
+                    reload(sessionMode);
+                }
             }
         } else if (SessionMode.REDIS.equals(sessionMode)) {
             ROOT_SESSION_MANAGER = EnhancedServiceLoader.load(SessionManager.class, SessionMode.REDIS.getName());
@@ -169,9 +170,11 @@ public class SessionHolder {
      * @param sessionMode the mode of store
      */
     protected static void reload(SessionMode sessionMode) {
-        if (sessionMode == SessionMode.FILE) {
+        if (sessionMode == SessionMode.FILE && ROOT_SESSION_MANAGER instanceof Reloadable) {
             ((Reloadable) ROOT_SESSION_MANAGER).reload();
             reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
+        } else if (sessionMode == SessionMode.FILE) {
+            reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode, false);
         } else {
             reload(null, sessionMode);
         }

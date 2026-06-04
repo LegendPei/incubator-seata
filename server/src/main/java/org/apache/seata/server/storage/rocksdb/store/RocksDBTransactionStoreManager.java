@@ -56,6 +56,10 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         this(RocksDBStoreEngineFactory.getInstance(), new RocksDBLocalLocks(), true);
     }
 
+    public RocksDBTransactionStoreManager(RocksDBLocalLocks xidLocks) {
+        this(RocksDBStoreEngineFactory.getInstance(), xidLocks, true);
+    }
+
     public RocksDBTransactionStoreManager(RocksDBStoreEngine storeEngine) {
         this(storeEngine, new RocksDBLocalLocks(), false);
     }
@@ -133,19 +137,9 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         if (statuses == null || statuses.length == 0) {
             return Collections.emptyList();
         }
-        Set<GlobalStatus> statusSet = new HashSet<>(Arrays.asList(statuses));
-        List<GlobalSession> result = new ArrayList<>();
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])) {
-            GlobalSession globalSession = decodeGlobalSession(entry.getValue());
-            if (statusSet.contains(globalSession.getStatus())) {
-                if (withBranchSessions) {
-                    readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
-                }
-                result.add(globalSession);
-            }
-        }
-        return result;
+        SessionCondition sessionCondition = new SessionCondition(statuses);
+        sessionCondition.setLazyLoadBranch(!withBranchSessions);
+        return scanGlobalSessions(sessionCondition);
     }
 
     @Override
@@ -155,15 +149,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
         if (StringUtils.isNotBlank(sessionCondition.getXid())) {
             GlobalSession globalSession = readSession(sessionCondition.getXid(), !sessionCondition.isLazyLoadBranch());
-            if (globalSession == null) {
+            if (globalSession == null || !matches(globalSession, sessionCondition)) {
                 return Collections.emptyList();
             }
             return Collections.singletonList(globalSession);
         }
-        if (CollectionUtils.isNotEmpty(sessionCondition.getStatuses())) {
-            return readSession(sessionCondition.getStatuses(), !sessionCondition.isLazyLoadBranch());
-        }
-        return Collections.emptyList();
+        return scanGlobalSessions(sessionCondition);
     }
 
     @Override
@@ -217,6 +208,43 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             branches.add(decodeBranchSession(entry.getValue()));
         }
         return branches;
+    }
+
+    private List<GlobalSession> scanGlobalSessions(SessionCondition sessionCondition) {
+        List<GlobalSession> result = new ArrayList<>();
+        for (RocksDBStoreEngine.RocksDBEntry entry :
+                storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])) {
+            GlobalSession globalSession = decodeGlobalSession(entry.getValue());
+            if (matches(globalSession, sessionCondition)) {
+                if (!sessionCondition.isLazyLoadBranch()) {
+                    readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
+                }
+                result.add(globalSession);
+            }
+        }
+        return result;
+    }
+
+    private boolean matches(GlobalSession globalSession, SessionCondition sessionCondition) {
+        if (sessionCondition.getOverTimeAliveMills() != null
+                && sessionCondition.getOverTimeAliveMills() > 0
+                && System.currentTimeMillis() - globalSession.getBeginTime()
+                        <= sessionCondition.getOverTimeAliveMills()) {
+            return false;
+        }
+        if (sessionCondition.getTransactionId() != null
+                && sessionCondition.getTransactionId() > 0
+                && !sessionCondition.getTransactionId().equals(globalSession.getTransactionId())) {
+            return false;
+        }
+        if (CollectionUtils.isNotEmpty(sessionCondition.getStatuses())) {
+            Set<GlobalStatus> statusSet = new HashSet<>(Arrays.asList(sessionCondition.getStatuses()));
+            return statusSet.contains(globalSession.getStatus());
+        }
+        if (sessionCondition.getStatus() != null) {
+            return sessionCondition.getStatus() == globalSession.getStatus();
+        }
+        return true;
     }
 
     private byte[] encodeGlobalSession(GlobalSession session) {

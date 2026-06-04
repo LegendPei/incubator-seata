@@ -158,6 +158,43 @@ class RocksDBTransactionStoreManagerTest {
         }
     }
 
+    @Test
+    void testReadBySessionConditionTransactionIdAndOvertime() {
+        try (RocksDBStoreEngine engine = open("condition-filter")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession oldSession = globalSession("tx-old", GlobalStatus.Begin);
+            oldSession.setBeginTime(System.currentTimeMillis() - 60000);
+            GlobalSession newSession = globalSession("tx-new", GlobalStatus.Begin);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, oldSession);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, newSession);
+
+            SessionCondition condition = new SessionCondition();
+            condition.setTransactionId(oldSession.getTransactionId());
+            condition.setOverTimeAliveMills(1000L);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, actual.size());
+            Assertions.assertEquals(oldSession.getXid(), actual.get(0).getXid());
+        }
+    }
+
+    @Test
+    void testReadByEmptySessionConditionScansAll() {
+        try (RocksDBStoreEngine engine = open("condition-all")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession begin = globalSession("tx-begin-all", GlobalStatus.Begin);
+            GlobalSession committed = globalSession("tx-committed-all", GlobalStatus.Committed);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, begin);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+
+            List<GlobalSession> actual = storeManager.readSession(new SessionCondition());
+
+            Assertions.assertEquals(2, actual.size());
+        }
+    }
+
     private RocksDBStoreEngine open(String name) {
         return RocksDBStoreEngine.open(
                 new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
