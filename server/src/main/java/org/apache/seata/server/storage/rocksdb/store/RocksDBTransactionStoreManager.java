@@ -36,12 +36,9 @@ import org.rocksdb.RocksDBException;
 import org.rocksdb.WriteBatch;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
  * RocksDB transaction store manager for file store engine.
@@ -238,8 +235,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return false;
         }
         if (CollectionUtils.isNotEmpty(sessionCondition.getStatuses())) {
-            Set<GlobalStatus> statusSet = new HashSet<>(Arrays.asList(sessionCondition.getStatuses()));
-            return statusSet.contains(globalSession.getStatus());
+            for (GlobalStatus status : sessionCondition.getStatuses()) {
+                if (status == globalSession.getStatus()) {
+                    return true;
+                }
+            }
+            return false;
         }
         if (sessionCondition.getStatus() != null) {
             return sessionCondition.getStatus() == globalSession.getStatus();

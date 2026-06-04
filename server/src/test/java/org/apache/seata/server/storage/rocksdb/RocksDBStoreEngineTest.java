@@ -128,6 +128,16 @@ class RocksDBStoreEngineTest {
                 StoreException.class, () -> RocksDBStoreEngineFactory.getInstance(config("factory-b", true)));
     }
 
+    @Test
+    void testFactoryRejectsDifferentSyncWrite() {
+        RocksDBStoreConfig config = config("factory-sync", true);
+        RocksDBStoreEngineFactory.getInstance(config);
+
+        Assertions.assertThrows(
+                StoreException.class,
+                () -> RocksDBStoreEngineFactory.getInstance(new RocksDBStoreConfig(config.getDbPath(), false)));
+    }
+
     private RocksDBStoreEngine open(String name, boolean syncWrite) {
         return RocksDBStoreEngine.open(config(name, syncWrite));
     }
