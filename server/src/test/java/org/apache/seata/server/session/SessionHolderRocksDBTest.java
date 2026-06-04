@@ -21,6 +21,10 @@ import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.common.store.SessionMode;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.constants.ConfigurationKeys;
+import org.apache.seata.core.model.BranchStatus;
+import org.apache.seata.core.model.BranchType;
+import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.junit.jupiter.api.AfterEach;
@@ -32,6 +36,7 @@ import org.springframework.mock.env.MockEnvironment;
 
 import java.lang.reflect.Field;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.Map;
 
 class SessionHolderRocksDBTest {
@@ -54,6 +59,7 @@ class SessionHolderRocksDBTest {
         System.clearProperty(ConfigurationKeys.STORE_FILE_ENGINE);
         System.clearProperty(ConfigurationKeys.STORE_FILE_ROCKSDB_DIR);
         SessionHolder.destroy();
+        LockerManagerFactory.destroy();
         RocksDBStoreEngineFactory.destroy();
         ConfigurationCache.clear();
         restoreEnvironment();
@@ -61,16 +67,54 @@ class SessionHolderRocksDBTest {
 
     @Test
     void testRocksDBFileEngineInitializesRocksDBSessionManager() {
+        configureRocksDBFileMode();
+
+        SessionHolder.init(SessionMode.FILE);
+
+        Assertions.assertTrue(SessionHolder.getRootSessionManager() instanceof RocksDBSessionManager);
+    }
+
+    @Test
+    void testRocksDBFileEngineReloadsBranchLocks() throws Exception {
+        configureRocksDBFileMode();
+        SessionHolder.init(SessionMode.FILE);
+
+        BranchSession branchSession = branchSession(1001L, 1L, "t_order:1");
+        GlobalSession globalSession = globalSession(branchSession);
+        globalSession.add(branchSession);
+
+        SessionHolder.reload(Collections.singletonList(globalSession), SessionMode.FILE);
+
+        BranchSession conflict = branchSession(1002L, 2L, "t_order:1");
+        Assertions.assertFalse(LockerManagerFactory.getLockManager().acquireLock(conflict));
+    }
+
+    private void configureRocksDBFileMode() {
         System.setProperty(
                 ConfigurationKeys.STORE_FILE_DIR, tempDir.resolve("file").toString());
         System.setProperty(ConfigurationKeys.STORE_FILE_ENGINE, "rocksdb");
         System.setProperty(
                 ConfigurationKeys.STORE_FILE_ROCKSDB_DIR,
                 tempDir.resolve("rocksdb").toString());
+    }
 
-        SessionHolder.init(SessionMode.FILE);
+    private GlobalSession globalSession(BranchSession branchSession) {
+        GlobalSession globalSession = new GlobalSession("app", "group", "tx", 60000);
+        globalSession.setXid(branchSession.getXid());
+        globalSession.setTransactionId(branchSession.getTransactionId());
+        globalSession.setStatus(GlobalStatus.Begin);
+        return globalSession;
+    }
 
-        Assertions.assertTrue(SessionHolder.getRootSessionManager() instanceof RocksDBSessionManager);
+    private BranchSession branchSession(long transactionId, long branchId, String lockKey) {
+        BranchSession branchSession = new BranchSession(BranchType.AT);
+        branchSession.setXid("127.0.0.1:8091:" + transactionId);
+        branchSession.setTransactionId(transactionId);
+        branchSession.setBranchId(branchId);
+        branchSession.setStatus(BranchStatus.Registered);
+        branchSession.setResourceId("jdbc:mysql://127.0.0.1/db");
+        branchSession.setLockKey(lockKey);
+        return branchSession;
     }
 
     @SuppressWarnings("unchecked")

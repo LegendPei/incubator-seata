@@ -144,7 +144,7 @@ public class SessionHolder {
                             SessionManager.class,
                             FileStoreEngine.ROCKSDB.getName(),
                             new Object[] {ROOT_SESSION_MANAGER_NAME});
-                    reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode, false);
+                    reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
                 } else {
                     ROOT_SESSION_MANAGER =
                             EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
@@ -174,7 +174,7 @@ public class SessionHolder {
             ((Reloadable) ROOT_SESSION_MANAGER).reload();
             reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
         } else if (sessionMode == SessionMode.FILE) {
-            reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode, false);
+            reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
         } else {
             reload(null, sessionMode);
         }
