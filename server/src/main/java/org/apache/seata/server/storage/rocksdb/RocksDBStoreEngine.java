@@ -1,0 +1,226 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.seata.server.storage.rocksdb;
+
+import org.apache.seata.common.exception.StoreException;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DBOptions;
+import org.rocksdb.FlushOptions;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Shared RocksDB engine for file store engine.
+ */
+public class RocksDBStoreEngine implements AutoCloseable {
+
+    public static final int FORMAT_VERSION = 1;
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBStoreEngine.class);
+    private static final byte[] FORMAT_VERSION_KEY = "format_version".getBytes(StandardCharsets.UTF_8);
+
+    static {
+        RocksDB.loadLibrary();
+    }
+
+    private final RocksDBStoreConfig config;
+    private final Map<RocksDBColumnFamily, ColumnFamilyHandle> handles = new EnumMap<>(RocksDBColumnFamily.class);
+    private final DBOptions dbOptions;
+    private final ColumnFamilyOptions columnFamilyOptions;
+    private final ReadOptions readOptions;
+    private final WriteOptions writeOptions;
+    private final RocksDB db;
+
+    private volatile boolean closed;
+
+    private RocksDBStoreEngine(RocksDBStoreConfig config) {
+        this.config = config;
+        try {
+            Files.createDirectories(Paths.get(config.getDbPath()));
+            dbOptions = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
+            columnFamilyOptions = new ColumnFamilyOptions();
+            readOptions = new ReadOptions();
+            writeOptions = new WriteOptions().setDisableWAL(false).setSync(config.isSyncWrite());
+
+            List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+            for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
+                descriptors.add(new ColumnFamilyDescriptor(columnFamily.getNameBytes(), columnFamilyOptions));
+            }
+
+            List<ColumnFamilyHandle> openedHandles = new ArrayList<>();
+            db = RocksDB.open(dbOptions, config.getDbPath(), descriptors, openedHandles);
+            for (int i = 0; i < RocksDBColumnFamily.values().length; i++) {
+                handles.put(RocksDBColumnFamily.values()[i], openedHandles.get(i));
+            }
+            initMetadata();
+            LOGGER.info(
+                    "RocksDB file store engine opened, path:{}, columnFamilies:{}, formatVersion:{}, syncWrite:{}",
+                    config.getDbPath(),
+                    handles.keySet(),
+                    FORMAT_VERSION,
+                    config.isSyncWrite());
+        } catch (Exception e) {
+            throw new StoreException(e, "open RocksDB file store engine failed, path:" + config.getDbPath());
+        }
+    }
+
+    public static RocksDBStoreEngine open(RocksDBStoreConfig config) {
+        return new RocksDBStoreEngine(config);
+    }
+
+    public RocksDBStoreConfig getConfig() {
+        return config;
+    }
+
+    public boolean isSyncWrite() {
+        return config.isSyncWrite();
+    }
+
+    public byte[] get(RocksDBColumnFamily columnFamily, byte[] key) {
+        try {
+            return db.get(handle(columnFamily), key);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "read RocksDB failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public void put(RocksDBColumnFamily columnFamily, byte[] key, byte[] value) {
+        try {
+            db.put(handle(columnFamily), writeOptions, key, value);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "write RocksDB failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public void delete(RocksDBColumnFamily columnFamily, byte[] key) {
+        try {
+            db.delete(handle(columnFamily), writeOptions, key);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "delete RocksDB failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public void write(WriteBatch batch) {
+        try {
+            db.write(writeOptions, batch);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "write RocksDB batch failed");
+        }
+    }
+
+    public List<RocksDBEntry> prefixScan(RocksDBColumnFamily columnFamily, byte[] prefix) {
+        List<RocksDBEntry> entries = new ArrayList<>();
+        try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+            for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
+                byte[] key = iterator.key();
+                if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                    break;
+                }
+                entries.add(new RocksDBEntry(copy(key), copy(iterator.value())));
+            }
+            iterator.status();
+            return entries;
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "scan RocksDB failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public void flush() {
+        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+            db.flush(flushOptions);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "flush RocksDB failed");
+        }
+    }
+
+    public ColumnFamilyHandle handle(RocksDBColumnFamily columnFamily) {
+        ColumnFamilyHandle handle = handles.get(columnFamily);
+        if (handle == null) {
+            throw new StoreException("RocksDB column family handle not found:" + columnFamily.getName());
+        }
+        return handle;
+    }
+
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        for (ColumnFamilyHandle handle : handles.values()) {
+            handle.close();
+        }
+        db.close();
+        writeOptions.close();
+        readOptions.close();
+        columnFamilyOptions.close();
+        dbOptions.close();
+    }
+
+    private void initMetadata() throws RocksDBException {
+        byte[] existing = db.get(handle(RocksDBColumnFamily.METADATA), FORMAT_VERSION_KEY);
+        if (existing == null) {
+            db.put(
+                    handle(RocksDBColumnFamily.METADATA),
+                    writeOptions,
+                    FORMAT_VERSION_KEY,
+                    Integer.toString(FORMAT_VERSION).getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static byte[] copy(byte[] bytes) {
+        return bytes == null ? null : Arrays.copyOf(bytes, bytes.length);
+    }
+
+    /**
+     * RocksDB key-value entry.
+     */
+    public static class RocksDBEntry {
+        private final byte[] key;
+        private final byte[] value;
+
+        public RocksDBEntry(byte[] key, byte[] value) {
+            this.key = key;
+            this.value = value;
+        }
+
+        public byte[] getKey() {
+            return copy(key);
+        }
+
+        public byte[] getValue() {
+            return copy(value);
+        }
+    }
+}

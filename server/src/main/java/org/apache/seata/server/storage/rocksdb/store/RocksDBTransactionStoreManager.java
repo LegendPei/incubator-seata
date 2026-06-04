@@ -1,0 +1,260 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.seata.server.storage.rocksdb.store;
+
+import org.apache.seata.common.exception.StoreException;
+import org.apache.seata.common.util.CollectionUtils;
+import org.apache.seata.common.util.StringUtils;
+import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.session.BranchSession;
+import org.apache.seata.server.session.GlobalSession;
+import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
+import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
+import org.apache.seata.server.storage.rocksdb.RocksDBLocalLocks;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
+import org.apache.seata.server.storage.rocksdb.RocksDBValueCodec;
+import org.apache.seata.server.store.AbstractTransactionStoreManager;
+import org.apache.seata.server.store.SessionStorable;
+import org.apache.seata.server.store.TransactionStoreManager;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * RocksDB transaction store manager for file store engine.
+ */
+public class RocksDBTransactionStoreManager extends AbstractTransactionStoreManager implements TransactionStoreManager {
+
+    private final RocksDBStoreEngine storeEngine;
+    private final RocksDBLocalLocks xidLocks;
+    private final boolean factoryManaged;
+
+    public RocksDBTransactionStoreManager() {
+        this(RocksDBStoreEngineFactory.getInstance(), new RocksDBLocalLocks(), true);
+    }
+
+    public RocksDBTransactionStoreManager(RocksDBStoreEngine storeEngine) {
+        this(storeEngine, new RocksDBLocalLocks(), false);
+    }
+
+    public RocksDBTransactionStoreManager(RocksDBStoreEngine storeEngine, RocksDBLocalLocks xidLocks) {
+        this(storeEngine, xidLocks, false);
+    }
+
+    private RocksDBTransactionStoreManager(
+            RocksDBStoreEngine storeEngine, RocksDBLocalLocks xidLocks, boolean factoryManaged) {
+        this.storeEngine = storeEngine;
+        this.xidLocks = xidLocks;
+        this.factoryManaged = factoryManaged;
+    }
+
+    @Override
+    public boolean writeSession(LogOperation logOperation, SessionStorable session) {
+        if (session == null) {
+            return true;
+        }
+        String xid = getXid(session);
+        try (RocksDBLocalLocks.LockScope ignored = xidLocks.lock(RocksDBKeyCodec.encodeXid(xid))) {
+            switch (logOperation) {
+                case GLOBAL_ADD:
+                case GLOBAL_UPDATE:
+                    writeGlobalSession((GlobalSession) session);
+                    return true;
+                case GLOBAL_REMOVE:
+                    removeGlobalSession((GlobalSession) session);
+                    return true;
+                case BRANCH_ADD:
+                case BRANCH_UPDATE:
+                    writeBranchSession((BranchSession) session);
+                    return true;
+                case BRANCH_REMOVE:
+                    removeBranchSession((BranchSession) session);
+                    return true;
+                default:
+                    throw new StoreException("Unknown LogOperation:" + logOperation.name());
+            }
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new StoreException(e, "write RocksDB session failed, logOperation:" + logOperation.name());
+        }
+    }
+
+    @Override
+    public GlobalSession readSession(String xid) {
+        return readSession(xid, true);
+    }
+
+    @Override
+    public GlobalSession readSession(String xid, boolean withBranchSessions) {
+        byte[] value = storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid));
+        if (value == null) {
+            return null;
+        }
+        GlobalSession globalSession = decodeGlobalSession(value);
+        if (withBranchSessions) {
+            readBranchSessions(xid).forEach(globalSession::add);
+        }
+        return globalSession;
+    }
+
+    @Override
+    public List<GlobalSession> readSortByTimeoutBeginSessions(boolean withBranchSessions) {
+        List<GlobalSession> sessions = readSession(new GlobalStatus[] {GlobalStatus.Begin}, withBranchSessions);
+        sessions.sort(Comparator.comparingLong(GlobalSession::getBeginTime));
+        return sessions;
+    }
+
+    @Override
+    public List<GlobalSession> readSession(GlobalStatus[] statuses, boolean withBranchSessions) {
+        if (statuses == null || statuses.length == 0) {
+            return Collections.emptyList();
+        }
+        Set<GlobalStatus> statusSet = new HashSet<>(Arrays.asList(statuses));
+        List<GlobalSession> result = new ArrayList<>();
+        for (RocksDBStoreEngine.RocksDBEntry entry :
+                storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])) {
+            GlobalSession globalSession = decodeGlobalSession(entry.getValue());
+            if (statusSet.contains(globalSession.getStatus())) {
+                if (withBranchSessions) {
+                    readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
+                }
+                result.add(globalSession);
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public List<GlobalSession> readSession(SessionCondition sessionCondition) {
+        if (sessionCondition == null) {
+            return Collections.emptyList();
+        }
+        if (StringUtils.isNotBlank(sessionCondition.getXid())) {
+            GlobalSession globalSession = readSession(sessionCondition.getXid(), !sessionCondition.isLazyLoadBranch());
+            if (globalSession == null) {
+                return Collections.emptyList();
+            }
+            return Collections.singletonList(globalSession);
+        }
+        if (CollectionUtils.isNotEmpty(sessionCondition.getStatuses())) {
+            return readSession(sessionCondition.getStatuses(), !sessionCondition.isLazyLoadBranch());
+        }
+        return Collections.emptyList();
+    }
+
+    @Override
+    public void shutdown() {
+        if (factoryManaged) {
+            RocksDBStoreEngineFactory.destroy();
+        } else {
+            storeEngine.close();
+        }
+    }
+
+    private void writeGlobalSession(GlobalSession session) {
+        storeEngine.put(
+                RocksDBColumnFamily.GLOBAL_SESSION,
+                RocksDBKeyCodec.encodeXid(session.getXid()),
+                encodeGlobalSession(session));
+    }
+
+    private void removeGlobalSession(GlobalSession session) {
+        try (WriteBatch batch = new WriteBatch()) {
+            batch.delete(
+                    storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION),
+                    RocksDBKeyCodec.encodeXid(session.getXid()));
+            for (RocksDBStoreEngine.RocksDBEntry entry : storeEngine.prefixScan(
+                    RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(session.getXid()))) {
+                batch.delete(storeEngine.handle(RocksDBColumnFamily.BRANCH_SESSION), entry.getKey());
+            }
+            storeEngine.write(batch);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "remove RocksDB global session failed, xid:" + session.getXid());
+        }
+    }
+
+    private void writeBranchSession(BranchSession session) {
+        storeEngine.put(
+                RocksDBColumnFamily.BRANCH_SESSION,
+                RocksDBKeyCodec.encodeBranch(session.getXid(), session.getBranchId()),
+                encodeBranchSession(session));
+    }
+
+    private void removeBranchSession(BranchSession session) {
+        storeEngine.delete(
+                RocksDBColumnFamily.BRANCH_SESSION,
+                RocksDBKeyCodec.encodeBranch(session.getXid(), session.getBranchId()));
+    }
+
+    private List<BranchSession> readBranchSessions(String xid) {
+        List<BranchSession> branches = new ArrayList<>();
+        for (RocksDBStoreEngine.RocksDBEntry entry :
+                storeEngine.prefixScan(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(xid))) {
+            branches.add(decodeBranchSession(entry.getValue()));
+        }
+        return branches;
+    }
+
+    private byte[] encodeGlobalSession(GlobalSession session) {
+        return RocksDBValueCodec.encode(RocksDBValueCodec.ValueType.GLOBAL_SESSION, session.encode());
+    }
+
+    private byte[] encodeBranchSession(BranchSession session) {
+        return RocksDBValueCodec.encode(RocksDBValueCodec.ValueType.BRANCH_SESSION, session.encode());
+    }
+
+    private GlobalSession decodeGlobalSession(byte[] value) {
+        RocksDBValueCodec.DecodedValue decodedValue = RocksDBValueCodec.decode(value);
+        if (decodedValue.getType() != RocksDBValueCodec.ValueType.GLOBAL_SESSION) {
+            throw new StoreException("unexpected RocksDB value type for global session:" + decodedValue.getType());
+        }
+        GlobalSession globalSession = new GlobalSession();
+        globalSession.decode(decodedValue.getPayload());
+        return globalSession;
+    }
+
+    private BranchSession decodeBranchSession(byte[] value) {
+        RocksDBValueCodec.DecodedValue decodedValue = RocksDBValueCodec.decode(value);
+        if (decodedValue.getType() != RocksDBValueCodec.ValueType.BRANCH_SESSION) {
+            throw new StoreException("unexpected RocksDB value type for branch session:" + decodedValue.getType());
+        }
+        BranchSession branchSession = new BranchSession();
+        branchSession.decode(decodedValue.getPayload());
+        return branchSession;
+    }
+
+    private String getXid(SessionStorable session) {
+        if (session instanceof GlobalSession) {
+            return ((GlobalSession) session).getXid();
+        }
+        if (session instanceof BranchSession) {
+            return ((BranchSession) session).getXid();
+        }
+        throw new StoreException(
+                "unsupported session type:" + session.getClass().getName());
+    }
+}
