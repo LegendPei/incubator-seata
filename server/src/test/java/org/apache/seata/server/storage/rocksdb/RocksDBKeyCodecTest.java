@@ -16,6 +16,7 @@
  */
 package org.apache.seata.server.storage.rocksdb;
 
+import org.apache.seata.core.model.GlobalStatus;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -45,5 +46,37 @@ class RocksDBKeyCodecTest {
     @Test
     void testStartsWithRejectsShorterKey() {
         Assertions.assertFalse(RocksDBKeyCodec.startsWith(new byte[] {1}, new byte[] {1, 2}));
+    }
+
+    @Test
+    void testGlobalStatusIndexKeySortsByStatusAndBeginTime() {
+        byte[] beginEarly = RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 10L, "xid-b");
+        byte[] beginLate = RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 20L, "xid-a");
+        byte[] committing = RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Committing, 1L, "xid-c");
+
+        Assertions.assertTrue(compare(beginEarly, beginLate) < 0);
+        Assertions.assertTrue(compare(beginLate, committing) < 0);
+        Assertions.assertTrue(
+                RocksDBKeyCodec.startsWith(beginEarly, RocksDBKeyCodec.encodeGlobalStatusPrefix(GlobalStatus.Begin)));
+        Assertions.assertFalse(RocksDBKeyCodec.startsWith(
+                beginEarly, RocksDBKeyCodec.encodeGlobalStatusPrefix(GlobalStatus.Committing)));
+    }
+
+    @Test
+    void testTransactionIdIndexKeySortsByTransactionId() {
+        Assertions.assertTrue(
+                compare(RocksDBKeyCodec.encodeTransactionIdIndex(1L), RocksDBKeyCodec.encodeTransactionIdIndex(2L))
+                        < 0);
+    }
+
+    private int compare(byte[] left, byte[] right) {
+        int length = Math.min(left.length, right.length);
+        for (int i = 0; i < length; i++) {
+            int result = (left[i] & 0xff) - (right[i] & 0xff);
+            if (result != 0) {
+                return result;
+            }
+        }
+        return left.length - right.length;
     }
 }

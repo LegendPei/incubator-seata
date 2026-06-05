@@ -41,6 +41,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -149,6 +150,93 @@ class RocksDBTransactionStoreManagerTest {
 
             Assertions.assertEquals(1, actual.size());
             Assertions.assertEquals(begin.getXid(), actual.get(0).getXid());
+        }
+    }
+
+    @Test
+    void testGlobalUpdateMovesStatusIndex() {
+        try (RocksDBStoreEngine engine = open("status-update")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession globalSession = globalSession("tx-status-update", GlobalStatus.Begin);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession);
+            globalSession.setStatus(GlobalStatus.Committing);
+            storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession);
+
+            Assertions.assertTrue(storeManager
+                    .readSession(new GlobalStatus[] {GlobalStatus.Begin}, false)
+                    .isEmpty());
+            List<GlobalSession> committingSessions =
+                    storeManager.readSession(new GlobalStatus[] {GlobalStatus.Committing}, false);
+            Assertions.assertEquals(1, committingSessions.size());
+            Assertions.assertEquals(
+                    globalSession.getXid(), committingSessions.get(0).getXid());
+        }
+    }
+
+    @Test
+    void testGlobalRemoveDeletesIndexes() {
+        try (RocksDBStoreEngine engine = open("remove-indexes")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession globalSession = globalSession("tx-remove-indexes", GlobalStatus.Begin);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession);
+            storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession);
+
+            SessionCondition condition = new SessionCondition();
+            condition.setTransactionId(globalSession.getTransactionId());
+            Assertions.assertTrue(storeManager.readSession(condition).isEmpty());
+            Assertions.assertTrue(storeManager
+                    .readSession(new GlobalStatus[] {GlobalStatus.Begin}, false)
+                    .isEmpty());
+        }
+    }
+
+    @Test
+    void testStaleIndexesDoNotReturnMismatchedGlobalSession() {
+        try (RocksDBStoreEngine engine = open("stale-indexes")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession globalSession = globalSession("tx-stale-indexes", GlobalStatus.Begin);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession);
+
+            byte[] xidValue = globalSession.getXid().getBytes(StandardCharsets.UTF_8);
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(
+                            GlobalStatus.Committing, globalSession.getBeginTime(), globalSession.getXid()),
+                    xidValue);
+            long staleTransactionId = globalSession.getTransactionId() + 1;
+            engine.put(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(staleTransactionId),
+                    xidValue);
+
+            Assertions.assertTrue(storeManager
+                    .readSession(new GlobalStatus[] {GlobalStatus.Committing}, false)
+                    .isEmpty());
+            SessionCondition condition = new SessionCondition();
+            condition.setTransactionId(staleTransactionId);
+            Assertions.assertTrue(storeManager.readSession(condition).isEmpty());
+        }
+    }
+
+    @Test
+    void testReadSortByTimeoutBeginSessionsUsesBeginTimeOrder() {
+        try (RocksDBStoreEngine engine = open("begin-order")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession late = globalSession("tx-late", GlobalStatus.Begin);
+            late.setBeginTime(System.currentTimeMillis());
+            GlobalSession early = globalSession("tx-early", GlobalStatus.Begin);
+            early.setBeginTime(late.getBeginTime() - 1000);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, late);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, early);
+
+            List<GlobalSession> actual = storeManager.readSortByTimeoutBeginSessions(false);
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(early.getXid(), actual.get(0).getXid());
+            Assertions.assertEquals(late.getXid(), actual.get(1).getXid());
         }
     }
 

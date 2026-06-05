@@ -16,6 +16,8 @@
  */
 package org.apache.seata.server.storage.rocksdb;
 
+import org.apache.seata.core.model.GlobalStatus;
+
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -72,6 +74,24 @@ public final class RocksDBKeyCodec {
         return encodeXidPrefix(xid);
     }
 
+    public static byte[] encodeGlobalStatusIndex(GlobalStatus status, long beginTime, String xid) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeInt(out, status.getCode());
+        writeLong(out, beginTime);
+        write(out, encodeComponent(xid));
+        return out.toByteArray();
+    }
+
+    public static byte[] encodeGlobalStatusPrefix(GlobalStatus status) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeInt(out, status.getCode());
+        return out.toByteArray();
+    }
+
+    public static byte[] encodeTransactionIdIndex(long transactionId) {
+        return ByteBuffer.allocate(LONG_BYTE_SIZE).putLong(transactionId).array();
+    }
+
     public static boolean startsWith(byte[] key, byte[] prefix) {
         if (key == null || prefix == null || key.length < prefix.length) {
             return false;
@@ -99,6 +119,10 @@ public final class RocksDBKeyCodec {
 
     private static void writeLong(ByteArrayOutputStream out, long value) {
         write(out, ByteBuffer.allocate(LONG_BYTE_SIZE).putLong(value).array());
+    }
+
+    private static void writeInt(ByteArrayOutputStream out, int value) {
+        write(out, ByteBuffer.allocate(INT_BYTE_SIZE).putInt(value).array());
     }
 
     private static void write(ByteArrayOutputStream out, byte[] bytes) {
