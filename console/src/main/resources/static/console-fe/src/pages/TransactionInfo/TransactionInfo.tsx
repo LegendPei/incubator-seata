@@ -1094,6 +1094,12 @@ class TransactionInfo extends React.Component<GlobalProps, TransactionInfoState>
               onChange={(value: string) => { this.searchFilterOnChange('xid', value); }}
             />
           </FormItem>
+          <FormItem name="transactionId" label="transactionId">
+            <Input
+              placeholder={inputFilterPlaceholder}
+              onChange={(value: string) => { this.searchFilterOnChange('transactionId', value); }}
+            />
+          </FormItem>
           <FormItem name="applicationId" label="applicationId">
             <Input
               placeholder={inputFilterPlaceholder}

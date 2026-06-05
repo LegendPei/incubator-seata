@@ -36,10 +36,14 @@ import org.springframework.mock.env.MockEnvironment;
 
 import java.lang.reflect.Field;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 class RocksDBSessionManagerTest {
 
@@ -162,6 +166,97 @@ class RocksDBSessionManagerTest {
     }
 
     @Test
+    void testCoordinatorStatusQueries() throws Exception {
+        try (RocksDBStoreEngine engine = open("coordinator-query")) {
+            RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine);
+            GlobalSession begin = globalSession("tx-timeout-begin", GlobalStatus.Begin);
+            GlobalSession timeoutRollbacking = globalSession("tx-timeout-rollbacking", GlobalStatus.TimeoutRollbacking);
+            GlobalSession timeoutRollbackRetrying =
+                    globalSession("tx-timeout-rollback-retrying", GlobalStatus.TimeoutRollbackRetrying);
+            GlobalSession rollbackRetrying = globalSession("tx-rollback-retrying", GlobalStatus.RollbackRetrying);
+            GlobalSession commitRetrying = globalSession("tx-commit-retrying", GlobalStatus.CommitRetrying);
+            GlobalSession rollbacking = globalSession("tx-rollbacking", GlobalStatus.Rollbacking);
+            GlobalSession committing = globalSession("tx-committing", GlobalStatus.Committing);
+            GlobalSession asyncCommitting = globalSession("tx-async-committing", GlobalStatus.AsyncCommitting);
+            GlobalSession rollbacked = globalSession("tx-rollbacked-end", GlobalStatus.Rollbacked);
+            GlobalSession timeoutRollbacked =
+                    globalSession("tx-timeout-rollbacked-end", GlobalStatus.TimeoutRollbacked);
+            GlobalSession committed = globalSession("tx-committed-end", GlobalStatus.Committed);
+            GlobalSession finished = globalSession("tx-finished-end", GlobalStatus.Finished);
+
+            for (GlobalSession globalSession : Arrays.asList(
+                    begin,
+                    timeoutRollbacking,
+                    timeoutRollbackRetrying,
+                    rollbackRetrying,
+                    commitRetrying,
+                    rollbacking,
+                    committing,
+                    asyncCommitting,
+                    rollbacked,
+                    timeoutRollbacked,
+                    committed,
+                    finished)) {
+                sessionManager.addGlobalSession(globalSession);
+            }
+            sessionManager.addBranchSession(commitRetrying, branchSession(commitRetrying, 1001L));
+
+            SessionCondition timeoutCondition = new SessionCondition(GlobalStatus.Begin);
+            timeoutCondition.setLazyLoadBranch(true);
+            List<GlobalSession> timeoutSessions = sessionManager.findGlobalSessions(timeoutCondition);
+            assertXids(timeoutSessions, begin.getXid());
+            Assertions.assertTrue(timeoutSessions.get(0).isLazyLoadBranch());
+
+            SessionCondition retryRollbackingCondition = new SessionCondition(
+                    GlobalStatus.TimeoutRollbacking,
+                    GlobalStatus.TimeoutRollbackRetrying,
+                    GlobalStatus.RollbackRetrying);
+            retryRollbackingCondition.setLazyLoadBranch(true);
+            assertXids(
+                    sessionManager.findGlobalSessions(retryRollbackingCondition),
+                    timeoutRollbacking.getXid(),
+                    timeoutRollbackRetrying.getXid(),
+                    rollbackRetrying.getXid());
+
+            SessionCondition retryCommittingCondition = new SessionCondition(GlobalStatus.CommitRetrying);
+            retryCommittingCondition.setLazyLoadBranch(true);
+            List<GlobalSession> retryCommittingSessions = sessionManager.findGlobalSessions(retryCommittingCondition);
+            assertXids(retryCommittingSessions, commitRetrying.getXid());
+            Assertions.assertTrue(retryCommittingSessions.get(0).isLazyLoadBranch());
+
+            retryCommittingCondition.setLazyLoadBranch(false);
+            retryCommittingSessions = sessionManager.findGlobalSessions(retryCommittingCondition);
+            assertXids(retryCommittingSessions, commitRetrying.getXid());
+            Assertions.assertFalse(retryCommittingSessions.get(0).isLazyLoadBranch());
+            Assertions.assertEquals(
+                    1, retryCommittingSessions.get(0).getBranchSessions().size());
+
+            assertXids(
+                    sessionManager.findGlobalSessions(new SessionCondition(GlobalStatus.Rollbacking)),
+                    rollbacking.getXid());
+            assertXids(
+                    sessionManager.findGlobalSessions(new SessionCondition(GlobalStatus.Committing)),
+                    committing.getXid());
+            assertXids(
+                    sessionManager.findGlobalSessions(new SessionCondition(GlobalStatus.AsyncCommitting)),
+                    asyncCommitting.getXid());
+
+            SessionCondition endStateCondition = new SessionCondition(
+                    GlobalStatus.Rollbacked,
+                    GlobalStatus.TimeoutRollbacked,
+                    GlobalStatus.Committed,
+                    GlobalStatus.Finished);
+            endStateCondition.setLazyLoadBranch(true);
+            assertXids(
+                    sessionManager.findGlobalSessions(endStateCondition),
+                    rollbacked.getXid(),
+                    timeoutRollbacked.getXid(),
+                    committed.getXid(),
+                    finished.getXid());
+        }
+    }
+
+    @Test
     void testLockAndExecute() throws Exception {
         try (RocksDBStoreEngine engine = open("lock")) {
             RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine);
@@ -202,6 +297,12 @@ class RocksDBSessionManagerTest {
 
     private boolean contains(Collection<GlobalSession> sessions, GlobalSession expected) {
         return sessions.stream().anyMatch(session -> expected.getXid().equals(session.getXid()));
+    }
+
+    private void assertXids(Collection<GlobalSession> sessions, String... xids) {
+        Assertions.assertEquals(xids.length, sessions.size());
+        Set<String> actual = sessions.stream().map(GlobalSession::getXid).collect(Collectors.toSet());
+        Assertions.assertEquals(new HashSet<>(Arrays.asList(xids)), actual);
     }
 
     @SuppressWarnings("unchecked")
