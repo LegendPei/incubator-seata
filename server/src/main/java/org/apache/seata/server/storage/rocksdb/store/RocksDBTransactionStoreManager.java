@@ -231,16 +231,15 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     private List<GlobalSession> scanGlobalSessions(SessionCondition sessionCondition) {
         List<GlobalSession> result = new ArrayList<>();
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])) {
-            GlobalSession globalSession = decodeGlobalSession(entry.getValue(), sessionCondition.isLazyLoadBranch());
+        storeEngine.scanByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0], (key, value) -> {
+            GlobalSession globalSession = decodeGlobalSession(value, sessionCondition.isLazyLoadBranch());
             if (matches(globalSession, sessionCondition)) {
                 if (!sessionCondition.isLazyLoadBranch()) {
                     readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
                 }
                 result.add(globalSession);
             }
-        }
+        });
         return result;
     }
 
@@ -257,16 +256,18 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     }
 
     private List<GlobalSession> readByStatuses(SessionCondition sessionCondition) {
-        Set<String> xids = new LinkedHashSet<>();
-        for (GlobalStatus status : sessionCondition.getStatuses()) {
-            xids.addAll(indexManager.scanXidsByStatus(status));
-        }
+        Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
-        for (String xid : xids) {
-            GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
-            if (globalSession != null && matches(globalSession, sessionCondition)) {
-                result.add(globalSession);
-            }
+        for (GlobalStatus status : sessionCondition.getStatuses()) {
+            indexManager.scanXidsByStatus(status, xid -> {
+                if (!seenXids.add(xid)) {
+                    return;
+                }
+                GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
+                if (globalSession != null && matches(globalSession, sessionCondition)) {
+                    result.add(globalSession);
+                }
+            });
         }
         return result;
     }

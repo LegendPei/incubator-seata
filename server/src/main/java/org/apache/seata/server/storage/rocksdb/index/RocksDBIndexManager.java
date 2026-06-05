@@ -29,6 +29,8 @@ import org.rocksdb.WriteBatch;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Secondary index manager for RocksDB global sessions.
@@ -135,11 +137,16 @@ public class RocksDBIndexManager {
 
     public List<String> scanXidsByStatus(GlobalStatus status) {
         List<String> xids = new ArrayList<>();
+        scanXidsByStatus(status, xids::add);
+        return xids;
+    }
+
+    public void scanXidsByStatus(GlobalStatus status, Consumer<String> consumer) {
+        Objects.requireNonNull(consumer, "consumer must not be null");
         storeEngine.scanByPrefix(
                 RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
                 RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
-                (key, value) -> xids.add(string(value)));
-        return xids;
+                (key, value) -> consumer.accept(string(value)));
     }
 
     private GlobalSession decodeGlobalSession(byte[] value) {

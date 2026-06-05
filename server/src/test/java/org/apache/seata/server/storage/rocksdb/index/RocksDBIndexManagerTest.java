@@ -37,6 +37,7 @@ import org.springframework.mock.env.MockEnvironment;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -79,6 +80,10 @@ class RocksDBIndexManagerTest {
             Assertions.assertEquals(
                     begin.getXid(),
                     indexManager.scanXidsByStatus(GlobalStatus.Begin).get(0));
+            List<String> streamedBeginXids = new ArrayList<>();
+            indexManager.scanXidsByStatus(GlobalStatus.Begin, streamedBeginXids::add);
+            Assertions.assertEquals(1, streamedBeginXids.size());
+            Assertions.assertEquals(begin.getXid(), streamedBeginXids.get(0));
             Assertions.assertEquals(
                     RocksDBIndexManager.INDEX_BUILD_STATUS_COMPLETED,
                     getMetadata(engine, RocksDBIndexManager.INDEX_BUILD_STATUS_KEY));
