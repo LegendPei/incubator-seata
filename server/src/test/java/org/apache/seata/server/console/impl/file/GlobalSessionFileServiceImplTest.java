@@ -230,6 +230,42 @@ public class GlobalSessionFileServiceImplTest extends BaseSpringBootTest {
     }
 
     @Test
+    public void testQuery_WithNonPositiveTransactionIdDoesNotFilter() {
+        assertNonPositiveTransactionIdDoesNotFilter(0L);
+        assertNonPositiveTransactionIdDoesNotFilter(-1L);
+    }
+
+    private void assertNonPositiveTransactionIdDoesNotFilter(long transactionId) {
+        reset(mockSessionManager, mockGlobalSession);
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            GlobalSessionParam param = new GlobalSessionParam();
+            param.setPageSize(10);
+            param.setPageNum(1);
+            param.setTransactionId(transactionId);
+
+            List<GlobalSession> sessions = new ArrayList<>();
+            when(mockGlobalSession.getXid()).thenReturn("192.168.1.1:8091:123456");
+            when(mockGlobalSession.getTransactionId()).thenReturn(123456L);
+            when(mockGlobalSession.getApplicationId()).thenReturn("test-app");
+            when(mockGlobalSession.getStatus()).thenReturn(GlobalStatus.Begin);
+            when(mockGlobalSession.getTransactionName()).thenReturn("test-tx");
+            when(mockGlobalSession.getTransactionServiceGroup()).thenReturn("default");
+            when(mockGlobalSession.getBeginTime()).thenReturn(System.currentTimeMillis());
+            sessions.add(mockGlobalSession);
+
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(mockSessionManager);
+            when(mockSessionManager.allSessions()).thenReturn(sessions);
+
+            PageResult<GlobalSessionVO> result = service.query(param);
+
+            Assertions.assertNotNull(result);
+            Assertions.assertFalse(result.getData().isEmpty());
+            verify(mockSessionManager, never()).findGlobalSessions(any(SessionCondition.class));
+            verify(mockSessionManager).allSessions();
+        }
+    }
+
+    @Test
     public void testQuery_WithInvalidStatusFilter() {
         try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
             GlobalSessionParam param = new GlobalSessionParam();

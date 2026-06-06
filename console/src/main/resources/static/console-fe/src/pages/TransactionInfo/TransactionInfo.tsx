@@ -470,7 +470,7 @@ class TransactionInfo extends React.Component<GlobalProps, TransactionInfoState>
 
   searchFilterOnChange = (key: string, val: string) => {
     if (key === 'transactionId') {
-      const transactionId = val && /^\d+$/.test(val) ? val : undefined;
+      const transactionId = val && /^(?!0+$)\d+$/.test(val) ? val : undefined;
       this.setState(prevState => ({
         globalSessionParam: { ...prevState.globalSessionParam, transactionId },
       }));

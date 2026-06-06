@@ -130,6 +130,7 @@ public class GlobalSessionFileServiceImpl extends AbstractGlobalService implemen
                     &&
                     // transactionId
                     (param.getTransactionId() == null
+                            || param.getTransactionId() <= 0
                             || Objects.equals(session.getTransactionId(), param.getTransactionId()))
                     &&
                     // applicationId
