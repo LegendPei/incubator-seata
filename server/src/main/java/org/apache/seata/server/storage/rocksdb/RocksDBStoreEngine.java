@@ -17,15 +17,21 @@
 package org.apache.seata.server.storage.rocksdb;
 
 import org.apache.seata.common.exception.StoreException;
+import org.apache.seata.common.util.StringUtils;
+import org.rocksdb.BlockBasedTableConfig;
+import org.rocksdb.Cache;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.CompressionType;
 import org.rocksdb.DBOptions;
 import org.rocksdb.FlushOptions;
+import org.rocksdb.LRUCache;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.Statistics;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
 import org.slf4j.Logger;
@@ -38,6 +44,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
@@ -62,6 +69,8 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final ColumnFamilyOptions columnFamilyOptions;
     private final ReadOptions readOptions;
     private final WriteOptions writeOptions;
+    private final Cache blockCache;
+    private final Statistics statistics;
     private final RocksDB db;
 
     private volatile boolean closed;
@@ -72,13 +81,33 @@ public class RocksDBStoreEngine implements AutoCloseable {
         ColumnFamilyOptions openedColumnFamilyOptions = null;
         ReadOptions openedReadOptions = null;
         WriteOptions openedWriteOptions = null;
+        BlockBasedTableConfig openedTableConfig = null;
+        Cache openedBlockCache = null;
+        Statistics openedStatistics = null;
         RocksDB openedDb = null;
         List<ColumnFamilyHandle> openedHandles = new ArrayList<>();
         Map<RocksDBColumnFamily, ColumnFamilyHandle> openedHandleMap = new EnumMap<>(RocksDBColumnFamily.class);
         try {
             Files.createDirectories(Paths.get(config.getDbPath()));
             openedDbOptions = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
+            if (config.getMaxBackgroundJobs() > 0) {
+                openedDbOptions.setMaxBackgroundJobs(config.getMaxBackgroundJobs());
+            }
+            if (config.getMaxOpenFiles() > 0) {
+                openedDbOptions.setMaxOpenFiles(config.getMaxOpenFiles());
+            }
+            if (config.isEnableStatistics()) {
+                openedStatistics = new Statistics();
+                openedDbOptions.setStatistics(openedStatistics);
+            }
+
             openedColumnFamilyOptions = new ColumnFamilyOptions();
+            if (config.getBlockCacheSize() > 0) {
+                openedBlockCache = new LRUCache(config.getBlockCacheSize());
+                openedTableConfig = new BlockBasedTableConfig().setBlockCache(openedBlockCache);
+                openedColumnFamilyOptions.setTableFormatConfig(openedTableConfig);
+            }
+            applyColumnFamilyOptions(openedColumnFamilyOptions, config);
             openedReadOptions = new ReadOptions();
             openedWriteOptions = new WriteOptions().setDisableWAL(false).setSync(config.isSyncWrite());
 
@@ -96,14 +125,19 @@ public class RocksDBStoreEngine implements AutoCloseable {
             columnFamilyOptions = openedColumnFamilyOptions;
             readOptions = openedReadOptions;
             writeOptions = openedWriteOptions;
+            blockCache = openedBlockCache;
+            statistics = openedStatistics;
             db = openedDb;
             handles.putAll(openedHandleMap);
             LOGGER.info(
-                    "RocksDB file store engine opened, path:{}, columnFamilies:{}, formatVersion:{}, syncWrite:{}",
+                    "RocksDB file store engine opened, path:{}, columnFamilies:{}, formatVersion:{}, "
+                            + "rocksDBVersion:{}, syncWrite:{}, options:{}",
                     config.getDbPath(),
                     handles.keySet(),
                     FORMAT_VERSION,
-                    config.isSyncWrite());
+                    rocksDBVersion(),
+                    config.isSyncWrite(),
+                    config.tuningSummary());
         } catch (StoreException e) {
             closeQuietly(
                     openedHandles,
@@ -111,7 +145,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     openedWriteOptions,
                     openedReadOptions,
                     openedColumnFamilyOptions,
-                    openedDbOptions);
+                    openedDbOptions,
+                    openedBlockCache,
+                    openedStatistics);
             throw e;
         } catch (Exception e) {
             closeQuietly(
@@ -120,7 +156,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     openedWriteOptions,
                     openedReadOptions,
                     openedColumnFamilyOptions,
-                    openedDbOptions);
+                    openedDbOptions,
+                    openedBlockCache,
+                    openedStatistics);
             throw new StoreException(e, "open RocksDB file store engine failed, path:" + config.getDbPath());
         }
     }
@@ -274,6 +312,8 @@ public class RocksDBStoreEngine implements AutoCloseable {
         readOptions.close();
         columnFamilyOptions.close();
         dbOptions.close();
+        closeQuietly(blockCache);
+        closeQuietly(statistics);
     }
 
     private static void initMetadata(RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions)
@@ -305,7 +345,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
             WriteOptions writeOptions,
             ReadOptions readOptions,
             ColumnFamilyOptions columnFamilyOptions,
-            DBOptions dbOptions) {
+            DBOptions dbOptions,
+            Cache blockCache,
+            Statistics statistics) {
         for (ColumnFamilyHandle handle : handles) {
             handle.close();
         }
@@ -323,6 +365,72 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
         if (dbOptions != null) {
             dbOptions.close();
+        }
+        closeQuietly(blockCache);
+        closeQuietly(statistics);
+    }
+
+    private static void applyColumnFamilyOptions(ColumnFamilyOptions options, RocksDBStoreConfig config) {
+        if (config.getWriteBufferSize() > 0) {
+            options.setWriteBufferSize(config.getWriteBufferSize());
+        }
+        if (config.getMaxWriteBufferNumber() > 0) {
+            options.setMaxWriteBufferNumber(config.getMaxWriteBufferNumber());
+        }
+        if (config.getMinWriteBufferNumberToMerge() > 0) {
+            options.setMinWriteBufferNumberToMerge(config.getMinWriteBufferNumberToMerge());
+        }
+        if (config.getTargetFileSizeBase() > 0) {
+            options.setTargetFileSizeBase(config.getTargetFileSizeBase());
+        }
+        if (config.getLevel0FileNumCompactionTrigger() > 0) {
+            options.setLevel0FileNumCompactionTrigger(config.getLevel0FileNumCompactionTrigger());
+        }
+        if (config.getLevel0SlowdownWritesTrigger() > 0) {
+            options.setLevel0SlowdownWritesTrigger(config.getLevel0SlowdownWritesTrigger());
+        }
+        if (config.getLevel0StopWritesTrigger() > 0) {
+            options.setLevel0StopWritesTrigger(config.getLevel0StopWritesTrigger());
+        }
+        if (config.isOptimizeFiltersForHits()) {
+            options.optimizeFiltersForHits();
+        }
+        CompressionType compressionType = compressionType(config.getCompressionType());
+        if (compressionType != null) {
+            options.setCompressionType(compressionType);
+        }
+    }
+
+    private static CompressionType compressionType(String configuredCompressionType) {
+        if (StringUtils.isBlank(configuredCompressionType)) {
+            return null;
+        }
+        String value = configuredCompressionType.trim().replace('-', '_').toUpperCase(Locale.ROOT);
+        if ("NONE".equals(value) || "NO".equals(value)) {
+            value = "NO_COMPRESSION";
+        } else if (!value.endsWith("_COMPRESSION")) {
+            value = value + "_COMPRESSION";
+        }
+        try {
+            return CompressionType.valueOf(value);
+        } catch (IllegalArgumentException e) {
+            throw new StoreException(e, "unsupported RocksDB compression type:" + configuredCompressionType);
+        }
+    }
+
+    private static String rocksDBVersion() {
+        RocksDB.Version version = RocksDB.rocksdbVersion();
+        return version == null ? "unknown" : version.toString();
+    }
+
+    private static void closeQuietly(AutoCloseable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (Exception e) {
+            LOGGER.warn("close RocksDB resource failed", e);
         }
     }
 
