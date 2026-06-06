@@ -27,6 +27,7 @@ import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreDiagnostics;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
@@ -63,7 +64,9 @@ public final class RocksDBFileModeBenchmark {
 
     private static final String CSV_HEADER =
             "scenario,globalCount,branchPerGlobal,lockPerBranch,syncWrite,warmupRounds,measureRounds,batchSize,"
-                    + "ops,totalMs,opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles";
+                    + "ops,totalMs,opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles,"
+                    + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
+                    + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys";
     private static final List<String> ALL_BENCHMARKS = Arrays.asList("write", "query", "lock", "cleanup", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
@@ -518,7 +521,19 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + footprint.sstFiles
                 + ","
-                + footprint.walFiles);
+                + footprint.walFiles
+                + ","
+                + footprint.estimateLiveDataSizeBytes
+                + ","
+                + footprint.totalSstFilesSizeBytes
+                + ","
+                + footprint.pendingCompactionBytes
+                + ","
+                + footprint.globalEstimateKeys
+                + ","
+                + footprint.branchEstimateKeys
+                + ","
+                + footprint.lockEstimateKeys);
     }
 
     private static void printEnvironment(BenchmarkOptions options, Path rootPath, Path runPath) {
@@ -781,17 +796,39 @@ public final class RocksDBFileModeBenchmark {
         private final long fileCount;
         private final long sstFiles;
         private final long walFiles;
+        private final long estimateLiveDataSizeBytes;
+        private final long totalSstFilesSizeBytes;
+        private final long pendingCompactionBytes;
+        private final long globalEstimateKeys;
+        private final long branchEstimateKeys;
+        private final long lockEstimateKeys;
 
-        private DbFootprint(long sizeBytes, long fileCount, long sstFiles, long walFiles) {
+        private DbFootprint(
+                long sizeBytes,
+                long fileCount,
+                long sstFiles,
+                long walFiles,
+                long estimateLiveDataSizeBytes,
+                long totalSstFilesSizeBytes,
+                long pendingCompactionBytes,
+                long globalEstimateKeys,
+                long branchEstimateKeys,
+                long lockEstimateKeys) {
             this.sizeBytes = sizeBytes;
             this.fileCount = fileCount;
             this.sstFiles = sstFiles;
             this.walFiles = walFiles;
+            this.estimateLiveDataSizeBytes = estimateLiveDataSizeBytes;
+            this.totalSstFilesSizeBytes = totalSstFilesSizeBytes;
+            this.pendingCompactionBytes = pendingCompactionBytes;
+            this.globalEstimateKeys = globalEstimateKeys;
+            this.branchEstimateKeys = branchEstimateKeys;
+            this.lockEstimateKeys = lockEstimateKeys;
         }
 
         private static DbFootprint from(Path path) throws IOException {
             if (path == null || !Files.exists(path)) {
-                return new DbFootprint(0L, 0L, 0L, 0L);
+                return empty();
             }
             final long[] values = new long[4];
             try (Stream<Path> stream = Files.walk(path)) {
@@ -807,7 +844,33 @@ public final class RocksDBFileModeBenchmark {
                     }
                 });
             }
-            return new DbFootprint(values[0], values[1], values[2], values[3]);
+            RocksDBStoreDiagnostics diagnostics = diagnostics(path);
+            return new DbFootprint(
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3],
+                    diagnostics.getProperty(RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE),
+                    diagnostics.getProperty(RocksDBStoreDiagnostics.TOTAL_SST_FILES_SIZE),
+                    diagnostics.getProperty(RocksDBStoreDiagnostics.ESTIMATE_PENDING_COMPACTION_BYTES),
+                    diagnostics.getColumnFamilyProperty(
+                            RocksDBColumnFamily.GLOBAL_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS),
+                    diagnostics.getColumnFamilyProperty(
+                            RocksDBColumnFamily.BRANCH_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS),
+                    diagnostics.getColumnFamilyProperty(
+                            RocksDBColumnFamily.LOCK, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+        }
+
+        private static DbFootprint empty() {
+            return new DbFootprint(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+        }
+
+        private static RocksDBStoreDiagnostics diagnostics(Path path) {
+            try (RocksDBStoreEngine engine = open(path, false)) {
+                return engine.diagnostics();
+            } catch (Exception e) {
+                return RocksDBStoreEngine.closedDiagnostics();
+            }
         }
 
         private static long size(Path file) {
