@@ -180,11 +180,68 @@ class RocksDBStoreEngineTest {
                 () -> RocksDBStoreEngineFactory.getInstance(new RocksDBStoreConfig(config.getDbPath(), false)));
     }
 
+    @Test
+    void testOpenWithTunedOptions() {
+        RocksDBStoreConfig config = tunedConfig("tuned", true);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            byte[] key = RocksDBKeyCodec.encodeXid("xid-tuned");
+            byte[] value = RocksDBValueCodec.encode(
+                    RocksDBValueCodec.ValueType.GLOBAL_SESSION, "global".getBytes(StandardCharsets.UTF_8));
+
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value);
+
+            Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+        }
+    }
+
+    @Test
+    void testOpenRejectsInvalidCompressionType() {
+        RocksDBStoreConfig config = tunedConfig("invalid-compression", true, "unknown");
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, () -> RocksDBStoreEngine.open(config));
+
+        Assertions.assertTrue(exception.getMessage().contains("unsupported RocksDB compression type"));
+    }
+
+    @Test
+    void testFactoryRejectsDifferentTuningOptions() {
+        RocksDBStoreConfig config = tunedConfig("factory-tuning", true);
+        RocksDBStoreEngineFactory.getInstance(config);
+
+        Assertions.assertThrows(
+                StoreException.class,
+                () -> RocksDBStoreEngineFactory.getInstance(new RocksDBStoreConfig(config.getDbPath(), true)));
+    }
+
     private RocksDBStoreEngine open(String name, boolean syncWrite) {
         return RocksDBStoreEngine.open(config(name, syncWrite));
     }
 
     private RocksDBStoreConfig config(String name, boolean syncWrite) {
         return new RocksDBStoreConfig(tempDir.resolve(name).toString(), syncWrite);
+    }
+
+    private RocksDBStoreConfig tunedConfig(String name, boolean syncWrite) {
+        return tunedConfig(name, syncWrite, "no");
+    }
+
+    private RocksDBStoreConfig tunedConfig(String name, boolean syncWrite, String compressionType) {
+        return new RocksDBStoreConfig(
+                tempDir.resolve(name).toString(),
+                syncWrite,
+                1024L * 1024L,
+                1024L * 1024L,
+                2,
+                1,
+                2,
+                64,
+                1024L * 1024L,
+                4,
+                8,
+                12,
+                true,
+                true,
+                compressionType);
     }
 }
