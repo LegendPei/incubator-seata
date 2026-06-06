@@ -186,6 +186,23 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
     }
 
+    public void scanByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix, RocksDBEntryConsumer consumer) {
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        Objects.requireNonNull(consumer, "consumer must not be null");
+        try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+            for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
+                byte[] key = iterator.key();
+                if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                    break;
+                }
+                consumer.accept(copy(key), copy(iterator.value()));
+            }
+            iterator.status();
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
     public boolean prefixExists(RocksDBColumnFamily columnFamily, byte[] prefix) {
         Objects.requireNonNull(prefix, "prefix must not be null");
         try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
@@ -332,5 +349,14 @@ public class RocksDBStoreEngine implements AutoCloseable {
         public byte[] getValue() {
             return copy(value);
         }
+    }
+
+    /**
+     * Streaming RocksDB entry consumer.
+     */
+    @FunctionalInterface
+    public interface RocksDBEntryConsumer {
+
+        void accept(byte[] key, byte[] value) throws RocksDBException;
     }
 }

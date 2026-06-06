@@ -29,6 +29,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBLocalLocks;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.RocksDBValueCodec;
+import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
 import org.apache.seata.server.store.AbstractTransactionStoreManager;
 import org.apache.seata.server.store.SessionStorable;
 import org.apache.seata.server.store.TransactionStoreManager;
@@ -37,8 +38,9 @@ import org.rocksdb.WriteBatch;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * RocksDB transaction store manager for file store engine.
@@ -47,6 +49,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     private final RocksDBStoreEngine storeEngine;
     private final RocksDBLocalLocks xidLocks;
+    private final RocksDBIndexManager indexManager;
     private final boolean factoryManaged;
 
     public RocksDBTransactionStoreManager() {
@@ -69,6 +72,8 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             RocksDBStoreEngine storeEngine, RocksDBLocalLocks xidLocks, boolean factoryManaged) {
         this.storeEngine = storeEngine;
         this.xidLocks = xidLocks;
+        this.indexManager = new RocksDBIndexManager(storeEngine);
+        this.indexManager.ensureReady();
         this.factoryManaged = factoryManaged;
     }
 
@@ -124,9 +129,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     @Override
     public List<GlobalSession> readSortByTimeoutBeginSessions(boolean withBranchSessions) {
-        List<GlobalSession> sessions = readSession(new GlobalStatus[] {GlobalStatus.Begin}, withBranchSessions);
-        sessions.sort(Comparator.comparingLong(GlobalSession::getBeginTime));
-        return sessions;
+        return readSession(new GlobalStatus[] {GlobalStatus.Begin}, withBranchSessions);
     }
 
     @Override
@@ -136,7 +139,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
         SessionCondition sessionCondition = new SessionCondition(statuses);
         sessionCondition.setLazyLoadBranch(!withBranchSessions);
-        return scanGlobalSessions(sessionCondition);
+        return readByStatuses(sessionCondition);
     }
 
     @Override
@@ -151,6 +154,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             }
             return Collections.singletonList(globalSession);
         }
+        if (sessionCondition.getTransactionId() != null && sessionCondition.getTransactionId() > 0) {
+            return readByTransactionId(sessionCondition);
+        }
+        if (CollectionUtils.isNotEmpty(sessionCondition.getStatuses())) {
+            return readByStatuses(sessionCondition);
+        }
         return scanGlobalSessions(sessionCondition);
     }
 
@@ -164,14 +173,27 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     }
 
     private void writeGlobalSession(GlobalSession session) {
-        storeEngine.put(
-                RocksDBColumnFamily.GLOBAL_SESSION,
-                RocksDBKeyCodec.encodeXid(session.getXid()),
-                encodeGlobalSession(session));
+        byte[] key = RocksDBKeyCodec.encodeXid(session.getXid());
+        try (WriteBatch batch = new WriteBatch()) {
+            byte[] oldValue = storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, key);
+            if (oldValue != null) {
+                indexManager.deleteGlobalIndexes(batch, decodeGlobalSession(oldValue, true));
+            }
+            batch.put(storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION), key, encodeGlobalSession(session));
+            indexManager.putGlobalIndexes(batch, session);
+            storeEngine.write(batch);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "write RocksDB global session failed, xid:" + session.getXid());
+        }
     }
 
     private void removeGlobalSession(GlobalSession session) {
         try (WriteBatch batch = new WriteBatch()) {
+            byte[] oldValue =
+                    storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(session.getXid()));
+            if (oldValue != null) {
+                indexManager.deleteGlobalIndexes(batch, decodeGlobalSession(oldValue, true));
+            }
             batch.delete(
                     storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION),
                     RocksDBKeyCodec.encodeXid(session.getXid()));
@@ -209,15 +231,43 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     private List<GlobalSession> scanGlobalSessions(SessionCondition sessionCondition) {
         List<GlobalSession> result = new ArrayList<>();
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])) {
-            GlobalSession globalSession = decodeGlobalSession(entry.getValue(), sessionCondition.isLazyLoadBranch());
+        storeEngine.scanByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0], (key, value) -> {
+            GlobalSession globalSession = decodeGlobalSession(value, sessionCondition.isLazyLoadBranch());
             if (matches(globalSession, sessionCondition)) {
                 if (!sessionCondition.isLazyLoadBranch()) {
                     readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
                 }
                 result.add(globalSession);
             }
+        });
+        return result;
+    }
+
+    private List<GlobalSession> readByTransactionId(SessionCondition sessionCondition) {
+        String xid = indexManager.findXidByTransactionId(sessionCondition.getTransactionId());
+        if (StringUtils.isBlank(xid)) {
+            return Collections.emptyList();
+        }
+        GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
+        if (globalSession == null || !matches(globalSession, sessionCondition)) {
+            return Collections.emptyList();
+        }
+        return Collections.singletonList(globalSession);
+    }
+
+    private List<GlobalSession> readByStatuses(SessionCondition sessionCondition) {
+        Set<String> seenXids = new LinkedHashSet<>();
+        List<GlobalSession> result = new ArrayList<>();
+        for (GlobalStatus status : sessionCondition.getStatuses()) {
+            indexManager.scanXidsByStatus(status, xid -> {
+                if (!seenXids.add(xid)) {
+                    return;
+                }
+                GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
+                if (globalSession != null && matches(globalSession, sessionCondition)) {
+                    result.add(globalSession);
+                }
+            });
         }
         return result;
     }

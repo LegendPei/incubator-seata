@@ -264,7 +264,9 @@ public class RocksDBMigrationService {
         return storeEngine.prefixExists(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])
                 || storeEngine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, new byte[0])
                 || storeEngine.prefixExists(RocksDBColumnFamily.LOCK, new byte[0])
-                || storeEngine.prefixExists(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]);
+                || storeEngine.prefixExists(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                || storeEngine.prefixExists(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, new byte[0])
+                || storeEngine.prefixExists(RocksDBColumnFamily.TRANSACTION_ID_INDEX, new byte[0]);
     }
 
     private void clearCurrentState(RocksDBStoreEngine storeEngine) {
@@ -272,6 +274,8 @@ public class RocksDBMigrationService {
         storeEngine.deleteByPrefix(RocksDBColumnFamily.BRANCH_SESSION, new byte[0]);
         storeEngine.deleteByPrefix(RocksDBColumnFamily.LOCK, new byte[0]);
         storeEngine.deleteByPrefix(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]);
+        storeEngine.deleteByPrefix(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, new byte[0]);
+        storeEngine.deleteByPrefix(RocksDBColumnFamily.TRANSACTION_ID_INDEX, new byte[0]);
     }
 
     private String getMetadata(RocksDBStoreEngine storeEngine, String key) {

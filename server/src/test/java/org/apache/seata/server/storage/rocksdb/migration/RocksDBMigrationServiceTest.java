@@ -26,6 +26,7 @@ import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
+import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
 import org.apache.seata.server.storage.file.store.FileSessionLogReplayer;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
@@ -97,6 +98,17 @@ class RocksDBMigrationServiceTest {
             Assertions.assertEquals(
                     branch.getBranchId(), actual.getBranchSessions().get(0).getBranchId());
             Assertions.assertNull(storeManager.readSession(committed.getXid(), true));
+            SessionCondition transactionIdCondition = new SessionCondition();
+            transactionIdCondition.setTransactionId(active.getTransactionId());
+            Assertions.assertEquals(
+                    active.getXid(),
+                    storeManager.readSession(transactionIdCondition).get(0).getXid());
+            Assertions.assertEquals(
+                    active.getXid(),
+                    storeManager
+                            .readSession(new GlobalStatus[] {GlobalStatus.Begin}, false)
+                            .get(0)
+                            .getXid());
             Assertions.assertTrue(Files.isRegularFile(migrationMarker(fileLog)));
 
             Assertions.assertFalse(migrationService.migrate(fileLog, engine));

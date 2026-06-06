@@ -17,6 +17,7 @@
 package org.apache.seata.server.storage.rocksdb;
 
 import org.apache.seata.common.exception.StoreException;
+import org.apache.seata.core.model.GlobalStatus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -102,6 +103,21 @@ class RocksDBStoreEngineTest {
             Assertions.assertEquals(
                     Integer.toString(RocksDBStoreEngine.FORMAT_VERSION),
                     new String(formatVersion, StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    void testPhase3IndexColumnFamiliesAvailable() {
+        try (RocksDBStoreEngine engine = open("phase3-index-cf", true)) {
+            byte[] statusKey = RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 1L, "xid-index");
+            byte[] transactionIdKey = RocksDBKeyCodec.encodeTransactionIdIndex(1L);
+            byte[] value = "xid-index".getBytes(StandardCharsets.UTF_8);
+
+            engine.put(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey, value);
+            engine.put(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey, value);
+
+            Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey));
+            Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey));
         }
     }
 

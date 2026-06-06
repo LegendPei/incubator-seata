@@ -47,7 +47,15 @@ public enum RocksDBColumnFamily {
     /**
      * Branch to lock index column family.
      */
-    LOCK_BRANCH_INDEX("lock_branch_index");
+    LOCK_BRANCH_INDEX("lock_branch_index"),
+    /**
+     * Global status query index column family.
+     */
+    GLOBAL_STATUS_INDEX("global_status_index"),
+    /**
+     * Global transaction id query index column family.
+     */
+    TRANSACTION_ID_INDEX("transaction_id_index");
 
     private final String name;
     private final byte[] nameBytes;

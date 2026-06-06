@@ -36,7 +36,9 @@ import org.apache.seata.server.cluster.raft.context.SeataClusterContext;
 import org.apache.seata.server.lock.LockManager;
 import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.lock.distributed.DistributedLockerFactory;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
+import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
 import org.apache.seata.server.storage.rocksdb.migration.RocksDBMigrationService;
 import org.apache.seata.server.store.FileStoreEngine;
@@ -146,10 +148,10 @@ public class SessionHolder {
                         new Object[] {vGroupMappingStorePath});
 
                 if (FileStoreEngine.ROCKSDB == fileStoreEngine) {
+                    RocksDBStoreEngine rocksDBStoreEngine = RocksDBStoreEngineFactory.getInstance();
                     new RocksDBMigrationService()
-                            .migrate(
-                                    Paths.get(sessionStorePath, ROOT_SESSION_MANAGER_NAME),
-                                    RocksDBStoreEngineFactory.getInstance());
+                            .migrate(Paths.get(sessionStorePath, ROOT_SESSION_MANAGER_NAME), rocksDBStoreEngine);
+                    new RocksDBIndexManager(rocksDBStoreEngine).ensureReady();
                     ROOT_SESSION_MANAGER = EnhancedServiceLoader.load(
                             SessionManager.class,
                             FileStoreEngine.ROCKSDB.getName(),
