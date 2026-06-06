@@ -43,6 +43,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -58,6 +59,21 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private static final int DELETE_BATCH_SIZE = 1024;
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBStoreEngine.class);
     private static final byte[] FORMAT_VERSION_KEY = "format_version".getBytes(StandardCharsets.UTF_8);
+    private static final String[] DB_LONG_PROPERTIES = {
+        RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE,
+        RocksDBStoreDiagnostics.TOTAL_SST_FILES_SIZE,
+        RocksDBStoreDiagnostics.ESTIMATE_PENDING_COMPACTION_BYTES,
+        RocksDBStoreDiagnostics.CUR_SIZE_ACTIVE_MEM_TABLE,
+        RocksDBStoreDiagnostics.CUR_SIZE_ALL_MEM_TABLES,
+        RocksDBStoreDiagnostics.NUM_LIVE_VERSIONS
+    };
+    private static final String[] COLUMN_FAMILY_LONG_PROPERTIES = {
+        RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS,
+        RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL0,
+        RocksDBStoreDiagnostics.NUM_IMMUTABLE_MEM_TABLE,
+        RocksDBStoreDiagnostics.MEM_TABLE_FLUSH_PENDING,
+        RocksDBStoreDiagnostics.COMPACTION_PENDING
+    };
 
     static {
         RocksDB.loadLibrary();
@@ -138,6 +154,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     rocksDBVersion(),
                     config.isSyncWrite(),
                     config.tuningSummary());
+            RocksDBStoreMetrics.tryRegister(this);
         } catch (StoreException e) {
             closeQuietly(
                     openedHandles,
@@ -173,6 +190,36 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public boolean isSyncWrite() {
         return config.isSyncWrite();
+    }
+
+    public RocksDBStoreDiagnostics diagnostics() {
+        if (closed) {
+            return closedDiagnostics(config);
+        }
+        Map<String, Long> properties = new LinkedHashMap<>();
+        Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties =
+                new EnumMap<>(RocksDBColumnFamily.class);
+        List<String> errors = new ArrayList<>();
+        for (String property : DB_LONG_PROPERTIES) {
+            properties.put(property, readLongProperty(property, errors));
+        }
+        for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
+            Map<String, Long> values = new LinkedHashMap<>();
+            for (String property : COLUMN_FAMILY_LONG_PROPERTIES) {
+                values.put(property, readLongProperty(columnFamily, property, errors));
+            }
+            columnFamilyProperties.put(columnFamily, values);
+        }
+        return new RocksDBStoreDiagnostics(
+                config.getDbPath(),
+                FORMAT_VERSION,
+                rocksDBVersion(),
+                config.isSyncWrite(),
+                false,
+                config.tuningSummary(),
+                properties,
+                columnFamilyProperties,
+                errors);
     }
 
     public byte[] get(RocksDBColumnFamily columnFamily, byte[] key) {
@@ -304,6 +351,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
             return;
         }
         closed = true;
+        RocksDBStoreMetrics.unregister(this);
         for (ColumnFamilyHandle handle : handles.values()) {
             handle.close();
         }
@@ -314,6 +362,26 @@ public class RocksDBStoreEngine implements AutoCloseable {
         dbOptions.close();
         closeQuietly(blockCache);
         closeQuietly(statistics);
+    }
+
+    public static RocksDBStoreDiagnostics closedDiagnostics() {
+        return closedDiagnostics(null);
+    }
+
+    private static RocksDBStoreDiagnostics closedDiagnostics(RocksDBStoreConfig config) {
+        String dbPath = config == null ? null : config.getDbPath();
+        boolean syncWrite = config != null && config.isSyncWrite();
+        String tuningSummary = config == null ? null : config.tuningSummary();
+        return new RocksDBStoreDiagnostics(
+                dbPath,
+                FORMAT_VERSION,
+                rocksDBVersion(),
+                syncWrite,
+                true,
+                tuningSummary,
+                new LinkedHashMap<>(),
+                new EnumMap<>(RocksDBColumnFamily.class),
+                new ArrayList<>());
     }
 
     private static void initMetadata(RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions)
@@ -398,6 +466,33 @@ public class RocksDBStoreEngine implements AutoCloseable {
         CompressionType compressionType = compressionType(config.getCompressionType());
         if (compressionType != null) {
             options.setCompressionType(compressionType);
+        }
+    }
+
+    private long readLongProperty(String property, List<String> errors) {
+        try {
+            return db.getAggregatedLongProperty(property);
+        } catch (RocksDBException e) {
+            try {
+                return db.getLongProperty(property);
+            } catch (RocksDBException fallback) {
+                errors.add("read RocksDB property failed, property:" + property + ", message:" + fallback.getMessage());
+                return 0L;
+            }
+        }
+    }
+
+    private long readLongProperty(RocksDBColumnFamily columnFamily, String property, List<String> errors) {
+        try {
+            return db.getLongProperty(handle(columnFamily), property);
+        } catch (RocksDBException e) {
+            errors.add("read RocksDB column family property failed, columnFamily:"
+                    + columnFamily.getName()
+                    + ", property:"
+                    + property
+                    + ", message:"
+                    + e.getMessage());
+            return 0L;
         }
     }
 
