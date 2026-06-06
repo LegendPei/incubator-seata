@@ -132,6 +132,35 @@ public class GlobalSessionFileServiceImplTest extends BaseSpringBootTest {
     }
 
     @Test
+    public void testQuery_WithPartialXidFilterFallsBackToScan() {
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            GlobalSessionParam param = new GlobalSessionParam();
+            param.setPageSize(10);
+            param.setPageNum(1);
+            param.setXid("123456");
+
+            List<GlobalSession> sessions = new ArrayList<>();
+            when(mockGlobalSession.getXid()).thenReturn("192.168.1.1:8091:123456");
+            when(mockGlobalSession.getApplicationId()).thenReturn("test-app");
+            when(mockGlobalSession.getStatus()).thenReturn(GlobalStatus.Begin);
+            when(mockGlobalSession.getTransactionName()).thenReturn("test-tx");
+            when(mockGlobalSession.getTransactionServiceGroup()).thenReturn("default");
+            when(mockGlobalSession.getBeginTime()).thenReturn(System.currentTimeMillis());
+            sessions.add(mockGlobalSession);
+
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(mockSessionManager);
+            when(mockSessionManager.allSessions()).thenReturn(sessions);
+
+            PageResult<GlobalSessionVO> result = service.query(param);
+
+            Assertions.assertNotNull(result);
+            Assertions.assertFalse(result.getData().isEmpty());
+            verify(mockSessionManager, never()).findGlobalSession(anyString(), anyBoolean());
+            verify(mockSessionManager).allSessions();
+        }
+    }
+
+    @Test
     public void testQuery_WithStatusFilter() {
         try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
             GlobalSessionParam param = new GlobalSessionParam();

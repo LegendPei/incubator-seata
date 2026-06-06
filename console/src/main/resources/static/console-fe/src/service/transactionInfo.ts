@@ -20,7 +20,7 @@ import qs from 'qs';
 
 export type GlobalSessionParam = {
   xid?: string,
-  transactionId?: number,
+  transactionId?: string,
   applicationId?: string,
   status?: number,
   transactionName?: string,

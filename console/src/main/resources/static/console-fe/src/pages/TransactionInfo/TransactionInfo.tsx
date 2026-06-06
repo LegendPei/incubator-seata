@@ -469,6 +469,13 @@ class TransactionInfo extends React.Component<GlobalProps, TransactionInfoState>
   }
 
   searchFilterOnChange = (key: string, val: string) => {
+    if (key === 'transactionId') {
+      const transactionId = val && /^\d+$/.test(val) ? val : undefined;
+      this.setState(prevState => ({
+        globalSessionParam: { ...prevState.globalSessionParam, transactionId },
+      }));
+      return;
+    }
     if (key === 'namespace') {
       const selectedNamespace = this.state.namespaceOptions.get(val);
       const clusters = selectedNamespace ? selectedNamespace.clusters : [];

@@ -67,7 +67,7 @@ public class GlobalSessionFileServiceImpl extends AbstractGlobalService implemen
 
     private Collection<GlobalSession> findCandidateSessions(GlobalSessionParam param) {
         SessionManager sessionManager = SessionHolder.getRootSessionManager();
-        if (isNotBlank(param.getXid())) {
+        if (isNotBlank(param.getXid()) && isCompleteXid(param.getXid())) {
             GlobalSession globalSession = sessionManager.findGlobalSession(param.getXid(), param.isWithBranch());
             return globalSession == null ? Collections.emptyList() : Collections.singletonList(globalSession);
         }
@@ -94,6 +94,24 @@ public class GlobalSessionFileServiceImpl extends AbstractGlobalService implemen
             return GlobalStatus.get(status);
         } catch (IllegalArgumentException e) {
             return null;
+        }
+    }
+
+    private boolean isCompleteXid(String xid) {
+        int lastSplitIndex = xid.lastIndexOf(':');
+        if (lastSplitIndex <= 0 || lastSplitIndex == xid.length() - 1) {
+            return false;
+        }
+        int portSplitIndex = xid.lastIndexOf(':', lastSplitIndex - 1);
+        if (portSplitIndex <= 0 || portSplitIndex == lastSplitIndex - 1) {
+            return false;
+        }
+        try {
+            Integer.parseInt(xid.substring(portSplitIndex + 1, lastSplitIndex));
+            Long.parseLong(xid.substring(lastSplitIndex + 1));
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
         }
     }
 
