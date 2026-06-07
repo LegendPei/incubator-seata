@@ -55,6 +55,7 @@ class RocksDBStoreConfigTest {
         Assertions.assertFalse(config.isEnableStatistics());
         Assertions.assertFalse(config.isOptimizeFiltersForHits());
         Assertions.assertNull(config.getCompressionType());
+        Assertions.assertFalse(config.isEnableRangeDelete());
     }
 
     @Test
@@ -74,6 +75,7 @@ class RocksDBStoreConfigTest {
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_STATISTICS, "true");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS, "true");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_COMPRESSION_TYPE, "no");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE, "true");
 
         RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), true);
 
@@ -91,6 +93,7 @@ class RocksDBStoreConfigTest {
         Assertions.assertTrue(config.isEnableStatistics());
         Assertions.assertTrue(config.isOptimizeFiltersForHits());
         Assertions.assertEquals("no", config.getCompressionType());
+        Assertions.assertTrue(config.isEnableRangeDelete());
     }
 
     @Test

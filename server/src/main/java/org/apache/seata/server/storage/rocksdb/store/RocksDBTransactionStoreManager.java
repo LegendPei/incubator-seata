@@ -197,10 +197,8 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             batch.delete(
                     storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION),
                     RocksDBKeyCodec.encodeXid(session.getXid()));
-            for (RocksDBStoreEngine.RocksDBEntry entry : storeEngine.prefixScan(
-                    RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(session.getXid()))) {
-                batch.delete(storeEngine.handle(RocksDBColumnFamily.BRANCH_SESSION), entry.getKey());
-            }
+            storeEngine.deleteByPrefix(
+                    batch, RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(session.getXid()));
             storeEngine.write(batch);
         } catch (RocksDBException e) {
             throw new StoreException(e, "remove RocksDB global session failed, xid:" + session.getXid());
