@@ -222,6 +222,11 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_COMPRESSION_TYPE = STORE_FILE_ROCKSDB_PREFIX + "compressionType";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE.
+     */
+    String STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE = STORE_FILE_ROCKSDB_PREFIX + "enableRangeDelete";
+
+    /**
      * The constant SERVICE_GROUP_MAPPING_PREFIX.
      */
     String SERVICE_GROUP_MAPPING_PREFIX = SERVICE_PREFIX + "vgroupMapping.";

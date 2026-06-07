@@ -21,6 +21,7 @@ import org.apache.seata.core.model.GlobalStatus;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * Stable binary key codec for RocksDB file store engine.
@@ -102,6 +103,21 @@ public final class RocksDBKeyCodec {
             }
         }
         return true;
+    }
+
+    public static byte[] prefixEnd(byte[] prefix) {
+        if (prefix == null || prefix.length == 0) {
+            return null;
+        }
+        byte[] end = Arrays.copyOf(prefix, prefix.length);
+        for (int i = end.length - 1; i >= 0; i--) {
+            int value = end[i] & 0xff;
+            if (value != 0xff) {
+                end[i] = (byte) (value + 1);
+                return Arrays.copyOf(end, i + 1);
+            }
+        }
+        return null;
     }
 
     private static byte[] encodeComponent(String value) {

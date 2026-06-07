@@ -54,8 +54,13 @@ public class RocksDBStoreConfig {
     private final boolean enableStatistics;
     private final boolean optimizeFiltersForHits;
     private final String compressionType;
+    private final boolean enableRangeDelete;
 
     public RocksDBStoreConfig(String dbPath, boolean syncWrite) {
+        this(dbPath, syncWrite, false);
+    }
+
+    public RocksDBStoreConfig(String dbPath, boolean syncWrite, boolean enableRangeDelete) {
         this(
                 dbPath,
                 syncWrite,
@@ -71,7 +76,8 @@ public class RocksDBStoreConfig {
                 DEFAULT_INT_OPTION,
                 false,
                 false,
-                null);
+                null,
+                enableRangeDelete);
     }
 
     public RocksDBStoreConfig(
@@ -90,6 +96,42 @@ public class RocksDBStoreConfig {
             boolean enableStatistics,
             boolean optimizeFiltersForHits,
             String compressionType) {
+        this(
+                dbPath,
+                syncWrite,
+                blockCacheSize,
+                writeBufferSize,
+                maxWriteBufferNumber,
+                minWriteBufferNumberToMerge,
+                maxBackgroundJobs,
+                maxOpenFiles,
+                targetFileSizeBase,
+                level0FileNumCompactionTrigger,
+                level0SlowdownWritesTrigger,
+                level0StopWritesTrigger,
+                enableStatistics,
+                optimizeFiltersForHits,
+                compressionType,
+                false);
+    }
+
+    public RocksDBStoreConfig(
+            String dbPath,
+            boolean syncWrite,
+            long blockCacheSize,
+            long writeBufferSize,
+            int maxWriteBufferNumber,
+            int minWriteBufferNumberToMerge,
+            int maxBackgroundJobs,
+            int maxOpenFiles,
+            long targetFileSizeBase,
+            int level0FileNumCompactionTrigger,
+            int level0SlowdownWritesTrigger,
+            int level0StopWritesTrigger,
+            boolean enableStatistics,
+            boolean optimizeFiltersForHits,
+            String compressionType,
+            boolean enableRangeDelete) {
         this.dbPath = dbPath;
         this.syncWrite = syncWrite;
         this.blockCacheSize = nonNegative(blockCacheSize, ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE);
@@ -113,6 +155,7 @@ public class RocksDBStoreConfig {
         this.enableStatistics = enableStatistics;
         this.optimizeFiltersForHits = optimizeFiltersForHits;
         this.compressionType = StringUtils.isBlank(compressionType) ? null : compressionType.trim();
+        this.enableRangeDelete = enableRangeDelete;
     }
 
     public static RocksDBStoreConfig fromConfiguration() {
@@ -145,7 +188,8 @@ public class RocksDBStoreConfig {
                 intOption(config, ConfigurationKeys.STORE_FILE_ROCKSDB_LEVEL0_STOP_WRITES_TRIGGER),
                 config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_STATISTICS, false),
                 config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS, false),
-                config.getConfig(ConfigurationKeys.STORE_FILE_ROCKSDB_COMPRESSION_TYPE));
+                config.getConfig(ConfigurationKeys.STORE_FILE_ROCKSDB_COMPRESSION_TYPE),
+                config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE, false));
     }
 
     public String getDbPath() {
@@ -208,6 +252,10 @@ public class RocksDBStoreConfig {
         return compressionType;
     }
 
+    public boolean isEnableRangeDelete() {
+        return enableRangeDelete;
+    }
+
     public String tuningSummary() {
         return "blockCacheSize="
                 + blockCacheSize
@@ -234,7 +282,9 @@ public class RocksDBStoreConfig {
                 + ", optimizeFiltersForHits="
                 + optimizeFiltersForHits
                 + ", compressionType="
-                + compressionType;
+                + compressionType
+                + ", enableRangeDelete="
+                + enableRangeDelete;
     }
 
     @Override
@@ -259,6 +309,7 @@ public class RocksDBStoreConfig {
                 && level0StopWritesTrigger == that.level0StopWritesTrigger
                 && enableStatistics == that.enableStatistics
                 && optimizeFiltersForHits == that.optimizeFiltersForHits
+                && enableRangeDelete == that.enableRangeDelete
                 && Objects.equals(dbPath, that.dbPath)
                 && Objects.equals(compressionType, that.compressionType);
     }
@@ -280,7 +331,8 @@ public class RocksDBStoreConfig {
                 level0StopWritesTrigger,
                 enableStatistics,
                 optimizeFiltersForHits,
-                compressionType);
+                compressionType,
+                enableRangeDelete);
     }
 
     private static int intOption(Configuration config, String key) {

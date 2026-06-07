@@ -302,6 +302,50 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public void deleteByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
         Objects.requireNonNull(prefix, "prefix must not be null");
+        if (config.isEnableRangeDelete() && deleteRangeByPrefix(columnFamily, prefix)) {
+            return;
+        }
+        scanDeleteByPrefix(columnFamily, prefix);
+    }
+
+    public boolean deleteByPrefix(WriteBatch batch, RocksDBColumnFamily columnFamily, byte[] prefix)
+            throws RocksDBException {
+        Objects.requireNonNull(batch, "batch must not be null");
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        if (config.isEnableRangeDelete() && deleteRangeByPrefix(batch, columnFamily, prefix)) {
+            return true;
+        }
+        scanDeleteByPrefix(batch, columnFamily, prefix);
+        return false;
+    }
+
+    public boolean deleteRangeByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
+        if (end == null) {
+            return false;
+        }
+        try {
+            db.deleteRange(handle(columnFamily), writeOptions, prefix, end);
+            return true;
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "delete RocksDB range failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public boolean deleteRangeByPrefix(WriteBatch batch, RocksDBColumnFamily columnFamily, byte[] prefix)
+            throws RocksDBException {
+        Objects.requireNonNull(batch, "batch must not be null");
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
+        if (end == null) {
+            return false;
+        }
+        batch.deleteRange(handle(columnFamily), prefix, end);
+        return true;
+    }
+
+    private void scanDeleteByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
         ColumnFamilyHandle columnFamilyHandle = handle(columnFamily);
         while (true) {
             int count = 0;
@@ -326,6 +370,14 @@ public class RocksDBStoreEngine implements AutoCloseable {
             } catch (RocksDBException e) {
                 throw new StoreException(e, "delete RocksDB prefix failed, columnFamily:" + columnFamily.getName());
             }
+        }
+    }
+
+    private void scanDeleteByPrefix(WriteBatch batch, RocksDBColumnFamily columnFamily, byte[] prefix)
+            throws RocksDBException {
+        ColumnFamilyHandle columnFamilyHandle = handle(columnFamily);
+        for (RocksDBEntry entry : prefixScan(columnFamily, prefix)) {
+            batch.delete(columnFamilyHandle, entry.getKey());
         }
     }
 
