@@ -63,8 +63,9 @@ import java.util.stream.Stream;
 public final class RocksDBFileModeBenchmark {
 
     private static final String CSV_HEADER =
-            "scenario,globalCount,branchPerGlobal,lockPerBranch,syncWrite,warmupRounds,measureRounds,batchSize,"
-                    + "ops,totalMs,opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles,"
+            "scenario,globalCount,branchPerGlobal,lockPerBranch,syncWrite,enableRangeDelete,warmupRounds,"
+                    + "measureRounds,batchSize,ops,totalMs,opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,"
+                    + "sstFiles,walFiles,"
                     + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
                     + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys";
     private static final List<String> ALL_BENCHMARKS = Arrays.asList("write", "query", "lock", "cleanup", "restart");
@@ -141,7 +142,7 @@ public final class RocksDBFileModeBenchmark {
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, round);
             Path dbPath = scenarioPath(runPath, "write-round-" + round);
             lastDbPath = dbPath;
-            try (RocksDBStoreEngine engine = open(dbPath, options.syncWrite)) {
+            try (RocksDBStoreEngine engine = open(dbPath, options)) {
                 RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
                 for (GlobalSession globalSession : dataSet.globalSessions) {
                     measure(
@@ -214,7 +215,7 @@ public final class RocksDBFileModeBenchmark {
         OperationStats beginSortedStats = new OperationStats(options.sampleEvery);
         OperationStats fullScanStats = new OperationStats(options.sampleEvery);
 
-        try (RocksDBStoreEngine engine = open(dbPath, options.syncWrite)) {
+        try (RocksDBStoreEngine engine = open(dbPath, options)) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             writeDataSet(storeManager, dataSet);
             engine.flush();
@@ -289,7 +290,7 @@ public final class RocksDBFileModeBenchmark {
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
             Path dbPath = scenarioPath(runPath, "lock-round-" + round);
             lastDbPath = dbPath;
-            try (RocksDBStoreEngine engine = open(dbPath, options.syncWrite)) {
+            try (RocksDBStoreEngine engine = open(dbPath, options)) {
                 RocksDBLockManager lockManager = new RocksDBLockManager(engine);
                 for (BranchSession branchSession : dataSet.allBranches()) {
                     measure(acquireStats, round, options, () -> {
@@ -341,7 +342,7 @@ public final class RocksDBFileModeBenchmark {
         for (int round = 0; round < options.totalRounds(); round++) {
             Path orphanDbPath = scenarioPath(runPath, "lock-clean-orphan-round-" + round);
             lastOrphanDbPath = orphanDbPath;
-            try (RocksDBStoreEngine engine = open(orphanDbPath, options.syncWrite)) {
+            try (RocksDBStoreEngine engine = open(orphanDbPath, options)) {
                 RocksDBLockManager lockManager = new RocksDBLockManager(engine);
                 BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
                 for (BranchSession branchSession : dataSet.allBranches()) {
@@ -375,7 +376,7 @@ public final class RocksDBFileModeBenchmark {
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, round);
             Path dbPath = scenarioPath(runPath, "cleanup-round-" + round);
             lastDbPath = dbPath;
-            try (RocksDBStoreEngine engine = open(dbPath, options.syncWrite)) {
+            try (RocksDBStoreEngine engine = open(dbPath, options)) {
                 RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
                 writeDataSet(storeManager, dataSet);
                 engine.flush();
@@ -402,17 +403,17 @@ public final class RocksDBFileModeBenchmark {
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, round);
             Path dbPath = scenarioPath(runPath, "restart-round-" + round);
             lastDbPath = dbPath;
-            try (RocksDBStoreEngine engine = open(dbPath, options.syncWrite)) {
+            try (RocksDBStoreEngine engine = open(dbPath, options)) {
                 RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
                 writeDataSet(storeManager, dataSet);
                 engine.flush();
             }
             measure(restartStats, round, options, () -> {
-                try (RocksDBStoreEngine engine = open(dbPath, options.syncWrite)) {
+                try (RocksDBStoreEngine engine = open(dbPath, options)) {
                     new RocksDBTransactionStoreManager(engine);
                 }
             });
-            try (RocksDBStoreEngine engine = open(dbPath, options.syncWrite)) {
+            try (RocksDBStoreEngine engine = open(dbPath, options)) {
                 RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
                 SessionCondition condition = new SessionCondition();
                 condition.setLazyLoadBranch(true);
@@ -433,8 +434,16 @@ public final class RocksDBFileModeBenchmark {
         }
     }
 
+    private static RocksDBStoreEngine open(Path dbPath, BenchmarkOptions options) {
+        return open(dbPath, options.syncWrite, options.enableRangeDelete);
+    }
+
     private static RocksDBStoreEngine open(Path dbPath, boolean syncWrite) {
-        return RocksDBStoreEngine.open(new RocksDBStoreConfig(dbPath.toString(), syncWrite));
+        return open(dbPath, syncWrite, false);
+    }
+
+    private static RocksDBStoreEngine open(Path dbPath, boolean syncWrite, boolean enableRangeDelete) {
+        return RocksDBStoreEngine.open(new RocksDBStoreConfig(dbPath.toString(), syncWrite, enableRangeDelete));
     }
 
     private static Path scenarioPath(Path runPath, String scenario) throws IOException {
@@ -497,6 +506,8 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + options.syncWrite
                 + ","
+                + options.enableRangeDelete
+                + ","
                 + options.warmupRounds
                 + ","
                 + options.measureRounds
@@ -546,6 +557,7 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("os=" + System.getProperty("os.name") + " " + System.getProperty("os.version"));
         System.out.println("rocksdbJniVersion=" + rocksDbJniVersion());
         System.out.println("syncWrite=" + options.syncWrite);
+        System.out.println("enableRangeDelete=" + options.enableRangeDelete);
         System.out.println("globalCount=" + options.globalCount);
         System.out.println("branchPerGlobal=" + options.branchPerGlobal);
         System.out.println("lockPerBranch=" + options.lockPerBranch);
@@ -887,6 +899,7 @@ public final class RocksDBFileModeBenchmark {
         private final int branchPerGlobal;
         private final int lockPerBranch;
         private final boolean syncWrite;
+        private final boolean enableRangeDelete;
         private final boolean cleanup;
         private final int warmupRounds;
         private final int measureRounds;
@@ -901,6 +914,7 @@ public final class RocksDBFileModeBenchmark {
                 int branchPerGlobal,
                 int lockPerBranch,
                 boolean syncWrite,
+                boolean enableRangeDelete,
                 boolean cleanup,
                 int warmupRounds,
                 int measureRounds,
@@ -913,6 +927,7 @@ public final class RocksDBFileModeBenchmark {
             this.branchPerGlobal = nonNegative(branchPerGlobal, "branchPerGlobal");
             this.lockPerBranch = nonNegative(lockPerBranch, "lockPerBranch");
             this.syncWrite = syncWrite;
+            this.enableRangeDelete = enableRangeDelete;
             this.cleanup = cleanup;
             this.warmupRounds = nonNegative(warmupRounds, "warmupRounds");
             this.measureRounds = positive(measureRounds, "measureRounds");
@@ -930,6 +945,7 @@ public final class RocksDBFileModeBenchmark {
                     intValue(values, "branchPerGlobal", 2),
                     intValue(values, "lockPerBranch", 2),
                     booleanValue(values, "syncWrite", false),
+                    booleanValue(values, "enableRangeDelete", false),
                     booleanValue(values, "cleanup", false),
                     intValue(values, "warmupRounds", 1),
                     intValue(values, "measureRounds", 3),
@@ -946,6 +962,7 @@ public final class RocksDBFileModeBenchmark {
                     Math.max(1, branchPerGlobal),
                     Math.max(1, lockPerBranch),
                     syncWrite,
+                    enableRangeDelete,
                     cleanup,
                     warmupRounds,
                     measureRounds,
