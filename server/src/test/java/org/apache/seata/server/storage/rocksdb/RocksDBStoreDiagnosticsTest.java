@@ -188,6 +188,131 @@ class RocksDBStoreDiagnosticsTest {
         Assertions.assertNull(engine.getProperty(RocksDBColumnFamily.GLOBAL_SESSION, "cfstats-no-file-histogram"));
     }
 
+    @Test
+    void testBlockCacheMetricsWhenEnabled() {
+        long blockCacheSize = 8L * 1024 * 1024; // 8 MB
+        RocksDBStoreConfig config = new RocksDBStoreConfig(
+                tempDir.resolve("block-cache").toString(),
+                true,
+                blockCacheSize,
+                0L,
+                0,
+                0,
+                0,
+                0,
+                0L,
+                0,
+                0,
+                0,
+                false,
+                false,
+                null,
+                false);
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    RocksDBKeyCodec.encodeXid("xid-bc"),
+                    "global".getBytes(StandardCharsets.UTF_8));
+            engine.flush();
+
+            // block cache access methods
+            Assertions.assertEquals(blockCacheSize, engine.getBlockCacheCapacity());
+            Assertions.assertTrue(engine.getBlockCacheUsage() >= 0L);
+            Assertions.assertTrue(engine.getBlockCachePinnedUsage() >= 0L);
+
+            // diagnostics snapshot includes block cache
+            RocksDBStoreDiagnostics diagnostics = engine.diagnostics();
+            Assertions.assertTrue(diagnostics.isBlockCacheEnabled());
+            Assertions.assertEquals(blockCacheSize, diagnostics.getBlockCacheCapacity());
+            Assertions.assertTrue(diagnostics.getBlockCacheUsage() >= 0L);
+            Assertions.assertTrue(diagnostics.getBlockCachePinnedUsage() >= 0L);
+        }
+    }
+
+    @Test
+    void testBlockCacheMetricsWhenDisabled() {
+        try (RocksDBStoreEngine engine = open("no-block-cache")) {
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    RocksDBKeyCodec.encodeXid("xid-nbc"),
+                    "global".getBytes(StandardCharsets.UTF_8));
+            engine.flush();
+
+            // block cache is not configured
+            Assertions.assertEquals(0L, engine.getBlockCacheCapacity());
+            Assertions.assertEquals(0L, engine.getBlockCacheUsage());
+            Assertions.assertEquals(0L, engine.getBlockCachePinnedUsage());
+
+            RocksDBStoreDiagnostics diagnostics = engine.diagnostics();
+            Assertions.assertFalse(diagnostics.isBlockCacheEnabled());
+            Assertions.assertEquals(0L, diagnostics.getBlockCacheCapacity());
+        }
+    }
+
+    @Test
+    void testBlockCacheMetricsAfterClose() {
+        long blockCacheSize = 4L * 1024 * 1024;
+        RocksDBStoreConfig config = new RocksDBStoreConfig(
+                tempDir.resolve("bc-closed").toString(),
+                true,
+                blockCacheSize,
+                0L,
+                0,
+                0,
+                0,
+                0,
+                0L,
+                0,
+                0,
+                0,
+                false,
+                false,
+                null,
+                false);
+        RocksDBStoreEngine engine = RocksDBStoreEngine.open(config);
+        engine.close();
+
+        Assertions.assertEquals(0L, engine.getBlockCacheUsage());
+        Assertions.assertEquals(0L, engine.getBlockCachePinnedUsage());
+        Assertions.assertEquals(0L, engine.getBlockCacheCapacity());
+    }
+
+    @Test
+    void testBlockCacheMetricsGauges() {
+        CompactRegistry registry = new CompactRegistry();
+        long blockCacheSize = 8L * 1024 * 1024;
+        RocksDBStoreConfig config = new RocksDBStoreConfig(
+                tempDir.resolve("bc-metrics").toString(),
+                true,
+                blockCacheSize,
+                0L,
+                0,
+                0,
+                0,
+                0,
+                0L,
+                0,
+                0,
+                0,
+                false,
+                false,
+                null,
+                false);
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            RocksDBStoreMetrics.register(registry, engine);
+            List<Measurement> measurements = measurements(registry);
+
+            Assertions.assertTrue(
+                    measurements.stream().anyMatch(m -> m.getId().toString().contains("blockCacheUsageBytes")));
+            Assertions.assertTrue(
+                    measurements.stream().anyMatch(m -> m.getId().toString().contains("blockCachePinnedUsageBytes")));
+            Assertions.assertTrue(
+                    measurements.stream().anyMatch(m -> m.getId().toString().contains("blockCacheCapacityBytes")));
+        } finally {
+            registry.clearUp();
+        }
+    }
+
     private RocksDBStoreEngine open(String name) {
         return RocksDBStoreEngine.open(
                 new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));

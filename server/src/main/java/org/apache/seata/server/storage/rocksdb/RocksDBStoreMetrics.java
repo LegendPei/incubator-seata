@@ -54,24 +54,37 @@ final class RocksDBStoreMetrics {
         }
         RocksDBStoreMetrics.engine = engine;
         try {
-            gauge(registry, "estimateLiveDataSizeBytes", () -> diagnostics().getProperty(
-                    RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE));
-            gauge(registry, "totalSstFilesSizeBytes", () -> diagnostics().getProperty(
-                    RocksDBStoreDiagnostics.TOTAL_SST_FILES_SIZE));
-            gauge(registry, "pendingCompactionBytes", () -> diagnostics().getProperty(
-                    RocksDBStoreDiagnostics.ESTIMATE_PENDING_COMPACTION_BYTES));
-            gauge(registry, "activeMemTableBytes", () -> diagnostics().getProperty(
-                    RocksDBStoreDiagnostics.CUR_SIZE_ACTIVE_MEM_TABLE));
-            gauge(registry, "allMemTablesBytes", () -> diagnostics().getProperty(
-                    RocksDBStoreDiagnostics.CUR_SIZE_ALL_MEM_TABLES));
-            gauge(registry, "liveVersions", () -> diagnostics().getProperty(
-                    RocksDBStoreDiagnostics.NUM_LIVE_VERSIONS));
-            gauge(registry, "globalSessionEstimateKeys", () -> diagnostics().getColumnFamilyProperty(
-                    RocksDBColumnFamily.GLOBAL_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
-            gauge(registry, "branchSessionEstimateKeys", () -> diagnostics().getColumnFamilyProperty(
-                    RocksDBColumnFamily.BRANCH_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
-            gauge(registry, "lockEstimateKeys", () -> diagnostics().getColumnFamilyProperty(
-                    RocksDBColumnFamily.LOCK, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+            gauge(registry, "estimateLiveDataSizeBytes", () -> diagnostics()
+                    .getProperty(RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE));
+            gauge(registry, "totalSstFilesSizeBytes", () -> diagnostics()
+                    .getProperty(RocksDBStoreDiagnostics.TOTAL_SST_FILES_SIZE));
+            gauge(registry, "pendingCompactionBytes", () -> diagnostics()
+                    .getProperty(RocksDBStoreDiagnostics.ESTIMATE_PENDING_COMPACTION_BYTES));
+            gauge(registry, "activeMemTableBytes", () -> diagnostics()
+                    .getProperty(RocksDBStoreDiagnostics.CUR_SIZE_ACTIVE_MEM_TABLE));
+            gauge(registry, "allMemTablesBytes", () -> diagnostics()
+                    .getProperty(RocksDBStoreDiagnostics.CUR_SIZE_ALL_MEM_TABLES));
+            gauge(registry, "liveVersions", () -> diagnostics().getProperty(RocksDBStoreDiagnostics.NUM_LIVE_VERSIONS));
+            gauge(registry, "globalSessionEstimateKeys", () -> diagnostics()
+                    .getColumnFamilyProperty(
+                            RocksDBColumnFamily.GLOBAL_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+            gauge(registry, "branchSessionEstimateKeys", () -> diagnostics()
+                    .getColumnFamilyProperty(
+                            RocksDBColumnFamily.BRANCH_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+            gauge(registry, "lockEstimateKeys", () -> diagnostics()
+                    .getColumnFamilyProperty(RocksDBColumnFamily.LOCK, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+            gauge(registry, "blockCacheUsageBytes", () -> {
+                RocksDBStoreEngine current = engine;
+                return current == null ? 0L : current.getBlockCacheUsage();
+            });
+            gauge(registry, "blockCachePinnedUsageBytes", () -> {
+                RocksDBStoreEngine current = engine;
+                return current == null ? 0L : current.getBlockCachePinnedUsage();
+            });
+            gauge(registry, "blockCacheCapacityBytes", () -> {
+                RocksDBStoreEngine current = engine;
+                return current == null ? 0L : current.getBlockCacheCapacity();
+            });
         } catch (Exception e) {
             LOGGER.warn("register RocksDB file store metrics failed", e);
         }
