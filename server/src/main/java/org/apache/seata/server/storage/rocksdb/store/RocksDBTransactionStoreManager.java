@@ -35,7 +35,10 @@ import org.apache.seata.server.store.SessionStorable;
 import org.apache.seata.server.store.TransactionStoreManager;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.WriteBatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -46,6 +49,9 @@ import java.util.Set;
  * RocksDB transaction store manager for file store engine.
  */
 public class RocksDBTransactionStoreManager extends AbstractTransactionStoreManager implements TransactionStoreManager {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBTransactionStoreManager.class);
+    private static final String MIGRATION_STATUS_KEY = "migration_status";
 
     private final RocksDBStoreEngine storeEngine;
     private final RocksDBLocalLocks xidLocks;
@@ -75,6 +81,28 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         this.indexManager = new RocksDBIndexManager(storeEngine);
         this.indexManager.ensureReady();
         this.factoryManaged = factoryManaged;
+        logStartupState();
+    }
+
+    private void logStartupState() {
+        byte[] indexVersionBytes = storeEngine.get(
+                RocksDBColumnFamily.METADATA, RocksDBIndexManager.INDEX_VERSION_KEY.getBytes(StandardCharsets.UTF_8));
+        byte[] indexBuildStatusBytes = storeEngine.get(
+                RocksDBColumnFamily.METADATA,
+                RocksDBIndexManager.INDEX_BUILD_STATUS_KEY.getBytes(StandardCharsets.UTF_8));
+        byte[] migrationStatusBytes =
+                storeEngine.get(RocksDBColumnFamily.METADATA, MIGRATION_STATUS_KEY.getBytes(StandardCharsets.UTF_8));
+        String indexVersion =
+                indexVersionBytes != null ? new String(indexVersionBytes, StandardCharsets.UTF_8) : "none";
+        String indexBuildStatus =
+                indexBuildStatusBytes != null ? new String(indexBuildStatusBytes, StandardCharsets.UTF_8) : "none";
+        String migrationStatus =
+                migrationStatusBytes != null ? new String(migrationStatusBytes, StandardCharsets.UTF_8) : "none";
+        LOGGER.info(
+                "RocksDB transaction store ready, indexVersion:{}, indexBuildStatus:{}, migrationStatus:{}",
+                indexVersion,
+                indexBuildStatus,
+                migrationStatus);
     }
 
     @Override
