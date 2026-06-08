@@ -192,6 +192,14 @@ public class RocksDBStoreEngine implements AutoCloseable {
         return config.isSyncWrite();
     }
 
+    public RocksDB getDB() {
+        return db;
+    }
+
+    public boolean isClosed() {
+        return closed;
+    }
+
     public RocksDBStoreDiagnostics diagnostics() {
         if (closed) {
             return closedDiagnostics(config);
