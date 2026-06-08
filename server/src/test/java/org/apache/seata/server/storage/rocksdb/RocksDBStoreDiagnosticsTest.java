@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 class RocksDBStoreDiagnosticsTest {
 
@@ -58,10 +59,10 @@ class RocksDBStoreDiagnosticsTest {
             Assertions.assertEquals(tempDir.resolve("diagnostics").toString(), diagnostics.getDbPath());
             Assertions.assertEquals(RocksDBStoreEngine.FORMAT_VERSION, diagnostics.getFormatVersion());
             Assertions.assertNotNull(diagnostics.getRocksDBVersion());
-            Assertions.assertTrue(diagnostics.getProperties()
-                    .containsKey(RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE));
-            Assertions.assertTrue(diagnostics.getColumnFamilyProperties()
-                    .containsKey(RocksDBColumnFamily.GLOBAL_SESSION));
+            Assertions.assertTrue(
+                    diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE));
+            Assertions.assertTrue(
+                    diagnostics.getColumnFamilyProperties().containsKey(RocksDBColumnFamily.GLOBAL_SESSION));
             Assertions.assertTrue(diagnostics
                     .getColumnFamilyProperties()
                     .get(RocksDBColumnFamily.GLOBAL_SESSION)
@@ -114,8 +115,82 @@ class RocksDBStoreDiagnosticsTest {
         }
     }
 
+    @Test
+    void testExpandedDiagnosticsProperties() {
+        try (RocksDBStoreEngine engine = open("diagnostics-expanded")) {
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    RocksDBKeyCodec.encodeXid("xid-expanded"),
+                    "global".getBytes(StandardCharsets.UTF_8));
+            engine.flush();
+
+            RocksDBStoreDiagnostics diagnostics = engine.diagnostics();
+
+            // G1: new DB-level properties
+            Assertions.assertTrue(diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.SIZE_ALL_MEM_TABLES));
+            Assertions.assertTrue(
+                    diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.ESTIMATE_TABLE_READERS_MEM));
+            Assertions.assertTrue(diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.BACKGROUND_ERRORS));
+            Assertions.assertTrue(
+                    diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.NUM_RUNNING_COMPACTIONS));
+            Assertions.assertTrue(diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.NUM_RUNNING_FLUSHES));
+            Assertions.assertTrue(
+                    diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.ACTUAL_DELAYED_WRITE_RATE));
+            Assertions.assertTrue(diagnostics.getProperties().containsKey(RocksDBStoreDiagnostics.IS_WRITE_STOPPED));
+
+            // G2: level 1-6 file counts
+            Map<String, Long> cfProps = diagnostics.getColumnFamilyProperties().get(RocksDBColumnFamily.GLOBAL_SESSION);
+            Assertions.assertTrue(cfProps.containsKey(RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL0));
+            Assertions.assertTrue(cfProps.containsKey(RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL1));
+            Assertions.assertTrue(cfProps.containsKey(RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL6));
+        }
+    }
+
+    @Test
+    void testPublicPropertyAccessMethods() {
+        try (RocksDBStoreEngine engine = open("public-props")) {
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    RocksDBKeyCodec.encodeXid("xid-public"),
+                    "global".getBytes(StandardCharsets.UTF_8));
+            engine.flush();
+
+            // G7: public getLongProperty
+            long liveDataSize = engine.getLongProperty(RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE);
+            Assertions.assertTrue(liveDataSize >= 0L);
+
+            long cfKeys = engine.getLongProperty(
+                    RocksDBColumnFamily.GLOBAL_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS);
+            Assertions.assertTrue(cfKeys >= 0L);
+
+            // G7: public getProperty (string)
+            String cfstats = engine.getProperty("cfstats-no-file-histogram");
+            // may be null if property not available, should not throw
+            Assertions.assertDoesNotThrow(
+                    () -> engine.getProperty(RocksDBColumnFamily.GLOBAL_SESSION, "cfstats-no-file-histogram"));
+
+            // unknown property returns 0 / null gracefully
+            Assertions.assertEquals(0L, engine.getLongProperty("rocksdb.nonexistent-property"));
+            Assertions.assertNull(engine.getProperty("rocksdb.nonexistent-property"));
+        }
+    }
+
+    @Test
+    void testPublicPropertyAccessAfterClose() {
+        RocksDBStoreEngine engine = open("props-closed");
+        engine.close();
+
+        Assertions.assertEquals(0L, engine.getLongProperty(RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE));
+        Assertions.assertEquals(
+                0L,
+                engine.getLongProperty(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+        Assertions.assertNull(engine.getProperty("cfstats-no-file-histogram"));
+        Assertions.assertNull(engine.getProperty(RocksDBColumnFamily.GLOBAL_SESSION, "cfstats-no-file-histogram"));
+    }
+
     private RocksDBStoreEngine open(String name) {
-        return RocksDBStoreEngine.open(new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
+        return RocksDBStoreEngine.open(
+                new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
     }
 
     private List<Measurement> measurements(CompactRegistry registry) {
