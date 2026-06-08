@@ -27,8 +27,8 @@ import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
-import org.apache.seata.server.storage.rocksdb.RocksDBStoreDiagnostics;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreDiagnostics;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
@@ -67,7 +67,7 @@ public final class RocksDBFileModeBenchmark {
                     + "measureRounds,batchSize,ops,totalMs,opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,"
                     + "sstFiles,walFiles,"
                     + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
-                    + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys";
+                    + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys,rocksdbConfigDigest";
     private static final List<String> ALL_BENCHMARKS = Arrays.asList("write", "query", "lock", "cleanup", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
@@ -321,7 +321,8 @@ public final class RocksDBFileModeBenchmark {
                         assertTrue(released, "branch release failed");
                     });
                     if (dataSet.branchesOf(globalSession).size() == 1) {
-                        assertTrue(lockManager.acquireLock(branchSession), "lock reacquire before global release failed");
+                        assertTrue(
+                                lockManager.acquireLock(branchSession), "lock reacquire before global release failed");
                     }
                     measure(releaseGlobalStats, round, options, () -> {
                         boolean released = lockManager.releaseGlobalSessionLock(globalSession);
@@ -396,18 +397,31 @@ public final class RocksDBFileModeBenchmark {
     }
 
     private void runRestartBenchmark(Path runPath, BenchmarkOptions options) throws Exception {
+        runRestartScenario(runPath, options, "restart.mixed", null);
+        runRestartScenario(runPath, options, "restart.active_only", GlobalStatus.Begin);
+        runRestartScenario(runPath, options, "restart.terminal_only", GlobalStatus.Committed);
+    }
+
+    private void runRestartScenario(
+            Path runPath, BenchmarkOptions options, String scenarioName, GlobalStatus overrideStatus) throws Exception {
         OperationStats restartStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
 
         for (int round = 0; round < options.totalRounds(); round++) {
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, round);
-            Path dbPath = scenarioPath(runPath, "restart-round-" + round);
+            if (overrideStatus != null) {
+                for (GlobalSession globalSession : dataSet.globalSessions) {
+                    globalSession.setStatus(overrideStatus);
+                }
+            }
+            Path dbPath = scenarioPath(runPath, scenarioName.replace('.', '_') + "-round-" + round);
             lastDbPath = dbPath;
             try (RocksDBStoreEngine engine = open(dbPath, options)) {
                 RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
                 writeDataSet(storeManager, dataSet);
                 engine.flush();
             }
+            final BenchmarkDataSet finalDataSet = dataSet;
             measure(restartStats, round, options, () -> {
                 try (RocksDBStoreEngine engine = open(dbPath, options)) {
                     new RocksDBTransactionStoreManager(engine);
@@ -418,11 +432,13 @@ public final class RocksDBFileModeBenchmark {
                 SessionCondition condition = new SessionCondition();
                 condition.setLazyLoadBranch(true);
                 assertEquals(
-                        options.globalCount, storeManager.readSession(condition).size(), "restart global count");
+                        options.globalCount,
+                        storeManager.readSession(condition).size(),
+                        scenarioName + " restart global count");
             }
         }
 
-        emit("restart.open_existing_db", options, restartStats, DbFootprint.from(lastDbPath));
+        emit(scenarioName, options, restartStats, DbFootprint.from(lastDbPath));
     }
 
     private static void writeDataSet(RocksDBTransactionStoreManager storeManager, BenchmarkDataSet dataSet) {
@@ -544,7 +560,9 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + footprint.branchEstimateKeys
                 + ","
-                + footprint.lockEstimateKeys);
+                + footprint.lockEstimateKeys
+                + ","
+                + configDigest(options));
     }
 
     private static void printEnvironment(BenchmarkOptions options, Path rootPath, Path runPath) {
@@ -592,6 +610,16 @@ public final class RocksDBFileModeBenchmark {
         } catch (Exception e) {
             return "unknown";
         }
+    }
+
+    private static String configDigest(BenchmarkOptions options) {
+        String raw = "syncWrite=" + options.syncWrite
+                + ",enableRangeDelete=" + options.enableRangeDelete
+                + ",globalCount=" + options.globalCount
+                + ",branchPerGlobal=" + options.branchPerGlobal
+                + ",lockPerBranch=" + options.lockPerBranch;
+        int hash = raw.hashCode();
+        return String.format(Locale.ROOT, "%08x", hash);
     }
 
     private static String millis(long nanos) {
