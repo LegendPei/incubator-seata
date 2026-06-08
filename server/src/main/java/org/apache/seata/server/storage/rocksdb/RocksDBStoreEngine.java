@@ -67,11 +67,24 @@ public class RocksDBStoreEngine implements AutoCloseable {
         RocksDBStoreDiagnostics.ESTIMATE_PENDING_COMPACTION_BYTES,
         RocksDBStoreDiagnostics.CUR_SIZE_ACTIVE_MEM_TABLE,
         RocksDBStoreDiagnostics.CUR_SIZE_ALL_MEM_TABLES,
-        RocksDBStoreDiagnostics.NUM_LIVE_VERSIONS
+        RocksDBStoreDiagnostics.NUM_LIVE_VERSIONS,
+        RocksDBStoreDiagnostics.SIZE_ALL_MEM_TABLES,
+        RocksDBStoreDiagnostics.ESTIMATE_TABLE_READERS_MEM,
+        RocksDBStoreDiagnostics.BACKGROUND_ERRORS,
+        RocksDBStoreDiagnostics.NUM_RUNNING_COMPACTIONS,
+        RocksDBStoreDiagnostics.NUM_RUNNING_FLUSHES,
+        RocksDBStoreDiagnostics.ACTUAL_DELAYED_WRITE_RATE,
+        RocksDBStoreDiagnostics.IS_WRITE_STOPPED
     };
     private static final String[] COLUMN_FAMILY_LONG_PROPERTIES = {
         RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS,
         RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL0,
+        RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL1,
+        RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL2,
+        RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL3,
+        RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL4,
+        RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL5,
+        RocksDBStoreDiagnostics.NUM_FILES_AT_LEVEL6,
         RocksDBStoreDiagnostics.NUM_IMMUTABLE_MEM_TABLE,
         RocksDBStoreDiagnostics.MEM_TABLE_FLUSH_PENDING,
         RocksDBStoreDiagnostics.COMPACTION_PENDING
@@ -543,6 +556,78 @@ public class RocksDBStoreEngine implements AutoCloseable {
         CompressionType compressionType = compressionType(config.getCompressionType());
         if (compressionType != null) {
             options.setCompressionType(compressionType);
+        }
+    }
+
+    /**
+     * Read a DB-level long property. Returns 0 on failure and logs the error.
+     */
+    public long getLongProperty(String property) {
+        if (closed) {
+            return 0L;
+        }
+        try {
+            return db.getAggregatedLongProperty(property);
+        } catch (RocksDBException e) {
+            try {
+                return db.getLongProperty(property);
+            } catch (RocksDBException fallback) {
+                LOGGER.debug("read RocksDB property failed, property:{}, message:{}", property, fallback.getMessage());
+                return 0L;
+            }
+        }
+    }
+
+    /**
+     * Read a column-family-level long property. Returns 0 on failure and logs the error.
+     */
+    public long getLongProperty(RocksDBColumnFamily columnFamily, String property) {
+        if (closed) {
+            return 0L;
+        }
+        try {
+            return db.getLongProperty(handle(columnFamily), property);
+        } catch (RocksDBException e) {
+            LOGGER.debug(
+                    "read RocksDB column family property failed, columnFamily:{}, property:{}, message:{}",
+                    columnFamily.getName(),
+                    property,
+                    e.getMessage());
+            return 0L;
+        }
+    }
+
+    /**
+     * Read a DB-level string property. Returns null on failure.
+     */
+    public String getProperty(String property) {
+        if (closed) {
+            return null;
+        }
+        try {
+            return db.getProperty(property);
+        } catch (RocksDBException e) {
+            LOGGER.debug("read RocksDB string property failed, property:{}, message:{}", property, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Read a column-family-level string property. Returns null on failure.
+     */
+    public String getProperty(RocksDBColumnFamily columnFamily, String property) {
+        if (closed) {
+            return null;
+        }
+        try {
+            return db.getProperty(handle(columnFamily), property);
+        } catch (RocksDBException e) {
+            LOGGER.debug(
+                    "read RocksDB column family string property failed, columnFamily:{}, property:{}, message:{}",
+                    columnFamily.getName(),
+                    property,
+                    e.getMessage());
+            return null;
         }
     }
 
