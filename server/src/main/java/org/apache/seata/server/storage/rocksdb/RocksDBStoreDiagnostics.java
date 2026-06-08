@@ -36,9 +36,22 @@ public class RocksDBStoreDiagnostics {
     public static final String NUM_LIVE_VERSIONS = "rocksdb.num-live-versions";
     public static final String ESTIMATE_NUM_KEYS = "rocksdb.estimate-num-keys";
     public static final String NUM_FILES_AT_LEVEL0 = "rocksdb.num-files-at-level0";
+    public static final String NUM_FILES_AT_LEVEL1 = "rocksdb.num-files-at-level1";
+    public static final String NUM_FILES_AT_LEVEL2 = "rocksdb.num-files-at-level2";
+    public static final String NUM_FILES_AT_LEVEL3 = "rocksdb.num-files-at-level3";
+    public static final String NUM_FILES_AT_LEVEL4 = "rocksdb.num-files-at-level4";
+    public static final String NUM_FILES_AT_LEVEL5 = "rocksdb.num-files-at-level5";
+    public static final String NUM_FILES_AT_LEVEL6 = "rocksdb.num-files-at-level6";
     public static final String NUM_IMMUTABLE_MEM_TABLE = "rocksdb.num-immutable-mem-table";
     public static final String MEM_TABLE_FLUSH_PENDING = "rocksdb.mem-table-flush-pending";
     public static final String COMPACTION_PENDING = "rocksdb.compaction-pending";
+    public static final String SIZE_ALL_MEM_TABLES = "rocksdb.size-all-mem-tables";
+    public static final String ESTIMATE_TABLE_READERS_MEM = "rocksdb.estimate-table-readers-mem";
+    public static final String BACKGROUND_ERRORS = "rocksdb.background-errors";
+    public static final String NUM_RUNNING_COMPACTIONS = "rocksdb.num-running-compactions";
+    public static final String NUM_RUNNING_FLUSHES = "rocksdb.num-running-flushes";
+    public static final String ACTUAL_DELAYED_WRITE_RATE = "rocksdb.actual-delayed-write-rate";
+    public static final String IS_WRITE_STOPPED = "rocksdb.is-write-stopped";
 
     private final String dbPath;
     private final int formatVersion;
