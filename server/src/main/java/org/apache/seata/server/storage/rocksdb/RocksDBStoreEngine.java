@@ -42,12 +42,14 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 /**
  * Shared RocksDB engine for file store engine.
@@ -200,13 +202,28 @@ public class RocksDBStoreEngine implements AutoCloseable {
         return closed;
     }
 
+    /**
+     * Returns the database path configured for this engine.
+     */
+    public String getDbPath() {
+        return config.getDbPath();
+    }
+
+    /**
+     * Returns an unmodifiable list of column family names opened by this engine.
+     */
+    public List<String> getColumnFamilyNames() {
+        return Collections.unmodifiableList(Arrays.stream(RocksDBColumnFamily.values())
+                .map(RocksDBColumnFamily::getName)
+                .collect(Collectors.toList()));
+    }
+
     public RocksDBStoreDiagnostics diagnostics() {
         if (closed) {
             return closedDiagnostics(config);
         }
         Map<String, Long> properties = new LinkedHashMap<>();
-        Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties =
-                new EnumMap<>(RocksDBColumnFamily.class);
+        Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties = new EnumMap<>(RocksDBColumnFamily.class);
         List<String> errors = new ArrayList<>();
         for (String property : DB_LONG_PROPERTIES) {
             properties.put(property, readLongProperty(property, errors));
