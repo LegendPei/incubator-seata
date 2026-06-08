@@ -36,7 +36,9 @@ class RocksDBStoreConfigTest {
     @Test
     void testDefaultsKeepRocksDBOptionsUnset() {
         Map<String, String> values = new HashMap<>();
-        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_DIR, tempDir.resolve("default").toString());
+        values.put(
+                ConfigurationKeys.STORE_FILE_ROCKSDB_DIR,
+                tempDir.resolve("default").toString());
 
         RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), false);
 
@@ -56,12 +58,15 @@ class RocksDBStoreConfigTest {
         Assertions.assertFalse(config.isOptimizeFiltersForHits());
         Assertions.assertNull(config.getCompressionType());
         Assertions.assertFalse(config.isEnableRangeDelete());
+        Assertions.assertFalse(config.isRangeDeleteCompactAfterDelete());
     }
 
     @Test
     void testReadsTunableOptionsFromConfiguration() {
         Map<String, String> values = new HashMap<>();
-        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_DIR, tempDir.resolve("configured").toString());
+        values.put(
+                ConfigurationKeys.STORE_FILE_ROCKSDB_DIR,
+                tempDir.resolve("configured").toString());
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE, "64KB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE, "2MB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_WRITE_BUFFER_NUMBER, "3");
@@ -76,6 +81,7 @@ class RocksDBStoreConfigTest {
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS, "true");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_COMPRESSION_TYPE, "no");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE, "true");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_RANGE_DELETE_COMPACT_AFTER_DELETE, "true");
 
         RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), true);
 
@@ -94,6 +100,7 @@ class RocksDBStoreConfigTest {
         Assertions.assertTrue(config.isOptimizeFiltersForHits());
         Assertions.assertEquals("no", config.getCompressionType());
         Assertions.assertTrue(config.isEnableRangeDelete());
+        Assertions.assertTrue(config.isRangeDeleteCompactAfterDelete());
     }
 
     @Test
@@ -101,7 +108,8 @@ class RocksDBStoreConfigTest {
         Map<String, String> values = new HashMap<>();
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE, "-1");
 
-        Assertions.assertThrows(StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+        Assertions.assertThrows(
+                StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
     }
 
     @Test
@@ -109,7 +117,8 @@ class RocksDBStoreConfigTest {
         Map<String, String> values = new HashMap<>();
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE, "invalid");
 
-        Assertions.assertThrows(StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+        Assertions.assertThrows(
+                StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
     }
 
     private Configuration configuration(Map<String, String> values) {

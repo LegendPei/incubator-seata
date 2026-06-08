@@ -398,6 +398,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
         try {
             db.deleteRange(handle(columnFamily), writeOptions, prefix, end);
+            if (config.isRangeDeleteCompactAfterDelete()) {
+                db.compactRange(handle(columnFamily), prefix, end);
+            }
             return true;
         } catch (RocksDBException e) {
             throw new StoreException(e, "delete RocksDB range failed, columnFamily:" + columnFamily.getName());

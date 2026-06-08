@@ -227,6 +227,12 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE = STORE_FILE_ROCKSDB_PREFIX + "enableRangeDelete";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_RANGE_DELETE_COMPACT_AFTER_DELETE.
+     */
+    String STORE_FILE_ROCKSDB_RANGE_DELETE_COMPACT_AFTER_DELETE =
+            STORE_FILE_ROCKSDB_PREFIX + "rangeDeleteCompactAfterDelete";
+
+    /**
      * The constant SERVICE_GROUP_MAPPING_PREFIX.
      */
     String SERVICE_GROUP_MAPPING_PREFIX = SERVICE_PREFIX + "vgroupMapping.";
