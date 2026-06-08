@@ -53,6 +53,10 @@ public class RocksDBStoreDiagnostics {
     public static final String ACTUAL_DELAYED_WRITE_RATE = "rocksdb.actual-delayed-write-rate";
     public static final String IS_WRITE_STOPPED = "rocksdb.is-write-stopped";
 
+    public static final String BLOCK_CACHE_USAGE = "block-cache-usage";
+    public static final String BLOCK_CACHE_PINNED_USAGE = "block-cache-pinned-usage";
+    public static final String BLOCK_CACHE_CAPACITY = "block-cache-capacity";
+
     private final String dbPath;
     private final int formatVersion;
     private final String rocksDBVersion;
@@ -62,6 +66,9 @@ public class RocksDBStoreDiagnostics {
     private final Map<String, Long> properties;
     private final Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties;
     private final List<String> errors;
+    private final long blockCacheUsage;
+    private final long blockCachePinnedUsage;
+    private final long blockCacheCapacity;
 
     public RocksDBStoreDiagnostics(
             String dbPath,
@@ -73,6 +80,34 @@ public class RocksDBStoreDiagnostics {
             Map<String, Long> properties,
             Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties,
             List<String> errors) {
+        this(
+                dbPath,
+                formatVersion,
+                rocksDBVersion,
+                syncWrite,
+                closed,
+                tuningSummary,
+                properties,
+                columnFamilyProperties,
+                errors,
+                0L,
+                0L,
+                0L);
+    }
+
+    public RocksDBStoreDiagnostics(
+            String dbPath,
+            int formatVersion,
+            String rocksDBVersion,
+            boolean syncWrite,
+            boolean closed,
+            String tuningSummary,
+            Map<String, Long> properties,
+            Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties,
+            List<String> errors,
+            long blockCacheUsage,
+            long blockCachePinnedUsage,
+            long blockCacheCapacity) {
         this.dbPath = dbPath;
         this.formatVersion = formatVersion;
         this.rocksDBVersion = rocksDBVersion;
@@ -82,6 +117,9 @@ public class RocksDBStoreDiagnostics {
         this.properties = Collections.unmodifiableMap(new LinkedHashMap<>(properties));
         this.columnFamilyProperties = unmodifiableColumnFamilyProperties(columnFamilyProperties);
         this.errors = Collections.unmodifiableList(new ArrayList<>(errors));
+        this.blockCacheUsage = blockCacheUsage;
+        this.blockCachePinnedUsage = blockCachePinnedUsage;
+        this.blockCacheCapacity = blockCacheCapacity;
     }
 
     public String getDbPath() {
@@ -127,6 +165,22 @@ public class RocksDBStoreDiagnostics {
 
     public List<String> getErrors() {
         return errors;
+    }
+
+    public long getBlockCacheUsage() {
+        return blockCacheUsage;
+    }
+
+    public long getBlockCachePinnedUsage() {
+        return blockCachePinnedUsage;
+    }
+
+    public long getBlockCacheCapacity() {
+        return blockCacheCapacity;
+    }
+
+    public boolean isBlockCacheEnabled() {
+        return blockCacheCapacity > 0;
     }
 
     private static Map<RocksDBColumnFamily, Map<String, Long>> unmodifiableColumnFamilyProperties(

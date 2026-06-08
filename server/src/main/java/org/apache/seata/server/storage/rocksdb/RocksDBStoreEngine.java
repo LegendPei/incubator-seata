@@ -231,6 +231,36 @@ public class RocksDBStoreEngine implements AutoCloseable {
                 .collect(Collectors.toList()));
     }
 
+    /**
+     * Returns block cache memory usage in bytes, or 0 if block cache is not enabled or engine is closed.
+     */
+    public long getBlockCacheUsage() {
+        if (blockCache == null || closed) {
+            return 0L;
+        }
+        return blockCache.getUsage();
+    }
+
+    /**
+     * Returns block cache pinned memory usage in bytes, or 0 if block cache is not enabled or engine is closed.
+     */
+    public long getBlockCachePinnedUsage() {
+        if (blockCache == null || closed) {
+            return 0L;
+        }
+        return blockCache.getPinnedUsage();
+    }
+
+    /**
+     * Returns block cache configured capacity in bytes, or 0 if block cache is not enabled or engine is closed.
+     */
+    public long getBlockCacheCapacity() {
+        if (blockCache == null || closed) {
+            return 0L;
+        }
+        return config.getBlockCacheSize();
+    }
+
     public RocksDBStoreDiagnostics diagnostics() {
         if (closed) {
             return closedDiagnostics(config);
@@ -257,7 +287,10 @@ public class RocksDBStoreEngine implements AutoCloseable {
                 config.tuningSummary(),
                 properties,
                 columnFamilyProperties,
-                errors);
+                errors,
+                getBlockCacheUsage(),
+                getBlockCachePinnedUsage(),
+                getBlockCacheCapacity());
     }
 
     public byte[] get(RocksDBColumnFamily columnFamily, byte[] key) {
