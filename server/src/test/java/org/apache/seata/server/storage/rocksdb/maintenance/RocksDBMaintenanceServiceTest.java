@@ -80,8 +80,8 @@ class RocksDBMaintenanceServiceTest {
             Assertions.assertTrue(Files.exists(checkpointDir.resolve("seata-checkpoint-metadata.txt")));
 
             // Reopen from checkpoint and verify data
-            try (RocksDBStoreEngine checkpointEngine = RocksDBStoreEngine.open(
-                    new RocksDBStoreConfig(checkpointDir.toString(), true))) {
+            try (RocksDBStoreEngine checkpointEngine =
+                    RocksDBStoreEngine.open(new RocksDBStoreConfig(checkpointDir.toString(), true))) {
                 byte[] value = checkpointEngine.get(
                         RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(global.getXid()));
                 Assertions.assertNotNull(value);
@@ -117,14 +117,14 @@ class RocksDBMaintenanceServiceTest {
             service.createCheckpoint(checkpointDir, false);
 
             String metadata = new String(
-                    Files.readAllBytes(checkpointDir.resolve("seata-checkpoint-metadata.txt")),
-                    StandardCharsets.UTF_8);
+                    Files.readAllBytes(checkpointDir.resolve("seata-checkpoint-metadata.txt")), StandardCharsets.UTF_8);
             Assertions.assertTrue(metadata.contains("sourceDbPath="));
             Assertions.assertTrue(metadata.contains("formatVersion=" + RocksDBStoreEngine.FORMAT_VERSION));
             Assertions.assertTrue(metadata.contains("columnFamilies="));
             Assertions.assertTrue(metadata.contains("global_session"));
             Assertions.assertTrue(metadata.contains("branch_session"));
             Assertions.assertTrue(metadata.contains("rocksdbVersion="));
+            Assertions.assertTrue(metadata.contains("seataVersion="));
         }
     }
 
@@ -252,8 +252,8 @@ class RocksDBMaintenanceServiceTest {
 
             // Write consistent LOCK + LOCK_BRANCH_INDEX pair
             byte[] lockKey = RocksDBKeyCodec.encodeRowLock("resource", "table", "pk-1");
-            byte[] lockValue = encodeLockHolder(global.getXid(), global.getTransactionId(), 1L,
-                    "resource", "table", "pk-1");
+            byte[] lockValue =
+                    encodeLockHolder(global.getXid(), global.getTransactionId(), 1L, "resource", "table", "pk-1");
             byte[] indexKey = RocksDBKeyCodec.encodeLockBranchIndex(global.getXid(), 1L, lockKey);
 
             try (WriteBatch batch = new WriteBatch()) {
@@ -344,7 +344,8 @@ class RocksDBMaintenanceServiceTest {
     // ---- Helper methods ----
 
     private RocksDBStoreEngine open(String name) {
-        return RocksDBStoreEngine.open(new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
+        return RocksDBStoreEngine.open(
+                new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
     }
 
     private GlobalSession globalSession(String name, GlobalStatus status) {
@@ -353,8 +354,8 @@ class RocksDBMaintenanceServiceTest {
         return globalSession;
     }
 
-    private byte[] encodeLockHolder(String xid, long transactionId, long branchId,
-            String resourceId, String tableName, String pk) {
+    private byte[] encodeLockHolder(
+            String xid, long transactionId, long branchId, String resourceId, String tableName, String pk) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         writeLockString(out, xid);
         writeLockLong(out, transactionId);
@@ -365,8 +366,7 @@ class RocksDBMaintenanceServiceTest {
         writeLockString(out, resourceId + ":" + tableName + ":" + pk);
         writeLockInt(out, 0);
         return org.apache.seata.server.storage.rocksdb.RocksDBValueCodec.encode(
-                org.apache.seata.server.storage.rocksdb.RocksDBValueCodec.ValueType.LOCK_HOLDER,
-                out.toByteArray());
+                org.apache.seata.server.storage.rocksdb.RocksDBValueCodec.ValueType.LOCK_HOLDER, out.toByteArray());
     }
 
     private void writeLockString(ByteArrayOutputStream out, String value) {

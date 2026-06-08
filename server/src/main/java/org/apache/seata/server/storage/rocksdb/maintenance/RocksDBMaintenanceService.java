@@ -82,8 +82,7 @@ public class RocksDBMaintenanceService {
             throw new StoreException("checkpoint path must not be null");
         }
         if (Files.exists(checkpointPath) && !isDirectoryEmpty(checkpointPath)) {
-            throw new StoreException(
-                    "checkpoint target directory already exists and is not empty:" + checkpointPath);
+            throw new StoreException("checkpoint target directory already exists and is not empty:" + checkpointPath);
         }
         // Ensure parent directory exists; RocksDB createCheckpoint creates the target directory itself
         Path parent = checkpointPath.getParent();
@@ -123,15 +122,15 @@ public class RocksDBMaintenanceService {
         RocksDBVerifyReport.Builder report = RocksDBVerifyReport.builder();
 
         // Step 1: Check format version
-        byte[] versionBytes = storeEngine.get(
-                RocksDBColumnFamily.METADATA, "format_version".getBytes(StandardCharsets.UTF_8));
+        byte[] versionBytes =
+                storeEngine.get(RocksDBColumnFamily.METADATA, "format_version".getBytes(StandardCharsets.UTF_8));
         if (versionBytes == null) {
             report.addError("missing format_version in metadata");
         } else {
             String version = new String(versionBytes, StandardCharsets.UTF_8);
             if (!Integer.toString(RocksDBStoreEngine.FORMAT_VERSION).equals(version)) {
-                report.addError("format_version mismatch, expected:"
-                        + RocksDBStoreEngine.FORMAT_VERSION + ", found:" + version);
+                report.addError("format_version mismatch, expected:" + RocksDBStoreEngine.FORMAT_VERSION + ", found:"
+                        + version);
             }
         }
 
@@ -142,11 +141,12 @@ public class RocksDBMaintenanceService {
                 RocksDBValueCodec.DecodedValue decoded = RocksDBValueCodec.decode(value);
                 GlobalSession session = new GlobalSession(null, null, null, 0, true);
                 session.decode(decoded.getPayload());
-                globalSessions.put(session.getXid(), new GlobalVerifyEntry(
-                        session.getTransactionId(), session.getStatus(), session.getBeginTime()));
+                globalSessions.put(
+                        session.getXid(),
+                        new GlobalVerifyEntry(session.getTransactionId(), session.getStatus(), session.getBeginTime()));
             } catch (Exception e) {
-                report.addError("failed to decode global session, key length:" + key.length
-                        + ", message:" + e.getMessage());
+                report.addError(
+                        "failed to decode global session, key length:" + key.length + ", message:" + e.getMessage());
             }
         });
         report.checkedGlobalCount(globalSessions.size());
@@ -174,8 +174,7 @@ public class RocksDBMaintenanceService {
             // Verify value is xid
             String indexXid = new String(entry.getValue(), StandardCharsets.UTF_8);
             if (!xid.equals(indexXid)) {
-                report.addError("global status index value mismatch, key xid:" + xid
-                        + ", value xid:" + indexXid);
+                report.addError("global status index value mismatch, key xid:" + xid + ", value xid:" + indexXid);
                 staleStatusIndex++;
             }
         }
@@ -239,8 +238,7 @@ public class RocksDBMaintenanceService {
         // Step 7: Check orphan locks (LOCK without matching LOCK_BRANCH_INDEX)
         int orphanLocks = 0;
         int checkedLocks = 0;
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.LOCK, EMPTY_PREFIX)) {
+        for (RocksDBStoreEngine.RocksDBEntry entry : storeEngine.prefixScan(RocksDBColumnFamily.LOCK, EMPTY_PREFIX)) {
             checkedLocks++;
             if (!validLockKeyHexSet.contains(bytesToHex(entry.getKey()))) {
                 orphanLocks++;
@@ -281,9 +279,18 @@ public class RocksDBMaintenanceService {
         }
         sb.append('\n');
         RocksDB.Version version = RocksDB.rocksdbVersion();
-        sb.append("rocksdbVersion=").append(version != null ? version.toString() : "unknown").append('\n');
+        sb.append("rocksdbVersion=")
+                .append(version != null ? version.toString() : "unknown")
+                .append('\n');
         sb.append("syncWrite=").append(storeEngine.getConfig().isSyncWrite()).append('\n');
-        Files.write(checkpointPath.resolve(CHECKPOINT_METADATA_FILE), sb.toString().getBytes(StandardCharsets.UTF_8));
+        String seataVersion = RocksDBStoreEngine.class.getPackage() != null
+                ? RocksDBStoreEngine.class.getPackage().getImplementationVersion()
+                : null;
+        sb.append("seataVersion=")
+                .append(seataVersion != null ? seataVersion : "unknown")
+                .append('\n');
+        Files.write(
+                checkpointPath.resolve(CHECKPOINT_METADATA_FILE), sb.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     private boolean isDirectoryEmpty(Path dir) {
