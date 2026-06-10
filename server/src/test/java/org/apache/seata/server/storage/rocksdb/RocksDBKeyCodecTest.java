@@ -52,8 +52,7 @@ class RocksDBKeyCodecTest {
     void testPrefixEndReturnsSmallestExclusiveUpperBound() {
         Assertions.assertArrayEquals(new byte[] {1, 3}, RocksDBKeyCodec.prefixEnd(new byte[] {1, 2}));
         Assertions.assertArrayEquals(new byte[] {2}, RocksDBKeyCodec.prefixEnd(new byte[] {1, (byte) 0xff}));
-        Assertions.assertArrayEquals(
-                new byte[] {1, 3}, RocksDBKeyCodec.prefixEnd(new byte[] {1, 2, (byte) 0xff}));
+        Assertions.assertArrayEquals(new byte[] {1, 3}, RocksDBKeyCodec.prefixEnd(new byte[] {1, 2, (byte) 0xff}));
     }
 
     @Test

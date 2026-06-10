@@ -38,7 +38,6 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 import static org.apache.seata.common.exception.FrameworkErrorCode.ParameterRequired;
-import static org.apache.seata.common.util.StringUtils.isBlank;
 import static org.apache.seata.common.util.StringUtils.isNotBlank;
 import static org.apache.seata.server.storage.SessionConverter.convertToGlobalSessionVo;
 
@@ -67,8 +66,8 @@ public class GlobalSessionRedisServiceImpl extends AbstractGlobalService impleme
 
         RedisTransactionStoreManager instance = RedisTransactionStoreManagerFactory.getInstance();
 
-        boolean hasDirectGlobalQuery = isNotBlank(param.getXid())
-                || (param.getTransactionId() != null && param.getTransactionId() > 0);
+        boolean hasDirectGlobalQuery =
+                isNotBlank(param.getXid()) || (param.getTransactionId() != null && param.getTransactionId() > 0);
         if (!hasDirectGlobalQuery && param.getStatus() == null) {
             total = instance.countByGlobalSessions(GlobalStatus.values());
             globalSessions =
