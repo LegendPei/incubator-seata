@@ -54,18 +54,17 @@ import java.util.Map;
 public final class RocksDBQueryIndexBenchmark {
 
     private static final GlobalStatus[] STATUSES = {
-            GlobalStatus.Begin,
-            GlobalStatus.Committing,
-            GlobalStatus.RollbackRetrying,
-            GlobalStatus.AsyncCommitting,
-            GlobalStatus.Committed
+        GlobalStatus.Begin,
+        GlobalStatus.Committing,
+        GlobalStatus.RollbackRetrying,
+        GlobalStatus.AsyncCommitting,
+        GlobalStatus.Committed
     };
     private static final GlobalStatus TARGET_STATUS = GlobalStatus.RollbackRetrying;
     private static volatile int sinkCount;
     private static volatile String sinkXid;
 
-    private RocksDBQueryIndexBenchmark() {
-    }
+    private RocksDBQueryIndexBenchmark() {}
 
     public static void main(String[] args) throws Exception {
         Object originalEnvironment =
@@ -152,8 +151,7 @@ public final class RocksDBQueryIndexBenchmark {
                 engine.put(
                         RocksDBColumnFamily.GLOBAL_SESSION,
                         RocksDBKeyCodec.encodeXid(globalSession.getXid()),
-                        RocksDBValueCodec.encode(
-                                RocksDBValueCodec.ValueType.GLOBAL_SESSION, globalSession.encode()));
+                        RocksDBValueCodec.encode(RocksDBValueCodec.ValueType.GLOBAL_SESSION, globalSession.encode()));
             }
             engine.flush();
         }
@@ -250,11 +248,13 @@ public final class RocksDBQueryIndexBenchmark {
             return version;
         }
         try {
-            java.security.CodeSource codeSource = RocksDB.class.getProtectionDomain().getCodeSource();
+            java.security.CodeSource codeSource =
+                    RocksDB.class.getProtectionDomain().getCodeSource();
             if (codeSource == null || codeSource.getLocation() == null) {
                 return "unknown";
             }
-            String fileName = Paths.get(codeSource.getLocation().toURI()).getFileName().toString();
+            String fileName =
+                    Paths.get(codeSource.getLocation().toURI()).getFileName().toString();
             String prefix = "rocksdbjni-";
             String suffix = ".jar";
             if (fileName.startsWith(prefix) && fileName.endsWith(suffix)) {

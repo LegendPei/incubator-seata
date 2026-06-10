@@ -37,10 +37,16 @@ import org.rocksdb.RocksDB;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.io.IOException;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -77,11 +83,170 @@ public final class RocksDBFileModeBenchmark {
         GlobalStatus.Committed
     };
     private static final GlobalStatus TARGET_STATUS = GlobalStatus.RollbackRetrying;
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private static volatile int sinkCount;
     private static volatile String sinkXid;
 
     private RocksDBFileModeBenchmark() {}
+
+    // ---- Logging helpers ----
+
+    private static String ts() {
+        return LocalTime.now().format(TIME_FMT);
+    }
+
+    private static void log(String format, Object... args) {
+        System.out.printf(Locale.ROOT, "[%s] %s%n", ts(), String.format(Locale.ROOT, format, args));
+    }
+
+    private static void logScenarioStart(String scenario, BenchmarkOptions options) {
+        log(
+                "=== START %s (globalCount=%d, branchPerGlobal=%d, lockPerBranch=%d, syncWrite=%s, rangeDelete=%s) ===",
+                scenario,
+                options.globalCount,
+                options.branchPerGlobal,
+                options.lockPerBranch,
+                options.syncWrite,
+                options.enableRangeDelete);
+    }
+
+    private static void logRoundStart(String scenario, int round, int totalRounds, boolean warmup) {
+        log("  [%s] round %d/%d%s", scenario, round + 1, totalRounds, warmup ? " (warmup)" : "");
+    }
+
+    private static void logScenarioEnd(
+            String scenario, long elapsedNanos, SystemMetrics metricsBefore, SystemMetrics metricsAfter) {
+        double elapsedSec = elapsedNanos / 1_000_000_000.0;
+        log("=== END   %s (%.2fs) ===", scenario, elapsedSec);
+        if (metricsBefore != null && metricsAfter != null) {
+            long heapDelta = metricsAfter.heapUsed - metricsBefore.heapUsed;
+            long gcCountDelta = metricsAfter.gcCount - metricsBefore.gcCount;
+            long gcTimeDelta = metricsAfter.gcTimeMs - metricsBefore.gcTimeMs;
+            log(
+                    "  heap: %.1fMB -> %.1fMB (delta %+dMB), gc: +%d collections / +%dms",
+                    metricsBefore.heapUsed / 1048576.0,
+                    metricsAfter.heapUsed / 1048576.0,
+                    heapDelta / 1048576,
+                    gcCountDelta,
+                    gcTimeDelta);
+        }
+    }
+
+    private static void logEmit(String scenario, OperationStats stats) {
+        log(
+                "  >> %s: ops=%d, totalMs=%.1f, ops/s=%.1f, p50=%.3fms, p95=%.3fms, p99=%.3fms",
+                scenario,
+                stats.ops(),
+                stats.totalNanos() / 1_000_000.0,
+                stats.opsPerSecond(),
+                stats.percentile(50) / 1_000_000.0,
+                stats.percentile(95) / 1_000_000.0,
+                stats.percentile(99) / 1_000_000.0);
+    }
+
+    // ---- System metrics ----
+
+    private static final class SystemMetrics {
+        final long heapUsed;
+        final long heapMax;
+        final long nonHeapUsed;
+        final long gcCount;
+        final long gcTimeMs;
+
+        private SystemMetrics(long heapUsed, long heapMax, long nonHeapUsed, long gcCount, long gcTimeMs) {
+            this.heapUsed = heapUsed;
+            this.heapMax = heapMax;
+            this.nonHeapUsed = nonHeapUsed;
+            this.gcCount = gcCount;
+            this.gcTimeMs = gcTimeMs;
+        }
+
+        static SystemMetrics snapshot() {
+            MemoryMXBean mem = ManagementFactory.getMemoryMXBean();
+            MemoryUsage heap = mem.getHeapMemoryUsage();
+            MemoryUsage nonHeap = mem.getNonHeapMemoryUsage();
+            long gcCount = 0;
+            long gcTime = 0;
+            for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+                long count = gc.getCollectionCount();
+                if (count > 0) {
+                    gcCount += count;
+                }
+                long time = gc.getCollectionTime();
+                if (time > 0) {
+                    gcTime += time;
+                }
+            }
+            return new SystemMetrics(heap.getUsed(), heap.getMax(), nonHeap.getUsed(), gcCount, gcTime);
+        }
+    }
+
+    // ---- A/B comparison ----
+
+    private static void emitComparison(
+            List<String> csvLinesA, List<String> csvLinesB, BenchmarkOptions optionsA, BenchmarkOptions optionsB) {
+        System.out.println();
+        log("=== A/B COMPARISON: %s ===", optionsA.compare);
+        System.out.printf(Locale.ROOT, "%-40s %15s %15s %10s%n", "scenario", "A (ops/s)", "B (ops/s)", "delta%");
+        StringBuilder sep = new StringBuilder();
+        for (int i = 0; i < 82; i++) {
+            sep.append('-');
+        }
+        System.out.println(sep.toString());
+
+        Map<String, Double> mapA = parseOpsPerSecond(csvLinesA);
+        Map<String, Double> mapB = parseOpsPerSecond(csvLinesB);
+
+        Set<String> allScenarios = new LinkedHashSet<>();
+        allScenarios.addAll(mapA.keySet());
+        allScenarios.addAll(mapB.keySet());
+
+        for (String scenario : allScenarios) {
+            Double a = mapA.get(scenario);
+            Double b = mapB.get(scenario);
+            if (a == null || b == null) {
+                continue;
+            }
+            double delta = a > 0 ? (b - a) / a * 100.0 : 0;
+            String marker = delta > 5 ? " [B better]" : delta < -5 ? " [A better]" : "";
+            System.out.printf(Locale.ROOT, "%-40s %15.1f %15.1f %+9.1f%%%s%n", scenario, a, b, delta, marker);
+        }
+
+        System.out.println();
+        System.out.printf(Locale.ROOT, "A: %s%n", describeCompareOption(optionsA));
+        System.out.printf(Locale.ROOT, "B: %s%n", describeCompareOption(optionsB));
+    }
+
+    private static Map<String, Double> parseOpsPerSecond(List<String> csvLines) {
+        Map<String, Double> result = new LinkedHashMap<>();
+        for (String line : csvLines) {
+            if (line.isEmpty() || line.startsWith("#")) {
+                continue;
+            }
+            String[] parts = line.split(",", -1);
+            if (parts.length < 12) {
+                continue;
+            }
+            try {
+                result.put(parts[0], Double.parseDouble(parts[11]));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return result;
+    }
+
+    private static String describeCompareOption(BenchmarkOptions options) {
+        if ("syncWrite".equals(options.compare)) {
+            return "syncWrite=" + options.syncWrite;
+        }
+        if ("enableRangeDelete".equals(options.compare)) {
+            return "enableRangeDelete=" + options.enableRangeDelete;
+        }
+        return options.compare + " (custom)";
+    }
+
+    // ---- Main entry ----
 
     public static void main(String[] args) throws Exception {
         Object originalEnvironment =
@@ -97,39 +262,75 @@ public final class RocksDBFileModeBenchmark {
     }
 
     private void run(BenchmarkOptions options) throws Exception {
+        if (options.compare != null) {
+            runWithComparison(options);
+            return;
+        }
+        runOnce(options, null);
+    }
+
+    private void runWithComparison(BenchmarkOptions baseOptions) throws Exception {
+        BenchmarkOptions optionsA = baseOptions;
+        BenchmarkOptions optionsB = baseOptions.flipCompareOption();
+
+        log("=== A/B comparison mode: %s ===", baseOptions.compare);
+        log("A: %s", describeCompareOption(optionsA));
+        log("B: %s", describeCompareOption(optionsB));
+        System.out.println();
+
+        List<String> csvA = runOnce(optionsA, "A");
+        System.out.println();
+        List<String> csvB = runOnce(optionsB, "B");
+
+        emitComparison(csvA, csvB, optionsA, optionsB);
+    }
+
+    private List<String> runOnce(BenchmarkOptions options, String runLabel) throws Exception {
         Path rootPath = options.rootPath();
         Files.createDirectories(rootPath);
-        Path runPath = rootPath.resolve("rocksdb-file-mode-" + System.currentTimeMillis());
+        String suffix = runLabel != null ? "-" + runLabel : "";
+        Path runPath = rootPath.resolve("rocksdb-file-mode-" + System.currentTimeMillis() + suffix);
         Files.createDirectories(runPath);
 
-        printEnvironment(options, rootPath, runPath);
+        printEnvironment(options, rootPath, runPath, runLabel);
         System.out.println(CSV_HEADER);
+        List<String> csvLines = new ArrayList<>();
+
+        long runStartedAt = System.nanoTime();
         try {
             if (options.isEnabled("write")) {
-                runWriteBenchmark(runPath, options);
+                runWriteBenchmark(runPath, options, csvLines);
             }
             if (options.isEnabled("query")) {
-                runQueryBenchmark(runPath, options);
+                runQueryBenchmark(runPath, options, csvLines);
             }
             if (options.isEnabled("lock")) {
-                runLockBenchmark(runPath, options);
+                runLockBenchmark(runPath, options, csvLines);
             }
             if (options.isEnabled("cleanup")) {
-                runCleanupBenchmark(runPath, options);
+                runCleanupBenchmark(runPath, options, csvLines);
             }
             if (options.isEnabled("restart")) {
-                runRestartBenchmark(runPath, options);
+                runRestartBenchmark(runPath, options, csvLines);
             }
         } finally {
             if (options.cleanup) {
                 deleteRecursively(runPath);
             }
         }
+        double totalSec = (System.nanoTime() - runStartedAt) / 1_000_000_000.0;
+        log("=== ALL DONE (%.1fs, %d scenarios emitted) ===", totalSec, csvLines.size());
         System.out.println("sinkCount=" + sinkCount);
         System.out.println("sinkXid=" + sinkXid);
+        return csvLines;
     }
 
-    private void runWriteBenchmark(Path runPath, BenchmarkOptions options) throws Exception {
+    private void runWriteBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
+        String scenario = "write";
+        logScenarioStart(scenario, options);
+        SystemMetrics metricsBefore = SystemMetrics.snapshot();
+        long scenarioStart = System.nanoTime();
+
         OperationStats globalAddStats = new OperationStats(options.sampleEvery);
         OperationStats globalUpdateStats = new OperationStats(options.sampleEvery);
         OperationStats globalRemoveStats = new OperationStats(options.sampleEvery);
@@ -139,6 +340,8 @@ public final class RocksDBFileModeBenchmark {
         Path lastDbPath = null;
 
         for (int round = 0; round < options.totalRounds(); round++) {
+            boolean warmup = round < options.warmupRounds;
+            logRoundStart(scenario, round, options.totalRounds(), warmup);
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, round);
             Path dbPath = scenarioPath(runPath, "write-round-" + round);
             lastDbPath = dbPath;
@@ -198,15 +401,21 @@ public final class RocksDBFileModeBenchmark {
         }
 
         DbFootprint footprint = DbFootprint.from(lastDbPath);
-        emit("write.global_add", options, globalAddStats, footprint);
-        emit("write.global_update", options, globalUpdateStats, footprint);
-        emit("write.global_remove", options, globalRemoveStats, footprint);
-        emit("write.branch_add", options, branchAddStats, footprint);
-        emit("write.branch_update", options, branchUpdateStats, footprint);
-        emit("write.branch_remove", options, branchRemoveStats, footprint);
+        emit("write.global_add", options, globalAddStats, footprint, csvLines);
+        emit("write.global_update", options, globalUpdateStats, footprint, csvLines);
+        emit("write.global_remove", options, globalRemoveStats, footprint, csvLines);
+        emit("write.branch_add", options, branchAddStats, footprint, csvLines);
+        emit("write.branch_update", options, branchUpdateStats, footprint, csvLines);
+        emit("write.branch_remove", options, branchRemoveStats, footprint, csvLines);
+        logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
-    private void runQueryBenchmark(Path runPath, BenchmarkOptions options) throws Exception {
+    private void runQueryBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
+        String scenario = "query";
+        logScenarioStart(scenario, options);
+        SystemMetrics metricsBefore = SystemMetrics.snapshot();
+        long scenarioStart = System.nanoTime();
+
         BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, 0);
         Path dbPath = scenarioPath(runPath, "query");
         OperationStats xidStats = new OperationStats(options.sampleEvery);
@@ -219,6 +428,9 @@ public final class RocksDBFileModeBenchmark {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             writeDataSet(storeManager, dataSet);
             engine.flush();
+            log(
+                    "  query data loaded: %d globals, %d branches",
+                    options.globalCount, options.globalCount * options.branchPerGlobal);
 
             int iterations = options.totalRounds() * options.batchSize;
             int expectedStatusCount = dataSet.countByStatus(TARGET_STATUS);
@@ -226,6 +438,10 @@ public final class RocksDBFileModeBenchmark {
             for (int i = 0; i < iterations; i++) {
                 final int iteration = i;
                 int round = i / options.batchSize;
+                if (i % options.batchSize == 0) {
+                    boolean warmup = round < options.warmupRounds;
+                    logRoundStart(scenario, round, options.totalRounds(), warmup);
+                }
                 measure(xidStats, round, options, () -> {
                     GlobalSession globalSession = dataSet.pick(iteration);
                     GlobalSession actual = storeManager.readSession(globalSession.getXid(), false);
@@ -269,14 +485,20 @@ public final class RocksDBFileModeBenchmark {
         }
 
         DbFootprint footprint = DbFootprint.from(dbPath);
-        emit("query.xid", options, xidStats, footprint);
-        emit("query.transaction_id", options, transactionIdStats, footprint);
-        emit("query.status", options, statusStats, footprint);
-        emit("query.begin_sorted", options, beginSortedStats, footprint);
-        emit("query.full_scan_filter", options, fullScanStats, footprint);
+        emit("query.xid", options, xidStats, footprint, csvLines);
+        emit("query.transaction_id", options, transactionIdStats, footprint, csvLines);
+        emit("query.status", options, statusStats, footprint, csvLines);
+        emit("query.begin_sorted", options, beginSortedStats, footprint, csvLines);
+        emit("query.full_scan_filter", options, fullScanStats, footprint, csvLines);
+        logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
-    private void runLockBenchmark(Path runPath, BenchmarkOptions options) throws Exception {
+    private void runLockBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
+        String scenario = "lock";
+        logScenarioStart(scenario, options);
+        SystemMetrics metricsBefore = SystemMetrics.snapshot();
+        long scenarioStart = System.nanoTime();
+
         OperationStats acquireStats = new OperationStats(options.sampleEvery);
         OperationStats conflictAcquireStats = new OperationStats(options.sampleEvery);
         OperationStats conflictCheckStats = new OperationStats(options.sampleEvery);
@@ -287,6 +509,8 @@ public final class RocksDBFileModeBenchmark {
         Path lastDbPath = null;
 
         for (int round = 0; round < options.totalRounds(); round++) {
+            boolean warmup = round < options.warmupRounds;
+            logRoundStart(scenario, round, options.totalRounds(), warmup);
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
             Path dbPath = scenarioPath(runPath, "lock-round-" + round);
             lastDbPath = dbPath;
@@ -341,6 +565,7 @@ public final class RocksDBFileModeBenchmark {
 
         Path lastOrphanDbPath = null;
         for (int round = 0; round < options.totalRounds(); round++) {
+            log("  [lock.clean_orphan] round %d/%d", round + 1, options.totalRounds());
             Path orphanDbPath = scenarioPath(runPath, "lock-clean-orphan-round-" + round);
             lastOrphanDbPath = orphanDbPath;
             try (RocksDBStoreEngine engine = open(orphanDbPath, options)) {
@@ -360,20 +585,28 @@ public final class RocksDBFileModeBenchmark {
         }
 
         DbFootprint footprint = DbFootprint.from(lastDbPath);
-        emit("lock.acquire", options, acquireStats, footprint);
-        emit("lock.conflict_check", options, conflictCheckStats, footprint);
-        emit("lock.conflict_acquire", options, conflictAcquireStats, footprint);
-        emit("lock.update_status", options, updateStatusStats, footprint);
-        emit("lock.release_branch", options, releaseBranchStats, footprint);
-        emit("lock.release_global", options, releaseGlobalStats, footprint);
-        emit("lock.clean_orphan", options, cleanOrphanStats, DbFootprint.from(lastOrphanDbPath));
+        emit("lock.acquire", options, acquireStats, footprint, csvLines);
+        emit("lock.conflict_check", options, conflictCheckStats, footprint, csvLines);
+        emit("lock.conflict_acquire", options, conflictAcquireStats, footprint, csvLines);
+        emit("lock.update_status", options, updateStatusStats, footprint, csvLines);
+        emit("lock.release_branch", options, releaseBranchStats, footprint, csvLines);
+        emit("lock.release_global", options, releaseGlobalStats, footprint, csvLines);
+        emit("lock.clean_orphan", options, cleanOrphanStats, DbFootprint.from(lastOrphanDbPath), csvLines);
+        logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
-    private void runCleanupBenchmark(Path runPath, BenchmarkOptions options) throws Exception {
+    private void runCleanupBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
+        String scenario = "cleanup";
+        logScenarioStart(scenario, options);
+        SystemMetrics metricsBefore = SystemMetrics.snapshot();
+        long scenarioStart = System.nanoTime();
+
         OperationStats globalRemoveStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
 
         for (int round = 0; round < options.totalRounds(); round++) {
+            boolean warmup = round < options.warmupRounds;
+            logRoundStart(scenario, round, options.totalRounds(), warmup);
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, round);
             Path dbPath = scenarioPath(runPath, "cleanup-round-" + round);
             lastDbPath = dbPath;
@@ -393,21 +626,38 @@ public final class RocksDBFileModeBenchmark {
             }
         }
 
-        emit("cleanup.global_remove_with_branches", options, globalRemoveStats, DbFootprint.from(lastDbPath));
+        emit("cleanup.global_remove_with_branches", options, globalRemoveStats, DbFootprint.from(lastDbPath), csvLines);
+        logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
-    private void runRestartBenchmark(Path runPath, BenchmarkOptions options) throws Exception {
-        runRestartScenario(runPath, options, "restart.mixed", null);
-        runRestartScenario(runPath, options, "restart.active_only", GlobalStatus.Begin);
-        runRestartScenario(runPath, options, "restart.terminal_only", GlobalStatus.Committed);
+    private void runRestartBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
+        String scenario = "restart";
+        logScenarioStart(scenario, options);
+        SystemMetrics metricsBefore = SystemMetrics.snapshot();
+        long scenarioStart = System.nanoTime();
+
+        runRestartScenario(runPath, options, "restart.mixed", null, csvLines);
+        runRestartScenario(runPath, options, "restart.active_only", GlobalStatus.Begin, csvLines);
+        runRestartScenario(runPath, options, "restart.terminal_only", GlobalStatus.Committed, csvLines);
+
+        logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
     private void runRestartScenario(
-            Path runPath, BenchmarkOptions options, String scenarioName, GlobalStatus overrideStatus) throws Exception {
+            Path runPath,
+            BenchmarkOptions options,
+            String scenarioName,
+            GlobalStatus overrideStatus,
+            List<String> csvLines)
+            throws Exception {
         OperationStats restartStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
 
+        log("  [%s] override status: %s", scenarioName, overrideStatus != null ? overrideStatus : "mixed");
+
         for (int round = 0; round < options.totalRounds(); round++) {
+            boolean warmup = round < options.warmupRounds;
+            logRoundStart(scenarioName, round, options.totalRounds(), warmup);
             BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, round);
             if (overrideStatus != null) {
                 for (GlobalSession globalSession : dataSet.globalSessions) {
@@ -438,7 +688,7 @@ public final class RocksDBFileModeBenchmark {
             }
         }
 
-        emit(scenarioName, options, restartStats, DbFootprint.from(lastDbPath));
+        emit(scenarioName, options, restartStats, DbFootprint.from(lastDbPath), csvLines);
     }
 
     private static void writeDataSet(RocksDBTransactionStoreManager storeManager, BenchmarkDataSet dataSet) {
@@ -511,8 +761,13 @@ public final class RocksDBFileModeBenchmark {
         return status;
     }
 
-    private static void emit(String scenario, BenchmarkOptions options, OperationStats stats, DbFootprint footprint) {
-        System.out.println(scenario
+    private static void emit(
+            String scenario,
+            BenchmarkOptions options,
+            OperationStats stats,
+            DbFootprint footprint,
+            List<String> csvLines) {
+        String line = scenario
                 + ","
                 + options.globalCount
                 + ","
@@ -562,11 +817,16 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + footprint.lockEstimateKeys
                 + ","
-                + configDigest(options));
+                + configDigest(options);
+        System.out.println(line);
+        if (csvLines != null) {
+            csvLines.add(line);
+        }
+        logEmit(scenario, stats);
     }
 
-    private static void printEnvironment(BenchmarkOptions options, Path rootPath, Path runPath) {
-        System.out.println("RocksDB file mode benchmark");
+    private static void printEnvironment(BenchmarkOptions options, Path rootPath, Path runPath, String runLabel) {
+        System.out.println("RocksDB file mode benchmark" + (runLabel != null ? " [" + runLabel + "]" : ""));
         System.out.println("rootPath=" + rootPath);
         System.out.println("runPath=" + runPath);
         System.out.println("benchmarks=" + options.benchmarks);
@@ -585,6 +845,17 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("sampleEvery=" + options.sampleEvery);
         System.out.println("cleanup=" + options.cleanup);
         System.out.println("seed=" + options.seed);
+        if (options.compare != null) {
+            System.out.println("compare=" + options.compare);
+        }
+        SystemMetrics mem = SystemMetrics.snapshot();
+        System.out.printf(
+                Locale.ROOT,
+                "jvmHeapUsed=%.1fMB, jvmHeapMax=%.1fMB, gcCollections=%d, gcTimeMs=%d%n",
+                mem.heapUsed / 1048576.0,
+                mem.heapMax / 1048576.0,
+                mem.gcCount,
+                mem.gcTimeMs);
     }
 
     private static String rocksDbJniVersion() {
@@ -936,6 +1207,7 @@ public final class RocksDBFileModeBenchmark {
         private final long seed;
         private final String dbPath;
         private final Set<String> benchmarks;
+        private final String compare;
 
         private BenchmarkOptions(
                 int globalCount,
@@ -950,7 +1222,8 @@ public final class RocksDBFileModeBenchmark {
                 int sampleEvery,
                 long seed,
                 String dbPath,
-                Set<String> benchmarks) {
+                Set<String> benchmarks,
+                String compare) {
             this.globalCount = positive(globalCount, "globalCount");
             this.branchPerGlobal = nonNegative(branchPerGlobal, "branchPerGlobal");
             this.lockPerBranch = nonNegative(lockPerBranch, "lockPerBranch");
@@ -964,6 +1237,7 @@ public final class RocksDBFileModeBenchmark {
             this.seed = seed;
             this.dbPath = dbPath;
             this.benchmarks = benchmarks;
+            this.compare = compare;
         }
 
         private static BenchmarkOptions parse(String[] args) {
@@ -981,7 +1255,8 @@ public final class RocksDBFileModeBenchmark {
                     intValue(values, "sampleEvery", 1),
                     longValue(values, "seed", 20260606L),
                     stringValue(values, "dbPath", null),
-                    parseBenchmarks(stringValue(values, "benchmark", "all")));
+                    parseBenchmarks(stringValue(values, "benchmark", "all")),
+                    stringValue(values, "compare", null));
         }
 
         private BenchmarkOptions withAtLeastOneLock() {
@@ -998,7 +1273,50 @@ public final class RocksDBFileModeBenchmark {
                     sampleEvery,
                     seed,
                     dbPath,
-                    benchmarks);
+                    benchmarks,
+                    compare);
+        }
+
+        private BenchmarkOptions flipCompareOption() {
+            if (compare == null) {
+                return this;
+            }
+            switch (compare) {
+                case "syncWrite":
+                    return new BenchmarkOptions(
+                            globalCount,
+                            branchPerGlobal,
+                            lockPerBranch,
+                            !syncWrite,
+                            enableRangeDelete,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare);
+                case "enableRangeDelete":
+                    return new BenchmarkOptions(
+                            globalCount,
+                            branchPerGlobal,
+                            lockPerBranch,
+                            syncWrite,
+                            !enableRangeDelete,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare);
+                default:
+                    throw new IllegalArgumentException("Unsupported compare option: " + compare);
+            }
         }
 
         private boolean isEnabled(String benchmark) {

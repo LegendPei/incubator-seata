@@ -155,7 +155,12 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertTrue(engine.prefixScan(
                             RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(removed.getXid()))
                     .isEmpty());
-            Assertions.assertEquals(1, storeManager.readSession(kept.getXid(), true).getBranchSessions().size());
+            Assertions.assertEquals(
+                    1,
+                    storeManager
+                            .readSession(kept.getXid(), true)
+                            .getBranchSessions()
+                            .size());
         }
     }
 

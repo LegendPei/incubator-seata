@@ -238,7 +238,11 @@ public class RocksDBStoreEngine implements AutoCloseable {
         if (blockCache == null || closed) {
             return 0L;
         }
-        return blockCache.getUsage();
+        try {
+            return blockCache.getUsage();
+        } catch (Exception e) {
+            return 0L;
+        }
     }
 
     /**
@@ -248,7 +252,11 @@ public class RocksDBStoreEngine implements AutoCloseable {
         if (blockCache == null || closed) {
             return 0L;
         }
-        return blockCache.getPinnedUsage();
+        try {
+            return blockCache.getPinnedUsage();
+        } catch (Exception e) {
+            return 0L;
+        }
     }
 
     /**
@@ -390,6 +398,16 @@ public class RocksDBStoreEngine implements AutoCloseable {
         return false;
     }
 
+    /**
+     * Delete all keys matching the given prefix using RocksDB deleteRange.
+     * <p>
+     * When {@code rangeDeleteCompactAfterDelete} is enabled, a synchronous
+     * {@code compactRange} is issued immediately after the delete to reclaim
+     * disk space. Note that if {@code compactRange} fails, the preceding
+     * {@code deleteRange} has already been committed — the data is deleted
+     * but a {@link StoreException} is still thrown to signal the compaction
+     * failure.
+     */
     public boolean deleteRangeByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
         Objects.requireNonNull(prefix, "prefix must not be null");
         byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
