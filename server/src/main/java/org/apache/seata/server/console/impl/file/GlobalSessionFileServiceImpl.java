@@ -125,7 +125,7 @@ public class GlobalSessionFileServiceImpl extends AbstractGlobalService implemen
 
         return session -> {
             return
-                    // xid
+            // xid
             (isBlank(param.getXid()) || session.getXid().contains(param.getXid()))
                     &&
                     // transactionId
