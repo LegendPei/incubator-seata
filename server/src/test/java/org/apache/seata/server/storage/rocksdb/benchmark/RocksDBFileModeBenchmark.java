@@ -102,13 +102,14 @@ public final class RocksDBFileModeBenchmark {
 
     private static void logScenarioStart(String scenario, BenchmarkOptions options) {
         log(
-                "=== START %s (globalCount=%d, branchPerGlobal=%d, lockPerBranch=%d, syncWrite=%s, rangeDelete=%s) ===",
+                "=== START %s (globalCount=%d, branchPerGlobal=%d, lockPerBranch=%d, syncWrite=%s, rangeDelete=%s, blockCache=%s) ===",
                 scenario,
                 options.globalCount,
                 options.branchPerGlobal,
                 options.lockPerBranch,
                 options.syncWrite,
-                options.enableRangeDelete);
+                options.enableRangeDelete,
+                BenchmarkOptions.humanReadableSize(options.blockCacheSize));
     }
 
     private static void logRoundStart(String scenario, int round, int totalRounds, boolean warmup) {
@@ -143,6 +144,27 @@ public final class RocksDBFileModeBenchmark {
                 stats.percentile(50) / 1_000_000.0,
                 stats.percentile(95) / 1_000_000.0,
                 stats.percentile(99) / 1_000_000.0);
+    }
+
+    private static void logBlockCacheStats(RocksDBStoreEngine engine) {
+        try {
+            long usage = engine.getBlockCacheUsage();
+            long pinned = engine.getBlockCachePinnedUsage();
+            long capacity = engine.getBlockCacheCapacity();
+            if (capacity > 0) {
+                double usagePercent = capacity > 0 ? (usage * 100.0 / capacity) : 0;
+                log(
+                        "  block cache: usage=%s, pinned=%s, capacity=%s (%.1f%% utilized)",
+                        BenchmarkOptions.humanReadableSize(usage),
+                        BenchmarkOptions.humanReadableSize(pinned),
+                        BenchmarkOptions.humanReadableSize(capacity),
+                        usagePercent);
+            } else {
+                log("  block cache: disabled (no LRUCache configured)");
+            }
+        } catch (Exception e) {
+            log("  block cache: stats unavailable (%s)", e.getMessage());
+        }
     }
 
     // ---- System metrics ----
@@ -242,6 +264,9 @@ public final class RocksDBFileModeBenchmark {
         }
         if ("enableRangeDelete".equals(options.compare)) {
             return "enableRangeDelete=" + options.enableRangeDelete;
+        }
+        if ("blockCacheSize".equals(options.compare)) {
+            return "blockCacheSize=" + BenchmarkOptions.humanReadableSize(options.blockCacheSize);
         }
         return options.compare + " (custom)";
     }
@@ -482,6 +507,7 @@ public final class RocksDBFileModeBenchmark {
                     sinkCount = count;
                 });
             }
+            logBlockCacheStats(engine);
         }
 
         DbFootprint footprint = DbFootprint.from(dbPath);
@@ -701,15 +727,34 @@ public final class RocksDBFileModeBenchmark {
     }
 
     private static RocksDBStoreEngine open(Path dbPath, BenchmarkOptions options) {
-        return open(dbPath, options.syncWrite, options.enableRangeDelete);
+        return open(dbPath, options.syncWrite, options.enableRangeDelete, options.blockCacheSize);
     }
 
     private static RocksDBStoreEngine open(Path dbPath, boolean syncWrite) {
-        return open(dbPath, syncWrite, false);
+        return open(dbPath, syncWrite, false, 0L);
     }
 
-    private static RocksDBStoreEngine open(Path dbPath, boolean syncWrite, boolean enableRangeDelete) {
-        return RocksDBStoreEngine.open(new RocksDBStoreConfig(dbPath.toString(), syncWrite, enableRangeDelete));
+    private static RocksDBStoreEngine open(
+            Path dbPath, boolean syncWrite, boolean enableRangeDelete, long blockCacheSize) {
+        RocksDBStoreConfig config = new RocksDBStoreConfig(
+                dbPath.toString(),
+                syncWrite,
+                blockCacheSize,
+                0L, // writeBufferSize (default)
+                0, // maxWriteBufferNumber (default)
+                0, // minWriteBufferNumberToMerge (default)
+                0, // maxBackgroundJobs (default)
+                0, // maxOpenFiles (default)
+                0L, // targetFileSizeBase (default)
+                0, // level0FileNumCompactionTrigger (default)
+                0, // level0SlowdownWritesTrigger (default)
+                0, // level0StopWritesTrigger (default)
+                false, // enableStatistics
+                false, // optimizeFiltersForHits
+                null, // compressionType
+                enableRangeDelete,
+                false); // rangeDeleteCompactAfterDelete
+        return RocksDBStoreEngine.open(config);
     }
 
     private static Path scenarioPath(Path runPath, String scenario) throws IOException {
@@ -836,6 +881,7 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("rocksdbJniVersion=" + rocksDbJniVersion());
         System.out.println("syncWrite=" + options.syncWrite);
         System.out.println("enableRangeDelete=" + options.enableRangeDelete);
+        System.out.println("blockCacheSize=" + BenchmarkOptions.humanReadableSize(options.blockCacheSize));
         System.out.println("globalCount=" + options.globalCount);
         System.out.println("branchPerGlobal=" + options.branchPerGlobal);
         System.out.println("lockPerBranch=" + options.lockPerBranch);
@@ -886,6 +932,7 @@ public final class RocksDBFileModeBenchmark {
     private static String configDigest(BenchmarkOptions options) {
         String raw = "syncWrite=" + options.syncWrite
                 + ",enableRangeDelete=" + options.enableRangeDelete
+                + ",blockCacheSize=" + options.blockCacheSize
                 + ",globalCount=" + options.globalCount
                 + ",branchPerGlobal=" + options.branchPerGlobal
                 + ",lockPerBranch=" + options.lockPerBranch;
@@ -1199,6 +1246,7 @@ public final class RocksDBFileModeBenchmark {
         private final int lockPerBranch;
         private final boolean syncWrite;
         private final boolean enableRangeDelete;
+        private final long blockCacheSize;
         private final boolean cleanup;
         private final int warmupRounds;
         private final int measureRounds;
@@ -1215,6 +1263,7 @@ public final class RocksDBFileModeBenchmark {
                 int lockPerBranch,
                 boolean syncWrite,
                 boolean enableRangeDelete,
+                long blockCacheSize,
                 boolean cleanup,
                 int warmupRounds,
                 int measureRounds,
@@ -1229,6 +1278,7 @@ public final class RocksDBFileModeBenchmark {
             this.lockPerBranch = nonNegative(lockPerBranch, "lockPerBranch");
             this.syncWrite = syncWrite;
             this.enableRangeDelete = enableRangeDelete;
+            this.blockCacheSize = blockCacheSize;
             this.cleanup = cleanup;
             this.warmupRounds = nonNegative(warmupRounds, "warmupRounds");
             this.measureRounds = positive(measureRounds, "measureRounds");
@@ -1248,6 +1298,7 @@ public final class RocksDBFileModeBenchmark {
                     intValue(values, "lockPerBranch", 2),
                     booleanValue(values, "syncWrite", false),
                     booleanValue(values, "enableRangeDelete", false),
+                    parseSizeOption(values, "blockCacheSize", 0L),
                     booleanValue(values, "cleanup", false),
                     intValue(values, "warmupRounds", 1),
                     intValue(values, "measureRounds", 3),
@@ -1266,6 +1317,7 @@ public final class RocksDBFileModeBenchmark {
                     Math.max(1, lockPerBranch),
                     syncWrite,
                     enableRangeDelete,
+                    blockCacheSize,
                     cleanup,
                     warmupRounds,
                     measureRounds,
@@ -1289,6 +1341,7 @@ public final class RocksDBFileModeBenchmark {
                             lockPerBranch,
                             !syncWrite,
                             enableRangeDelete,
+                            blockCacheSize,
                             cleanup,
                             warmupRounds,
                             measureRounds,
@@ -1305,6 +1358,25 @@ public final class RocksDBFileModeBenchmark {
                             lockPerBranch,
                             syncWrite,
                             !enableRangeDelete,
+                            blockCacheSize,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare);
+                case "blockCacheSize":
+                    long flipped = blockCacheSize > 0 ? 0L : 128L * 1024 * 1024;
+                    return new BenchmarkOptions(
+                            globalCount,
+                            branchPerGlobal,
+                            lockPerBranch,
+                            syncWrite,
+                            enableRangeDelete,
+                            flipped,
                             cleanup,
                             warmupRounds,
                             measureRounds,
@@ -1413,6 +1485,50 @@ public final class RocksDBFileModeBenchmark {
                 throw new IllegalArgumentException(name + " must be non-negative");
             }
             return value;
+        }
+
+        private static long parseSizeOption(Map<String, String> values, String key, long defaultValue) {
+            String value = stringValue(values, key, null);
+            if (value == null) {
+                return defaultValue;
+            }
+            return parseSize(value);
+        }
+
+        private static long parseSize(String value) {
+            if (value == null || value.trim().isEmpty()) {
+                return 0L;
+            }
+            value = value.trim().toUpperCase(Locale.ROOT);
+            if (value.endsWith("GB")) {
+                return (long) (Double.parseDouble(value.substring(0, value.length() - 2)) * 1024 * 1024 * 1024);
+            }
+            if (value.endsWith("MB")) {
+                return (long) (Double.parseDouble(value.substring(0, value.length() - 2)) * 1024 * 1024);
+            }
+            if (value.endsWith("KB")) {
+                return (long) (Double.parseDouble(value.substring(0, value.length() - 2)) * 1024);
+            }
+            if (value.endsWith("B")) {
+                return Long.parseLong(value.substring(0, value.length() - 1));
+            }
+            return Long.parseLong(value);
+        }
+
+        private static String humanReadableSize(long bytes) {
+            if (bytes <= 0) {
+                return "0 (disabled)";
+            }
+            if (bytes >= 1024L * 1024 * 1024 && bytes % (1024L * 1024 * 1024) == 0) {
+                return (bytes / (1024L * 1024 * 1024)) + "GB";
+            }
+            if (bytes >= 1024L * 1024 && bytes % (1024L * 1024) == 0) {
+                return (bytes / (1024L * 1024)) + "MB";
+            }
+            if (bytes >= 1024 && bytes % 1024 == 0) {
+                return (bytes / 1024) + "KB";
+            }
+            return bytes + "B";
         }
     }
 }
