@@ -16,6 +16,7 @@
  */
 package org.apache.seata.server.storage.rocksdb;
 
+import org.apache.seata.common.exception.StoreException;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -23,6 +24,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.Delayed;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -125,6 +127,41 @@ class RocksDBWalSyncControllerTest {
     }
 
     @Test
+    void testClosePropagatesFinalWalSyncFailure() {
+        AtomicLong nowMillis = new AtomicLong(1000L);
+        AtomicLong nowNanos = new AtomicLong(10_000L);
+        FakeWalSyncer syncer = new FakeWalSyncer();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
+        RocksDBWalSyncController controller = controller(syncer, executor, nowMillis, nowNanos, 1000L, 100L, true);
+
+        controller.afterWrite();
+        syncer.fail = true;
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, controller::close);
+
+        Assertions.assertTrue(exception.getMessage().contains("shutdown"));
+        Assertions.assertEquals(1, syncer.flushCount);
+        Assertions.assertTrue(executor.isShutdown());
+        Assertions.assertEquals(1L, controller.stats().getSyncFailureCount());
+        Assertions.assertEquals(1L, controller.stats().getUnsyncedWriteRequests());
+    }
+
+    @Test
+    void testAfterWriteDoesNotThrowWhenExecutorRejectsDuringShutdown() {
+        AtomicLong nowMillis = new AtomicLong(1000L);
+        AtomicLong nowNanos = new AtomicLong(10_000L);
+        FakeWalSyncer syncer = new FakeWalSyncer();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
+        RocksDBWalSyncController controller = controller(syncer, executor, nowMillis, nowNanos, 1000L, 1L, false);
+
+        executor.shutdown();
+
+        Assertions.assertDoesNotThrow(controller::afterWrite);
+        Assertions.assertEquals(0, syncer.flushCount);
+        Assertions.assertEquals(1L, controller.stats().getUnsyncedWriteRequests());
+    }
+
+    @Test
     void testDisabledStatsAreEmpty() {
         RocksDBWalSyncController controller = RocksDBWalSyncController.disabled();
 
@@ -209,6 +246,9 @@ class RocksDBWalSyncControllerTest {
 
         @Override
         public void execute(Runnable command) {
+            if (shutdown) {
+                throw new RejectedExecutionException("executor shutdown");
+            }
             command.run();
         }
 

@@ -184,15 +184,18 @@ public class SessionHolder {
         if (!(lockManager instanceof RocksDBLockManager)) {
             return;
         }
-        int cleaned = ((RocksDBLockManager) lockManager).cleanOrphanLocks(ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT);
-        if (cleaned > 0) {
-            LOGGER.warn("Cleaned RocksDB orphan locks, count:{}", cleaned);
+        RocksDBLockManager.CleanOrphanLocksResult result =
+                ((RocksDBLockManager) lockManager).cleanOrphanLocks(ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT);
+        if (result.getCleaned() > 0) {
+            LOGGER.warn("Cleaned RocksDB orphan locks, count:{}, scanned:{}", result.getCleaned(), result.getScanned());
         }
-        if (cleaned >= ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT) {
+        if (result.isLimitReached()) {
             LOGGER.warn(
-                    "RocksDB orphan lock cleanup reached startup limit:{}, remaining locks may be cleaned by "
-                            + "maintenance tasks",
-                    ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT);
+                    "RocksDB orphan lock cleanup reached startup scan limit:{}, scanned:{}, cleaned:{}, "
+                            + "remaining locks may be cleaned by maintenance tasks",
+                    ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT,
+                    result.getScanned(),
+                    result.getCleaned());
         }
     }
 
