@@ -16,11 +16,13 @@
  */
 package org.apache.seata.server.storage.rocksdb;
 
+import org.apache.seata.common.exception.StoreException;
 import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -191,7 +193,16 @@ final class RocksDBWalSyncController implements AutoCloseable {
         if (!isPeriodic() || closed.get() || !syncScheduled.compareAndSet(false, true)) {
             return;
         }
-        executor.execute(() -> syncIfNeeded(reason));
+        try {
+            executor.execute(() -> syncIfNeeded(reason));
+        } catch (RejectedExecutionException e) {
+            syncScheduled.set(false);
+            if (closed.get() || executor.isShutdown()) {
+                LOGGER.debug("skip RocksDB WAL sync request because executor is shutting down, reason:{}", reason, e);
+                return;
+            }
+            throw e;
+        }
     }
 
     void syncNow(String reason) {
@@ -213,6 +224,10 @@ final class RocksDBWalSyncController implements AutoCloseable {
     }
 
     private synchronized void syncIfNeeded(String reason) {
+        syncIfNeeded(reason, false);
+    }
+
+    private synchronized void syncIfNeeded(String reason, boolean strict) {
         if (!isPeriodic()) {
             return;
         }
@@ -250,6 +265,9 @@ final class RocksDBWalSyncController implements AutoCloseable {
             syncFailureCount.incrementAndGet();
             lastSyncError = e.getMessage();
             LOGGER.error("periodic RocksDB WAL sync failed, reason:{}", reason, e);
+            if (strict) {
+                throw new StoreException(e, "periodic RocksDB WAL sync failed, reason:" + reason);
+            }
         } finally {
             syncScheduled.set(false);
         }
@@ -290,19 +308,28 @@ final class RocksDBWalSyncController implements AutoCloseable {
         if (!isPeriodic() || !closed.compareAndSet(false, true)) {
             return;
         }
-        if (syncOnShutdown) {
-            syncIfNeeded("shutdown");
-        }
-        if (shutdownExecutor) {
-            executor.shutdown();
-            try {
-                if (!executor.awaitTermination(intervalMillis, TimeUnit.MILLISECONDS)) {
+        RuntimeException syncFailure = null;
+        try {
+            if (syncOnShutdown) {
+                syncIfNeeded("shutdown", true);
+            }
+        } catch (RuntimeException e) {
+            syncFailure = e;
+        } finally {
+            if (shutdownExecutor) {
+                executor.shutdown();
+                try {
+                    if (!executor.awaitTermination(intervalMillis, TimeUnit.MILLISECONDS)) {
+                        executor.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                     executor.shutdownNow();
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                executor.shutdownNow();
             }
+        }
+        if (syncFailure != null) {
+            throw syncFailure;
         }
     }
 

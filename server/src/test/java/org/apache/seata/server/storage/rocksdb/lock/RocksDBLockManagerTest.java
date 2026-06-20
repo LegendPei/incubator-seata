@@ -271,7 +271,11 @@ class RocksDBLockManagerTest {
             Assertions.assertTrue(lockManager.acquireLock(first));
             Assertions.assertTrue(lockManager.acquireLock(second));
 
-            Assertions.assertEquals(1, lockManager.cleanOrphanLocks(1));
+            RocksDBLockManager.CleanOrphanLocksResult firstBatch = lockManager.cleanOrphanLocks(1);
+            Assertions.assertEquals(1, firstBatch.getCleaned());
+            Assertions.assertEquals(1, firstBatch.getScanned());
+            Assertions.assertTrue(firstBatch.isLimitReached());
+            Assertions.assertNotNull(firstBatch.getNextSeekKey());
             Assertions.assertEquals(
                     1, engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).size());
             Assertions.assertEquals(
@@ -279,11 +283,42 @@ class RocksDBLockManagerTest {
                     engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
                             .size());
 
-            Assertions.assertEquals(1, lockManager.cleanOrphanLocks(1));
+            RocksDBLockManager.CleanOrphanLocksResult secondBatch = lockManager.cleanOrphanLocks(1);
+            Assertions.assertEquals(1, secondBatch.getCleaned());
+            Assertions.assertEquals(1, secondBatch.getScanned());
+            Assertions.assertTrue(secondBatch.isLimitReached());
             Assertions.assertTrue(
                     engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty());
             Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
                     .isEmpty());
+        }
+    }
+
+    @Test
+    void testCleanOrphanLocksWithLimitReportsRemainingWhenScannedLocksAreValid() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-orphan-valid-prefix")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            BranchSession validFirst = branchSession(1001L, 1L, "t_order:1");
+            BranchSession validSecond = branchSession(1002L, 2L, "t_order:2");
+            BranchSession orphanAfterValidLocks = branchSession(1003L, 3L, "t_order:3");
+
+            storeManager.writeSession(LogOperation.BRANCH_ADD, validFirst);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, validSecond);
+            Assertions.assertTrue(lockManager.acquireLock(validFirst));
+            Assertions.assertTrue(lockManager.acquireLock(validSecond));
+            Assertions.assertTrue(lockManager.acquireLock(orphanAfterValidLocks));
+
+            RocksDBLockManager.CleanOrphanLocksResult result = lockManager.cleanOrphanLocks(2);
+
+            Assertions.assertEquals(0, result.getCleaned());
+            Assertions.assertEquals(2, result.getScanned());
+            Assertions.assertTrue(result.isLimitReached());
+            Assertions.assertNotNull(result.getNextSeekKey());
+            Assertions.assertEquals(
+                    3,
+                    engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                            .size());
         }
     }
 

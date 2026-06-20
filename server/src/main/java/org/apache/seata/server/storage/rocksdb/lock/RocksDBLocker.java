@@ -240,13 +240,17 @@ public class RocksDBLocker extends AbstractLocker {
     }
 
     public int cleanOrphanLocks() {
-        return cleanOrphanLocks(0);
+        return cleanOrphanLocks(0).getCleaned();
     }
 
-    public int cleanOrphanLocks(int limit) {
-        List<RocksDBStoreEngine.RocksDBEntry> indexEntries = scanLockBranchIndex(EMPTY_VALUE, limit);
+    public RocksDBLockManager.CleanOrphanLocksResult cleanOrphanLocks(int limit) {
+        LockBranchIndexScanResult scanResult = scanLockBranchIndexWithStats(EMPTY_VALUE, limit);
+        List<RocksDBStoreEngine.RocksDBEntry> indexEntries = scanResult.getIndexEntries();
+        boolean limitReached = scanResult.getStats().isLimitReached();
+        byte[] nextSeekKey = limitReached ? nextLockBranchIndexSeekKey(EMPTY_VALUE, indexEntries, limit) : null;
         if (CollectionUtils.isEmpty(indexEntries)) {
-            return 0;
+            return new RocksDBLockManager.CleanOrphanLocksResult(
+                    0, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
         }
         int cleaned = 0;
         try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
@@ -279,30 +283,44 @@ public class RocksDBLocker extends AbstractLocker {
                 }
             }
             storeEngine.write(batch);
-            return cleaned;
+            return new RocksDBLockManager.CleanOrphanLocksResult(
+                    cleaned, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
         } catch (RocksDBException e) {
             throw new StoreException(e, "clean RocksDB orphan locks failed");
         }
     }
 
     private List<RocksDBStoreEngine.RocksDBEntry> scanLockBranchIndex(byte[] prefix, int limit) {
-        return scanLockBranchIndex(prefix, prefix, limit);
+        return scanLockBranchIndexWithStats(prefix, prefix, limit).getIndexEntries();
     }
 
     private List<RocksDBStoreEngine.RocksDBEntry> scanLockBranchIndex(byte[] seekKey, byte[] prefix, int limit) {
+        return scanLockBranchIndexWithStats(seekKey, prefix, limit).getIndexEntries();
+    }
+
+    private LockBranchIndexScanResult scanLockBranchIndexWithStats(byte[] prefix, int limit) {
+        return scanLockBranchIndexWithStats(prefix, prefix, limit);
+    }
+
+    private LockBranchIndexScanResult scanLockBranchIndexWithStats(byte[] seekKey, byte[] prefix, int limit) {
         List<RocksDBStoreEngine.RocksDBEntry> indexEntries = new ArrayList<>();
-        storeEngine.scanByPrefix(
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
                 RocksDBColumnFamily.LOCK_BRANCH_INDEX,
                 seekKey,
                 prefix,
                 limit,
                 null,
                 (key, value) -> indexEntries.add(new RocksDBStoreEngine.RocksDBEntry(key, value)));
-        return indexEntries;
+        return new LockBranchIndexScanResult(indexEntries, stats);
     }
 
     private byte[] nextLockBranchIndexSeekKey(byte[] prefix, List<RocksDBStoreEngine.RocksDBEntry> indexEntries) {
-        if (indexEntries.size() < lockIndexScanBatchSize) {
+        return nextLockBranchIndexSeekKey(prefix, indexEntries, lockIndexScanBatchSize);
+    }
+
+    private byte[] nextLockBranchIndexSeekKey(
+            byte[] prefix, List<RocksDBStoreEngine.RocksDBEntry> indexEntries, int batchSize) {
+        if (batchSize <= 0 || indexEntries.size() < batchSize) {
             return null;
         }
         byte[] nextSeekKey = RocksDBKeyCodec.prefixEnd(
@@ -311,6 +329,25 @@ public class RocksDBLocker extends AbstractLocker {
             return null;
         }
         return nextSeekKey;
+    }
+
+    private static final class LockBranchIndexScanResult {
+        private final List<RocksDBStoreEngine.RocksDBEntry> indexEntries;
+        private final RocksDBStoreEngine.ScanStats stats;
+
+        private LockBranchIndexScanResult(
+                List<RocksDBStoreEngine.RocksDBEntry> indexEntries, RocksDBStoreEngine.ScanStats stats) {
+            this.indexEntries = indexEntries;
+            this.stats = stats;
+        }
+
+        private List<RocksDBStoreEngine.RocksDBEntry> getIndexEntries() {
+            return indexEntries;
+        }
+
+        private RocksDBStoreEngine.ScanStats getStats() {
+            return stats;
+        }
     }
 
     private void writeLocks(List<LockDO> lockDOs) {

@@ -26,6 +26,8 @@ import org.apache.seata.server.storage.rocksdb.RocksDBLocalLocks;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 
+import java.util.Arrays;
+
 /**
  * RocksDB lock manager for file store engine.
  */
@@ -70,12 +72,46 @@ public class RocksDBLockManager extends AbstractLockManager {
         return locker.cleanOrphanLocks();
     }
 
-    public int cleanOrphanLocks(int limit) {
+    public CleanOrphanLocksResult cleanOrphanLocks(int limit) {
         return locker.cleanOrphanLocks(limit);
     }
 
     @Override
     protected Locker getLocker(BranchSession branchSession) {
         return locker;
+    }
+
+    public static class CleanOrphanLocksResult {
+        private final int cleaned;
+        private final int scanned;
+        private final boolean limitReached;
+        private final byte[] nextSeekKey;
+
+        CleanOrphanLocksResult(int cleaned, int scanned, boolean limitReached, byte[] nextSeekKey) {
+            this.cleaned = cleaned;
+            this.scanned = scanned;
+            this.limitReached = limitReached;
+            this.nextSeekKey = copy(nextSeekKey);
+        }
+
+        public int getCleaned() {
+            return cleaned;
+        }
+
+        public int getScanned() {
+            return scanned;
+        }
+
+        public boolean isLimitReached() {
+            return limitReached;
+        }
+
+        public byte[] getNextSeekKey() {
+            return copy(nextSeekKey);
+        }
+
+        private static byte[] copy(byte[] value) {
+            return value == null ? null : Arrays.copyOf(value, value.length);
+        }
     }
 }
