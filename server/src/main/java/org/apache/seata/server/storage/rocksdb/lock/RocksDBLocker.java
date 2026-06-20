@@ -244,7 +244,12 @@ public class RocksDBLocker extends AbstractLocker {
     }
 
     public RocksDBLockManager.CleanOrphanLocksResult cleanOrphanLocks(int limit) {
-        LockBranchIndexScanResult scanResult = scanLockBranchIndexWithStats(EMPTY_VALUE, limit);
+        return cleanOrphanLocks(EMPTY_VALUE, limit);
+    }
+
+    public RocksDBLockManager.CleanOrphanLocksResult cleanOrphanLocks(byte[] seekKey, int limit) {
+        byte[] actualSeekKey = seekKey == null ? EMPTY_VALUE : Arrays.copyOf(seekKey, seekKey.length);
+        LockBranchIndexScanResult scanResult = scanLockBranchIndexWithStats(actualSeekKey, EMPTY_VALUE, limit);
         List<RocksDBStoreEngine.RocksDBEntry> indexEntries = scanResult.getIndexEntries();
         boolean limitReached = scanResult.getStats().isLimitReached();
         byte[] nextSeekKey = limitReached ? nextLockBranchIndexSeekKey(EMPTY_VALUE, indexEntries, limit) : null;

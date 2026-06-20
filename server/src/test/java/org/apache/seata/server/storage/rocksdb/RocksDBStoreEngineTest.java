@@ -24,10 +24,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.WriteBatch;
 
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 class RocksDBStoreEngineTest {
 
@@ -369,6 +376,30 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testCloseReleasesResourcesWhenFinalWalSyncFails() throws Exception {
+        RocksDBStoreConfig config = config("wal-sync-close-failure-reopen", false);
+        RocksDBStoreEngine engine = RocksDBStoreEngine.open(config);
+        FailingWalSyncer syncer = new FailingWalSyncer();
+        DirectScheduledExecutor executor = new DirectScheduledExecutor();
+        replaceWalSyncController(engine, newFailingShutdownSyncController(syncer, executor));
+
+        engine.put(
+                RocksDBColumnFamily.GLOBAL_SESSION,
+                RocksDBKeyCodec.encodeXid("xid-close-failure"),
+                "value".getBytes(StandardCharsets.UTF_8));
+        syncer.fail = true;
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, engine::close);
+
+        Assertions.assertTrue(exception.getMessage().contains("shutdown"));
+        Assertions.assertTrue(executor.isShutdown());
+        try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
+            Assertions.assertNotNull(
+                    reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid("xid-close-failure")));
+        }
+    }
+
+    @Test
     void testFactoryRejectsDifferentTuningOptions() {
         RocksDBStoreConfig config = tunedConfig("factory-tuning", true);
         RocksDBStoreEngineFactory.getInstance(config);
@@ -513,6 +544,28 @@ class RocksDBStoreEngineTest {
                 1000);
     }
 
+    private RocksDBWalSyncController newFailingShutdownSyncController(
+            RocksDBWalSyncController.WalSyncer syncer, ScheduledExecutorService executor) {
+        return new RocksDBWalSyncController(
+                RocksDBWalSyncMode.PERIODIC,
+                syncer,
+                1000L,
+                100L,
+                true,
+                1000L,
+                executor,
+                true,
+                System::currentTimeMillis,
+                System::nanoTime);
+    }
+
+    private void replaceWalSyncController(RocksDBStoreEngine engine, RocksDBWalSyncController controller)
+            throws Exception {
+        Field field = RocksDBStoreEngine.class.getDeclaredField("walSyncController");
+        field.setAccessible(true);
+        field.set(engine, controller);
+    }
+
     private void waitUntil(Condition condition) throws Exception {
         long deadline = System.currentTimeMillis() + 3000L;
         while (System.currentTimeMillis() < deadline) {
@@ -527,5 +580,123 @@ class RocksDBStoreEngineTest {
     @FunctionalInterface
     private interface Condition {
         boolean evaluate();
+    }
+
+    private static final class FailingWalSyncer implements RocksDBWalSyncController.WalSyncer {
+        private long sequence;
+        private boolean fail;
+
+        @Override
+        public void flushWal(boolean sync) throws Exception {
+            if (fail) {
+                throw new Exception("boom");
+            }
+            sequence++;
+        }
+
+        @Override
+        public long latestSequenceNumber() {
+            return sequence;
+        }
+    }
+
+    private static final class DirectScheduledExecutor extends AbstractExecutorService
+            implements ScheduledExecutorService {
+        private boolean shutdown;
+
+        @Override
+        public void shutdown() {
+            shutdown = true;
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            shutdown = true;
+            return Collections.emptyList();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) {
+            return true;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            command.run();
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            return new DoneScheduledFuture<>(null);
+        }
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(java.util.concurrent.Callable<V> callable, long delay, TimeUnit unit) {
+            return new DoneScheduledFuture<>(null);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable command, long initialDelay, long period, TimeUnit unit) {
+            return scheduleWithFixedDelay(command, initialDelay, period, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(
+                Runnable command, long initialDelay, long delay, TimeUnit unit) {
+            return new DoneScheduledFuture<>(null);
+        }
+    }
+
+    private static final class DoneScheduledFuture<V> implements ScheduledFuture<V> {
+        private final V value;
+
+        private DoneScheduledFuture(V value) {
+            this.value = value;
+        }
+
+        @Override
+        public long getDelay(TimeUnit unit) {
+            return 0L;
+        }
+
+        @Override
+        public int compareTo(Delayed other) {
+            return 0;
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            return false;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return false;
+        }
+
+        @Override
+        public boolean isDone() {
+            return true;
+        }
+
+        @Override
+        public V get() {
+            return value;
+        }
+
+        @Override
+        public V get(long timeout, TimeUnit unit) {
+            return value;
+        }
     }
 }
