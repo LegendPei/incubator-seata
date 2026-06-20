@@ -559,17 +559,25 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
         closed = true;
         RocksDBStoreMetrics.unregister(this);
-        walSyncController.close();
-        for (ColumnFamilyHandle handle : handles.values()) {
-            handle.close();
+        RuntimeException syncFailure = null;
+        try {
+            walSyncController.close();
+        } catch (RuntimeException e) {
+            syncFailure = e;
+        } finally {
+            closeQuietly(
+                    new ArrayList<>(handles.values()),
+                    db,
+                    writeOptions,
+                    readOptions,
+                    columnFamilyOptions,
+                    dbOptions,
+                    blockCache,
+                    statistics);
         }
-        db.close();
-        writeOptions.close();
-        readOptions.close();
-        columnFamilyOptions.close();
-        dbOptions.close();
-        closeQuietly(blockCache);
-        closeQuietly(statistics);
+        if (syncFailure != null) {
+            throw syncFailure;
+        }
     }
 
     public static RocksDBStoreDiagnostics closedDiagnostics() {
