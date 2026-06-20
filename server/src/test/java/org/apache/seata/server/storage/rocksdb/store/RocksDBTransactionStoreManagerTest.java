@@ -331,6 +331,33 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByStatusAndOvertimeUsesBeginTimeBoundary() {
+        try (RocksDBStoreEngine engine = open("condition-status-overtime")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            long now = System.currentTimeMillis();
+            GlobalSession oldSession = globalSession("tx-old-status", GlobalStatus.Begin);
+            oldSession.setBeginTime(now - 60000);
+            GlobalSession newSession = globalSession("tx-new-status", GlobalStatus.Begin);
+            newSession.setBeginTime(now);
+            GlobalSession oldOtherStatus = globalSession("tx-old-other-status", GlobalStatus.Committing);
+            oldOtherStatus.setBeginTime(now - 60000);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, oldSession);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, newSession);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, oldOtherStatus);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setLazyLoadBranch(true);
+            condition.setOverTimeAliveMills(1000L);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, actual.size());
+            Assertions.assertEquals(oldSession.getXid(), actual.get(0).getXid());
+            Assertions.assertTrue(actual.get(0).isLazyLoadBranch());
+        }
+    }
+
+    @Test
     void testReadByEmptySessionConditionScansAll() {
         try (RocksDBStoreEngine engine = open("condition-all")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);

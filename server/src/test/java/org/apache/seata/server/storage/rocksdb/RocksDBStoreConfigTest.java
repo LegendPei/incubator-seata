@@ -59,6 +59,13 @@ class RocksDBStoreConfigTest {
         Assertions.assertNull(config.getCompressionType());
         Assertions.assertFalse(config.isEnableRangeDelete());
         Assertions.assertFalse(config.isRangeDeleteCompactAfterDelete());
+        Assertions.assertEquals(RocksDBWalSyncMode.NONE, config.getWalSyncMode());
+        Assertions.assertEquals(RocksDBStoreConfig.DEFAULT_WAL_SYNC_INTERVAL_MILLIS, config.getWalSyncIntervalMillis());
+        Assertions.assertEquals(RocksDBStoreConfig.DEFAULT_WAL_SYNC_WRITE_THRESHOLD, config.getWalSyncWriteThreshold());
+        Assertions.assertTrue(config.isWalSyncOnShutdown());
+        Assertions.assertEquals(
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS, config.getWalSyncWarnThresholdMillis());
+        Assertions.assertFalse(config.isPeriodicWalSyncEnabled());
     }
 
     @Test
@@ -82,10 +89,15 @@ class RocksDBStoreConfigTest {
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_COMPRESSION_TYPE, "no");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE, "true");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_RANGE_DELETE_COMPACT_AFTER_DELETE, "true");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_MODE, "periodic");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS, "500");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD, "5000");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_ON_SHUTDOWN, "false");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS, "200");
 
-        RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), true);
+        RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), false);
 
-        Assertions.assertTrue(config.isSyncWrite());
+        Assertions.assertFalse(config.isSyncWrite());
         Assertions.assertEquals(64L * 1024L, config.getBlockCacheSize());
         Assertions.assertEquals(2L * 1024L * 1024L, config.getWriteBufferSize());
         Assertions.assertEquals(3, config.getMaxWriteBufferNumber());
@@ -101,6 +113,24 @@ class RocksDBStoreConfigTest {
         Assertions.assertEquals("no", config.getCompressionType());
         Assertions.assertTrue(config.isEnableRangeDelete());
         Assertions.assertTrue(config.isRangeDeleteCompactAfterDelete());
+        Assertions.assertEquals(RocksDBWalSyncMode.PERIODIC, config.getWalSyncMode());
+        Assertions.assertEquals(500, config.getWalSyncIntervalMillis());
+        Assertions.assertEquals(5000L, config.getWalSyncWriteThreshold());
+        Assertions.assertFalse(config.isWalSyncOnShutdown());
+        Assertions.assertEquals(200, config.getWalSyncWarnThresholdMillis());
+        Assertions.assertTrue(config.isPeriodicWalSyncEnabled());
+    }
+
+    @Test
+    void testPeriodicWalSyncIgnoredBySyncWriteEffectiveMode() {
+        Map<String, String> values = new HashMap<>();
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_MODE, "periodic");
+
+        RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), true);
+
+        Assertions.assertTrue(config.isSyncWrite());
+        Assertions.assertEquals(RocksDBWalSyncMode.PERIODIC, config.getWalSyncMode());
+        Assertions.assertFalse(config.isPeriodicWalSyncEnabled());
     }
 
     @Test
@@ -121,6 +151,31 @@ class RocksDBStoreConfigTest {
                 StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
     }
 
+    @Test
+    void testRejectsInvalidWalSyncMode() {
+        Map<String, String> values = new HashMap<>();
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_MODE, "invalid");
+
+        Assertions.assertThrows(
+                StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+    }
+
+    @Test
+    void testRejectsInvalidWalSyncThresholds() {
+        Map<String, String> values = new HashMap<>();
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_MODE, "periodic");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS, "0");
+
+        Assertions.assertThrows(
+                StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS, "1");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD, "0");
+
+        Assertions.assertThrows(
+                StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+    }
+
     private Configuration configuration(Map<String, String> values) {
         Configuration configuration = Mockito.mock(Configuration.class);
         Mockito.when(configuration.getConfig(Mockito.anyString()))
@@ -134,6 +189,11 @@ class RocksDBStoreConfigTest {
                 .thenAnswer(invocation -> {
                     String value = values.get(invocation.getArgument(0));
                     return value == null ? invocation.getArgument(1) : Integer.parseInt(value);
+                });
+        Mockito.when(configuration.getLong(Mockito.anyString(), Mockito.anyLong()))
+                .thenAnswer(invocation -> {
+                    String value = values.get(invocation.getArgument(0));
+                    return value == null ? invocation.getArgument(1) : Long.parseLong(value);
                 });
         Mockito.when(configuration.getBoolean(Mockito.anyString(), Mockito.anyBoolean()))
                 .thenAnswer(invocation -> {

@@ -198,8 +198,13 @@ seata:
       session-reload-read-size: 100
       flush-disk-mode: async
       rocksdb:
-        # Phase1 only reserves the config key; RocksDB engine becomes available in Phase2.
         dir: sessionStore/rocksdb
+        # periodic WAL sync is disabled by default; only works when flush-disk-mode is async.
+        wal-sync-mode: none
+        wal-sync-interval-millis: 2000
+        wal-sync-write-threshold: 10
+        wal-sync-on-shutdown: true
+        wal-sync-warn-threshold-millis: 1000
     db:
       datasource: druid
       db-type: mysql

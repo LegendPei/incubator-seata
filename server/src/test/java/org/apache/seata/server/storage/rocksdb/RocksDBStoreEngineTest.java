@@ -29,6 +29,7 @@ import org.rocksdb.WriteBatch;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 class RocksDBStoreEngineTest {
@@ -69,6 +70,47 @@ class RocksDBStoreEngineTest {
                     engine.prefixScan(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1"));
 
             Assertions.assertEquals(2, entries.size());
+        }
+    }
+
+    @Test
+    void testScanByPrefixCanSeekAndStopWithStats() {
+        try (RocksDBStoreEngine engine = open("bounded-scan", false)) {
+            byte[] prefix = RocksDBKeyCodec.encodeGlobalStatusPrefix(GlobalStatus.Begin);
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 100L, "tx-before"),
+                    "tx-before".getBytes(StandardCharsets.UTF_8));
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 200L, "tx-first"),
+                    "tx-first".getBytes(StandardCharsets.UTF_8));
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 300L, "tx-second"),
+                    "tx-second".getBytes(StandardCharsets.UTF_8));
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 400L, "tx-after"),
+                    "tx-after".getBytes(StandardCharsets.UTF_8));
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Committing, 100L, "tx-other-status"),
+                    "tx-other-status".getBytes(StandardCharsets.UTF_8));
+
+            List<String> xids = new ArrayList<>();
+            RocksDBStoreEngine.ScanStats stats = engine.scanByPrefix(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusSeekKey(GlobalStatus.Begin, 200L),
+                    prefix,
+                    0,
+                    (key, value) -> RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(key) <= 300L,
+                    (key, value) -> xids.add(new String(value, StandardCharsets.UTF_8)));
+
+            Assertions.assertEquals(List.of("tx-first", "tx-second"), xids);
+            Assertions.assertEquals(3, stats.getRowsScanned());
+            Assertions.assertEquals(2, stats.getRowsReturned());
+            Assertions.assertFalse(stats.isLimitReached());
         }
     }
 
@@ -311,6 +353,45 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testPeriodicWalSyncStatsAfterWrite() throws Exception {
+        RocksDBStoreConfig config = periodicWalSyncConfig("periodic-wal-sync", false, 1L);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            byte[] key = RocksDBKeyCodec.encodeXid("xid-periodic");
+            byte[] value = "periodic".getBytes(StandardCharsets.UTF_8);
+            long syncCountBeforeWrite = engine.diagnostics().getWalSyncStats().getSyncCount();
+
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value);
+
+            waitUntil(() -> {
+                RocksDBWalSyncStats stats = engine.diagnostics().getWalSyncStats();
+                return stats.getSyncCount() > syncCountBeforeWrite && stats.getUnsyncedWriteRequests() == 0;
+            });
+            RocksDBWalSyncStats stats = engine.diagnostics().getWalSyncStats();
+            Assertions.assertEquals(RocksDBWalSyncMode.PERIODIC, stats.getMode());
+            Assertions.assertEquals(0L, stats.getSyncFailureCount());
+            Assertions.assertEquals(0L, stats.getUnsyncedWriteRequests());
+            Assertions.assertTrue(stats.getLastSyncedSequenceNumber() > 0);
+        }
+    }
+
+    @Test
+    void testPeriodicWalSyncDisabledWhenSyncWriteEnabled() {
+        RocksDBStoreConfig config = periodicWalSyncConfig("periodic-ignored-by-sync", true, 1L);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            byte[] key = RocksDBKeyCodec.encodeXid("xid-sync");
+            byte[] value = "sync".getBytes(StandardCharsets.UTF_8);
+
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value);
+
+            RocksDBWalSyncStats stats = engine.diagnostics().getWalSyncStats();
+            Assertions.assertEquals(RocksDBWalSyncMode.NONE, stats.getMode());
+            Assertions.assertEquals(0L, stats.getSyncCount());
+        }
+    }
+
+    @Test
     void testFactoryRejectsDifferentTuningOptions() {
         RocksDBStoreConfig config = tunedConfig("factory-tuning", true);
         RocksDBStoreEngineFactory.getInstance(config);
@@ -435,5 +516,47 @@ class RocksDBStoreEngineTest {
                 true,
                 true,
                 compressionType);
+    }
+
+    private RocksDBStoreConfig periodicWalSyncConfig(String name, boolean syncWrite, long threshold) {
+        return new RocksDBStoreConfig(
+                tempDir.resolve(name).toString(),
+                syncWrite,
+                0L,
+                0L,
+                0,
+                0,
+                0,
+                0,
+                0L,
+                0,
+                0,
+                0,
+                false,
+                false,
+                null,
+                false,
+                false,
+                RocksDBWalSyncMode.PERIODIC,
+                1000,
+                threshold,
+                true,
+                1000);
+    }
+
+    private void waitUntil(Condition condition) throws Exception {
+        long deadline = System.currentTimeMillis() + 3000L;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.evaluate()) {
+                return;
+            }
+            Thread.sleep(20L);
+        }
+        Assertions.fail("condition was not satisfied before timeout");
+    }
+
+    @FunctionalInterface
+    private interface Condition {
+        boolean evaluate();
     }
 }
