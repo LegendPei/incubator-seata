@@ -319,6 +319,18 @@ class RocksDBLockManagerTest {
                     3,
                     engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
                             .size());
+
+            RocksDBLockManager.CleanOrphanLocksResult nextResult =
+                    lockManager.cleanOrphanLocks(result.getNextSeekKey(), 2);
+
+            Assertions.assertEquals(1, nextResult.getCleaned());
+            Assertions.assertEquals(1, nextResult.getScanned());
+            Assertions.assertFalse(nextResult.isLimitReached());
+            Assertions.assertNull(nextResult.getNextSeekKey());
+            Assertions.assertEquals(
+                    2,
+                    engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                            .size());
         }
     }
 

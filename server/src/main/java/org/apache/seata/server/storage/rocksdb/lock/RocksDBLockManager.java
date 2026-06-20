@@ -76,6 +76,10 @@ public class RocksDBLockManager extends AbstractLockManager {
         return locker.cleanOrphanLocks(limit);
     }
 
+    public CleanOrphanLocksResult cleanOrphanLocks(byte[] seekKey, int limit) {
+        return locker.cleanOrphanLocks(seekKey, limit);
+    }
+
     @Override
     protected Locker getLocker(BranchSession branchSession) {
         return locker;
