@@ -102,6 +102,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final WriteOptions writeOptions;
     private final Cache blockCache;
     private final Statistics statistics;
+    private final RocksDBWalSyncController walSyncController;
     private final RocksDB db;
 
     private volatile boolean closed;
@@ -115,6 +116,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         BlockBasedTableConfig openedTableConfig = null;
         Cache openedBlockCache = null;
         Statistics openedStatistics = null;
+        RocksDBWalSyncController openedWalSyncController = RocksDBWalSyncController.disabled();
         RocksDB openedDb = null;
         List<ColumnFamilyHandle> openedHandles = new ArrayList<>();
         Map<RocksDBColumnFamily, ColumnFamilyHandle> openedHandleMap = new EnumMap<>(RocksDBColumnFamily.class);
@@ -151,13 +153,19 @@ public class RocksDBStoreEngine implements AutoCloseable {
             for (int i = 0; i < RocksDBColumnFamily.values().length; i++) {
                 openedHandleMap.put(RocksDBColumnFamily.values()[i], openedHandles.get(i));
             }
-            initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
+            boolean metadataUpdated =
+                    initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
+            openedWalSyncController = RocksDBWalSyncController.create(openedDb, config);
+            if (metadataUpdated) {
+                openedWalSyncController.afterWrite();
+            }
             dbOptions = openedDbOptions;
             columnFamilyOptions = openedColumnFamilyOptions;
             readOptions = openedReadOptions;
             writeOptions = openedWriteOptions;
             blockCache = openedBlockCache;
             statistics = openedStatistics;
+            walSyncController = openedWalSyncController;
             db = openedDb;
             handles.putAll(openedHandleMap);
             LOGGER.info(
@@ -169,8 +177,14 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     rocksDBVersion(),
                     config.isSyncWrite(),
                     config.tuningSummary());
+            if (config.isSyncWrite() && config.getWalSyncMode().isPeriodic()) {
+                LOGGER.info(
+                        "RocksDB periodic WAL sync is ignored because syncWrite is enabled, path:{}",
+                        config.getDbPath());
+            }
             RocksDBStoreMetrics.tryRegister(this);
         } catch (StoreException e) {
+            closeQuietly(openedWalSyncController);
             closeQuietly(
                     openedHandles,
                     openedDb,
@@ -182,6 +196,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     openedStatistics);
             throw e;
         } catch (Exception e) {
+            closeQuietly(openedWalSyncController);
             closeQuietly(
                     openedHandles,
                     openedDb,
@@ -298,7 +313,8 @@ public class RocksDBStoreEngine implements AutoCloseable {
                 errors,
                 getBlockCacheUsage(),
                 getBlockCachePinnedUsage(),
-                getBlockCacheCapacity());
+                getBlockCacheCapacity(),
+                walSyncController.stats());
     }
 
     public byte[] get(RocksDBColumnFamily columnFamily, byte[] key) {
@@ -312,6 +328,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void put(RocksDBColumnFamily columnFamily, byte[] key, byte[] value) {
         try {
             db.put(handle(columnFamily), writeOptions, key, value);
+            afterWrite();
         } catch (RocksDBException e) {
             throw new StoreException(e, "write RocksDB failed, columnFamily:" + columnFamily.getName());
         }
@@ -320,6 +337,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void delete(RocksDBColumnFamily columnFamily, byte[] key) {
         try {
             db.delete(handle(columnFamily), writeOptions, key);
+            afterWrite();
         } catch (RocksDBException e) {
             throw new StoreException(e, "delete RocksDB failed, columnFamily:" + columnFamily.getName());
         }
@@ -328,9 +346,14 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void write(WriteBatch batch) {
         try {
             db.write(writeOptions, batch);
+            afterWrite();
         } catch (RocksDBException e) {
             throw new StoreException(e, "write RocksDB batch failed");
         }
+    }
+
+    private void afterWrite() {
+        walSyncController.afterWrite();
     }
 
     public List<RocksDBEntry> prefixScan(RocksDBColumnFamily columnFamily, byte[] prefix) {
@@ -347,6 +370,44 @@ public class RocksDBStoreEngine implements AutoCloseable {
             return entries;
         } catch (RocksDBException e) {
             throw new StoreException(e, "scan RocksDB failed, columnFamily:" + columnFamily.getName());
+        }
+    }
+
+    public ScanStats scanByPrefix(
+            RocksDBColumnFamily columnFamily,
+            byte[] seekKey,
+            byte[] prefix,
+            int limit,
+            RocksDBEntryFilter filter,
+            RocksDBEntryConsumer consumer) {
+        Objects.requireNonNull(seekKey, "seekKey must not be null");
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        Objects.requireNonNull(consumer, "consumer must not be null");
+        int rowsScanned = 0;
+        int rowsReturned = 0;
+        boolean limitReached = false;
+        try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+            for (iterator.seek(seekKey); iterator.isValid(); iterator.next()) {
+                byte[] key = iterator.key();
+                if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                    break;
+                }
+                byte[] value = iterator.value();
+                rowsScanned++;
+                if (filter != null && !filter.shouldContinue(key, value)) {
+                    break;
+                }
+                consumer.accept(copy(key), copy(value));
+                rowsReturned++;
+                if (limit > 0 && rowsReturned >= limit) {
+                    limitReached = true;
+                    break;
+                }
+            }
+            iterator.status();
+            return new ScanStats(rowsScanned, rowsReturned, limitReached);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
         }
     }
 
@@ -416,6 +477,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
         try {
             db.deleteRange(handle(columnFamily), writeOptions, prefix, end);
+            afterWrite();
             if (config.isRangeDeleteCompactAfterDelete()) {
                 db.compactRange(handle(columnFamily), prefix, end);
             }
@@ -459,6 +521,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     return;
                 }
                 db.write(writeOptions, batch);
+                afterWrite();
             } catch (RocksDBException e) {
                 throw new StoreException(e, "delete RocksDB prefix failed, columnFamily:" + columnFamily.getName());
             }
@@ -496,6 +559,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
         closed = true;
         RocksDBStoreMetrics.unregister(this);
+        walSyncController.close();
         for (ColumnFamilyHandle handle : handles.values()) {
             handle.close();
         }
@@ -528,7 +592,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                 new ArrayList<>());
     }
 
-    private static void initMetadata(RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions)
+    private static boolean initMetadata(RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions)
             throws RocksDBException {
         byte[] existing = db.get(metadataHandle, FORMAT_VERSION_KEY);
         if (existing == null) {
@@ -537,7 +601,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     writeOptions,
                     FORMAT_VERSION_KEY,
                     Integer.toString(FORMAT_VERSION).getBytes(StandardCharsets.UTF_8));
-            return;
+            return true;
         }
         int existingFormatVersion;
         try {
@@ -549,6 +613,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
             throw new StoreException(
                     "unsupported RocksDB format version:" + existingFormatVersion + ", expected:" + FORMAT_VERSION);
         }
+        return false;
     }
 
     private static void closeQuietly(
@@ -768,6 +833,39 @@ public class RocksDBStoreEngine implements AutoCloseable {
         public byte[] getValue() {
             return copy(value);
         }
+    }
+
+    public static class ScanStats {
+        private final int rowsScanned;
+        private final int rowsReturned;
+        private final boolean limitReached;
+
+        public ScanStats(int rowsScanned, int rowsReturned, boolean limitReached) {
+            this.rowsScanned = rowsScanned;
+            this.rowsReturned = rowsReturned;
+            this.limitReached = limitReached;
+        }
+
+        public int getRowsScanned() {
+            return rowsScanned;
+        }
+
+        public int getRowsReturned() {
+            return rowsReturned;
+        }
+
+        public boolean isLimitReached() {
+            return limitReached;
+        }
+    }
+
+    /**
+     * Predicate that controls whether a bounded scan should continue.
+     */
+    @FunctionalInterface
+    public interface RocksDBEntryFilter {
+
+        boolean shouldContinue(byte[] key, byte[] value) throws RocksDBException;
     }
 
     /**

@@ -233,6 +233,31 @@ public interface ConfigurationKeys {
             STORE_FILE_ROCKSDB_PREFIX + "rangeDeleteCompactAfterDelete";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_WAL_SYNC_MODE.
+     */
+    String STORE_FILE_ROCKSDB_WAL_SYNC_MODE = STORE_FILE_ROCKSDB_PREFIX + "walSyncMode";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS.
+     */
+    String STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS = STORE_FILE_ROCKSDB_PREFIX + "walSyncIntervalMillis";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD.
+     */
+    String STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD = STORE_FILE_ROCKSDB_PREFIX + "walSyncWriteThreshold";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_WAL_SYNC_ON_SHUTDOWN.
+     */
+    String STORE_FILE_ROCKSDB_WAL_SYNC_ON_SHUTDOWN = STORE_FILE_ROCKSDB_PREFIX + "walSyncOnShutdown";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS.
+     */
+    String STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS = STORE_FILE_ROCKSDB_PREFIX + "walSyncWarnThresholdMillis";
+
+    /**
      * The constant SERVICE_GROUP_MAPPING_PREFIX.
      */
     String SERVICE_GROUP_MAPPING_PREFIX = SERVICE_PREFIX + "vgroupMapping.";

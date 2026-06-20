@@ -18,6 +18,7 @@ package org.apache.seata.server.storage.rocksdb.benchmark;
 
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
+import org.apache.seata.common.util.StringUtils;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
@@ -30,6 +31,8 @@ import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreDiagnostics;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncMode;
+import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncStats;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
@@ -73,7 +76,10 @@ public final class RocksDBFileModeBenchmark {
                     + "measureRounds,batchSize,ops,totalMs,opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,"
                     + "sstFiles,walFiles,"
                     + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
-                    + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys,rocksdbConfigDigest";
+                    + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys,rocksdbConfigDigest,"
+                    + "walSyncMode,walSyncIntervalMillis,walSyncWriteThreshold,walSyncCount,walSyncFailureCount,"
+                    + "walSyncAvgMs,walSyncMaxMs,walUnsyncedWrites,walMaxUnsyncedWrites,walUnsyncedMs,"
+                    + "walMaxUnsyncedMs,walLatestSequenceNumber,walLastSyncedSequenceNumber";
     private static final List<String> ALL_BENCHMARKS = Arrays.asList("write", "query", "lock", "cleanup", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
@@ -268,6 +274,14 @@ public final class RocksDBFileModeBenchmark {
         if ("blockCacheSize".equals(options.compare)) {
             return "blockCacheSize=" + BenchmarkOptions.humanReadableSize(options.blockCacheSize);
         }
+        if ("tuningProfile".equals(options.compare)) {
+            return "tuningProfile=" + options.tuningProfile + " (" + options.tuningSummary() + ")";
+        }
+        if ("walSyncMode".equals(options.compare)) {
+            return "walSyncMode=" + options.walSyncMode.configValue()
+                    + ", intervalMillis=" + options.walSyncIntervalMillis
+                    + ", writeThreshold=" + options.walSyncWriteThreshold;
+        }
         return options.compare + " (custom)";
     }
 
@@ -363,6 +377,7 @@ public final class RocksDBFileModeBenchmark {
         OperationStats branchUpdateStats = new OperationStats(options.sampleEvery);
         OperationStats branchRemoveStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
+        RocksDBWalSyncStats lastWalSyncStats = RocksDBWalSyncStats.NONE;
 
         for (int round = 0; round < options.totalRounds(); round++) {
             boolean warmup = round < options.warmupRounds;
@@ -422,10 +437,11 @@ public final class RocksDBFileModeBenchmark {
                 }
                 verifyStoreEmpty(engine);
                 engine.flush();
+                lastWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
         }
 
-        DbFootprint footprint = DbFootprint.from(lastDbPath);
+        DbFootprint footprint = DbFootprint.from(lastDbPath, lastWalSyncStats);
         emit("write.global_add", options, globalAddStats, footprint, csvLines);
         emit("write.global_update", options, globalUpdateStats, footprint, csvLines);
         emit("write.global_remove", options, globalRemoveStats, footprint, csvLines);
@@ -448,6 +464,7 @@ public final class RocksDBFileModeBenchmark {
         OperationStats statusStats = new OperationStats(options.sampleEvery);
         OperationStats beginSortedStats = new OperationStats(options.sampleEvery);
         OperationStats fullScanStats = new OperationStats(options.sampleEvery);
+        RocksDBWalSyncStats walSyncStats = RocksDBWalSyncStats.NONE;
 
         try (RocksDBStoreEngine engine = open(dbPath, options)) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -508,9 +525,10 @@ public final class RocksDBFileModeBenchmark {
                 });
             }
             logBlockCacheStats(engine);
+            walSyncStats = engine.diagnostics().getWalSyncStats();
         }
 
-        DbFootprint footprint = DbFootprint.from(dbPath);
+        DbFootprint footprint = DbFootprint.from(dbPath, walSyncStats);
         emit("query.xid", options, xidStats, footprint, csvLines);
         emit("query.transaction_id", options, transactionIdStats, footprint, csvLines);
         emit("query.status", options, statusStats, footprint, csvLines);
@@ -533,6 +551,7 @@ public final class RocksDBFileModeBenchmark {
         OperationStats releaseGlobalStats = new OperationStats(options.sampleEvery);
         OperationStats cleanOrphanStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
+        RocksDBWalSyncStats lastWalSyncStats = RocksDBWalSyncStats.NONE;
 
         for (int round = 0; round < options.totalRounds(); round++) {
             boolean warmup = round < options.warmupRounds;
@@ -586,10 +605,12 @@ public final class RocksDBFileModeBenchmark {
                         engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
                                 .isEmpty(),
                         "lock branch index should be empty after release");
+                lastWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
         }
 
         Path lastOrphanDbPath = null;
+        RocksDBWalSyncStats lastOrphanWalSyncStats = RocksDBWalSyncStats.NONE;
         for (int round = 0; round < options.totalRounds(); round++) {
             log("  [lock.clean_orphan] round %d/%d", round + 1, options.totalRounds());
             Path orphanDbPath = scenarioPath(runPath, "lock-clean-orphan-round-" + round);
@@ -607,17 +628,23 @@ public final class RocksDBFileModeBenchmark {
                 assertTrue(
                         engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty(),
                         "lock table should be empty after clean orphan");
+                lastOrphanWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
         }
 
-        DbFootprint footprint = DbFootprint.from(lastDbPath);
+        DbFootprint footprint = DbFootprint.from(lastDbPath, lastWalSyncStats);
         emit("lock.acquire", options, acquireStats, footprint, csvLines);
         emit("lock.conflict_check", options, conflictCheckStats, footprint, csvLines);
         emit("lock.conflict_acquire", options, conflictAcquireStats, footprint, csvLines);
         emit("lock.update_status", options, updateStatusStats, footprint, csvLines);
         emit("lock.release_branch", options, releaseBranchStats, footprint, csvLines);
         emit("lock.release_global", options, releaseGlobalStats, footprint, csvLines);
-        emit("lock.clean_orphan", options, cleanOrphanStats, DbFootprint.from(lastOrphanDbPath), csvLines);
+        emit(
+                "lock.clean_orphan",
+                options,
+                cleanOrphanStats,
+                DbFootprint.from(lastOrphanDbPath, lastOrphanWalSyncStats),
+                csvLines);
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
@@ -629,6 +656,7 @@ public final class RocksDBFileModeBenchmark {
 
         OperationStats globalRemoveStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
+        RocksDBWalSyncStats lastWalSyncStats = RocksDBWalSyncStats.NONE;
 
         for (int round = 0; round < options.totalRounds(); round++) {
             boolean warmup = round < options.warmupRounds;
@@ -649,10 +677,16 @@ public final class RocksDBFileModeBenchmark {
                 }
                 verifyStoreEmpty(engine);
                 engine.flush();
+                lastWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
         }
 
-        emit("cleanup.global_remove_with_branches", options, globalRemoveStats, DbFootprint.from(lastDbPath), csvLines);
+        emit(
+                "cleanup.global_remove_with_branches",
+                options,
+                globalRemoveStats,
+                DbFootprint.from(lastDbPath, lastWalSyncStats),
+                csvLines);
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
@@ -678,6 +712,7 @@ public final class RocksDBFileModeBenchmark {
             throws Exception {
         OperationStats restartStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
+        RocksDBWalSyncStats lastWalSyncStats = RocksDBWalSyncStats.NONE;
 
         log("  [%s] override status: %s", scenarioName, overrideStatus != null ? overrideStatus : "mixed");
 
@@ -696,6 +731,7 @@ public final class RocksDBFileModeBenchmark {
                 RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
                 writeDataSet(storeManager, dataSet);
                 engine.flush();
+                lastWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
             final BenchmarkDataSet finalDataSet = dataSet;
             measure(restartStats, round, options, () -> {
@@ -714,7 +750,7 @@ public final class RocksDBFileModeBenchmark {
             }
         }
 
-        emit(scenarioName, options, restartStats, DbFootprint.from(lastDbPath), csvLines);
+        emit(scenarioName, options, restartStats, DbFootprint.from(lastDbPath, lastWalSyncStats), csvLines);
     }
 
     private static void writeDataSet(RocksDBTransactionStoreManager storeManager, BenchmarkDataSet dataSet) {
@@ -727,7 +763,30 @@ public final class RocksDBFileModeBenchmark {
     }
 
     private static RocksDBStoreEngine open(Path dbPath, BenchmarkOptions options) {
-        return open(dbPath, options.syncWrite, options.enableRangeDelete, options.blockCacheSize);
+        RocksDBStoreConfig config = new RocksDBStoreConfig(
+                dbPath.toString(),
+                options.syncWrite,
+                options.blockCacheSize,
+                options.writeBufferSize,
+                options.maxWriteBufferNumber,
+                options.minWriteBufferNumberToMerge,
+                options.maxBackgroundJobs,
+                options.maxOpenFiles,
+                options.targetFileSizeBase,
+                options.level0FileNumCompactionTrigger,
+                options.level0SlowdownWritesTrigger,
+                options.level0StopWritesTrigger,
+                options.enableStatistics,
+                options.optimizeFiltersForHits,
+                options.compressionType,
+                options.enableRangeDelete,
+                false, // rangeDeleteCompactAfterDelete
+                options.walSyncMode,
+                options.walSyncIntervalMillis,
+                options.walSyncWriteThreshold,
+                options.walSyncOnShutdown,
+                options.walSyncWarnThresholdMillis);
+        return RocksDBStoreEngine.open(config);
     }
 
     private static RocksDBStoreEngine open(Path dbPath, boolean syncWrite) {
@@ -862,7 +921,33 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + footprint.lockEstimateKeys
                 + ","
-                + configDigest(options);
+                + configDigest(options)
+                + ","
+                + footprint.walSyncStats.getMode().configValue()
+                + ","
+                + options.walSyncIntervalMillis
+                + ","
+                + options.walSyncWriteThreshold
+                + ","
+                + footprint.walSyncStats.getSyncCount()
+                + ","
+                + footprint.walSyncStats.getSyncFailureCount()
+                + ","
+                + footprint.walSyncStats.getAvgSyncCostMillis()
+                + ","
+                + footprint.walSyncStats.getMaxSyncCostMillis()
+                + ","
+                + footprint.walSyncStats.getUnsyncedWriteRequests()
+                + ","
+                + footprint.walSyncStats.getMaxUnsyncedWriteRequests()
+                + ","
+                + footprint.walSyncStats.getUnsyncedMillis()
+                + ","
+                + footprint.walSyncStats.getMaxUnsyncedMillis()
+                + ","
+                + footprint.walSyncStats.getLatestSequenceNumber()
+                + ","
+                + footprint.walSyncStats.getLastSyncedSequenceNumber();
         System.out.println(line);
         if (csvLines != null) {
             csvLines.add(line);
@@ -882,6 +967,24 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("syncWrite=" + options.syncWrite);
         System.out.println("enableRangeDelete=" + options.enableRangeDelete);
         System.out.println("blockCacheSize=" + BenchmarkOptions.humanReadableSize(options.blockCacheSize));
+        System.out.println("tuningProfile=" + options.tuningProfile);
+        System.out.println("writeBufferSize=" + BenchmarkOptions.humanReadableSize(options.writeBufferSize));
+        System.out.println("maxWriteBufferNumber=" + options.maxWriteBufferNumber);
+        System.out.println("minWriteBufferNumberToMerge=" + options.minWriteBufferNumberToMerge);
+        System.out.println("maxBackgroundJobs=" + options.maxBackgroundJobs);
+        System.out.println("maxOpenFiles=" + options.maxOpenFiles);
+        System.out.println("targetFileSizeBase=" + BenchmarkOptions.humanReadableSize(options.targetFileSizeBase));
+        System.out.println("level0FileNumCompactionTrigger=" + options.level0FileNumCompactionTrigger);
+        System.out.println("level0SlowdownWritesTrigger=" + options.level0SlowdownWritesTrigger);
+        System.out.println("level0StopWritesTrigger=" + options.level0StopWritesTrigger);
+        System.out.println("enableStatistics=" + options.enableStatistics);
+        System.out.println("optimizeFiltersForHits=" + options.optimizeFiltersForHits);
+        System.out.println("compressionType=" + options.compressionType);
+        System.out.println("walSyncMode=" + options.walSyncMode.configValue());
+        System.out.println("walSyncIntervalMillis=" + options.walSyncIntervalMillis);
+        System.out.println("walSyncWriteThreshold=" + options.walSyncWriteThreshold);
+        System.out.println("walSyncOnShutdown=" + options.walSyncOnShutdown);
+        System.out.println("walSyncWarnThresholdMillis=" + options.walSyncWarnThresholdMillis);
         System.out.println("globalCount=" + options.globalCount);
         System.out.println("branchPerGlobal=" + options.branchPerGlobal);
         System.out.println("lockPerBranch=" + options.lockPerBranch);
@@ -933,6 +1036,23 @@ public final class RocksDBFileModeBenchmark {
         String raw = "syncWrite=" + options.syncWrite
                 + ",enableRangeDelete=" + options.enableRangeDelete
                 + ",blockCacheSize=" + options.blockCacheSize
+                + ",writeBufferSize=" + options.writeBufferSize
+                + ",maxWriteBufferNumber=" + options.maxWriteBufferNumber
+                + ",minWriteBufferNumberToMerge=" + options.minWriteBufferNumberToMerge
+                + ",maxBackgroundJobs=" + options.maxBackgroundJobs
+                + ",maxOpenFiles=" + options.maxOpenFiles
+                + ",targetFileSizeBase=" + options.targetFileSizeBase
+                + ",level0FileNumCompactionTrigger=" + options.level0FileNumCompactionTrigger
+                + ",level0SlowdownWritesTrigger=" + options.level0SlowdownWritesTrigger
+                + ",level0StopWritesTrigger=" + options.level0StopWritesTrigger
+                + ",enableStatistics=" + options.enableStatistics
+                + ",optimizeFiltersForHits=" + options.optimizeFiltersForHits
+                + ",compressionType=" + options.compressionType
+                + ",walSyncMode=" + options.walSyncMode.configValue()
+                + ",walSyncIntervalMillis=" + options.walSyncIntervalMillis
+                + ",walSyncWriteThreshold=" + options.walSyncWriteThreshold
+                + ",walSyncOnShutdown=" + options.walSyncOnShutdown
+                + ",walSyncWarnThresholdMillis=" + options.walSyncWarnThresholdMillis
                 + ",globalCount=" + options.globalCount
                 + ",branchPerGlobal=" + options.branchPerGlobal
                 + ",lockPerBranch=" + options.lockPerBranch;
@@ -1160,6 +1280,7 @@ public final class RocksDBFileModeBenchmark {
         private final long globalEstimateKeys;
         private final long branchEstimateKeys;
         private final long lockEstimateKeys;
+        private final RocksDBWalSyncStats walSyncStats;
 
         private DbFootprint(
                 long sizeBytes,
@@ -1171,7 +1292,8 @@ public final class RocksDBFileModeBenchmark {
                 long pendingCompactionBytes,
                 long globalEstimateKeys,
                 long branchEstimateKeys,
-                long lockEstimateKeys) {
+                long lockEstimateKeys,
+                RocksDBWalSyncStats walSyncStats) {
             this.sizeBytes = sizeBytes;
             this.fileCount = fileCount;
             this.sstFiles = sstFiles;
@@ -1182,9 +1304,14 @@ public final class RocksDBFileModeBenchmark {
             this.globalEstimateKeys = globalEstimateKeys;
             this.branchEstimateKeys = branchEstimateKeys;
             this.lockEstimateKeys = lockEstimateKeys;
+            this.walSyncStats = walSyncStats == null ? RocksDBWalSyncStats.NONE : walSyncStats;
         }
 
         private static DbFootprint from(Path path) throws IOException {
+            return from(path, RocksDBWalSyncStats.NONE);
+        }
+
+        private static DbFootprint from(Path path, RocksDBWalSyncStats walSyncStats) throws IOException {
             if (path == null || !Files.exists(path)) {
                 return empty();
             }
@@ -1216,11 +1343,12 @@ public final class RocksDBFileModeBenchmark {
                     diagnostics.getColumnFamilyProperty(
                             RocksDBColumnFamily.BRANCH_SESSION, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS),
                     diagnostics.getColumnFamilyProperty(
-                            RocksDBColumnFamily.LOCK, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+                            RocksDBColumnFamily.LOCK, RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS),
+                    walSyncStats);
         }
 
         private static DbFootprint empty() {
-            return new DbFootprint(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+            return new DbFootprint(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, RocksDBWalSyncStats.NONE);
         }
 
         private static RocksDBStoreDiagnostics diagnostics(Path path) {
@@ -1247,6 +1375,24 @@ public final class RocksDBFileModeBenchmark {
         private final boolean syncWrite;
         private final boolean enableRangeDelete;
         private final long blockCacheSize;
+        private final long writeBufferSize;
+        private final int maxWriteBufferNumber;
+        private final int minWriteBufferNumberToMerge;
+        private final int maxBackgroundJobs;
+        private final int maxOpenFiles;
+        private final long targetFileSizeBase;
+        private final int level0FileNumCompactionTrigger;
+        private final int level0SlowdownWritesTrigger;
+        private final int level0StopWritesTrigger;
+        private final boolean enableStatistics;
+        private final boolean optimizeFiltersForHits;
+        private final String compressionType;
+        private final RocksDBWalSyncMode walSyncMode;
+        private final int walSyncIntervalMillis;
+        private final long walSyncWriteThreshold;
+        private final boolean walSyncOnShutdown;
+        private final int walSyncWarnThresholdMillis;
+        private final RocksDBWalSyncMode walSyncCompareMode;
         private final boolean cleanup;
         private final int warmupRounds;
         private final int measureRounds;
@@ -1256,6 +1402,7 @@ public final class RocksDBFileModeBenchmark {
         private final String dbPath;
         private final Set<String> benchmarks;
         private final String compare;
+        private final String tuningProfile;
 
         private BenchmarkOptions(
                 int globalCount,
@@ -1273,12 +1420,103 @@ public final class RocksDBFileModeBenchmark {
                 String dbPath,
                 Set<String> benchmarks,
                 String compare) {
+            this(
+                    globalCount,
+                    branchPerGlobal,
+                    lockPerBranch,
+                    syncWrite,
+                    enableRangeDelete,
+                    blockCacheSize,
+                    0L,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0L,
+                    0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    null,
+                    RocksDBWalSyncMode.NONE,
+                    2000,
+                    10L,
+                    true,
+                    1000,
+                    RocksDBWalSyncMode.NONE,
+                    cleanup,
+                    warmupRounds,
+                    measureRounds,
+                    batchSize,
+                    sampleEvery,
+                    seed,
+                    dbPath,
+                    benchmarks,
+                    compare,
+                    "baseline");
+        }
+
+        private BenchmarkOptions(
+                int globalCount,
+                int branchPerGlobal,
+                int lockPerBranch,
+                boolean syncWrite,
+                boolean enableRangeDelete,
+                long blockCacheSize,
+                long writeBufferSize,
+                int maxWriteBufferNumber,
+                int minWriteBufferNumberToMerge,
+                int maxBackgroundJobs,
+                int maxOpenFiles,
+                long targetFileSizeBase,
+                int level0FileNumCompactionTrigger,
+                int level0SlowdownWritesTrigger,
+                int level0StopWritesTrigger,
+                boolean enableStatistics,
+                boolean optimizeFiltersForHits,
+                String compressionType,
+                RocksDBWalSyncMode walSyncMode,
+                int walSyncIntervalMillis,
+                long walSyncWriteThreshold,
+                boolean walSyncOnShutdown,
+                int walSyncWarnThresholdMillis,
+                RocksDBWalSyncMode walSyncCompareMode,
+                boolean cleanup,
+                int warmupRounds,
+                int measureRounds,
+                int batchSize,
+                int sampleEvery,
+                long seed,
+                String dbPath,
+                Set<String> benchmarks,
+                String compare,
+                String tuningProfile) {
             this.globalCount = positive(globalCount, "globalCount");
             this.branchPerGlobal = nonNegative(branchPerGlobal, "branchPerGlobal");
             this.lockPerBranch = nonNegative(lockPerBranch, "lockPerBranch");
             this.syncWrite = syncWrite;
             this.enableRangeDelete = enableRangeDelete;
-            this.blockCacheSize = blockCacheSize;
+            this.blockCacheSize = nonNegative(blockCacheSize, "blockCacheSize");
+            this.writeBufferSize = nonNegative(writeBufferSize, "writeBufferSize");
+            this.maxWriteBufferNumber = nonNegative(maxWriteBufferNumber, "maxWriteBufferNumber");
+            this.minWriteBufferNumberToMerge = nonNegative(minWriteBufferNumberToMerge, "minWriteBufferNumberToMerge");
+            this.maxBackgroundJobs = nonNegative(maxBackgroundJobs, "maxBackgroundJobs");
+            this.maxOpenFiles = nonNegative(maxOpenFiles, "maxOpenFiles");
+            this.targetFileSizeBase = nonNegative(targetFileSizeBase, "targetFileSizeBase");
+            this.level0FileNumCompactionTrigger =
+                    nonNegative(level0FileNumCompactionTrigger, "level0FileNumCompactionTrigger");
+            this.level0SlowdownWritesTrigger = nonNegative(level0SlowdownWritesTrigger, "level0SlowdownWritesTrigger");
+            this.level0StopWritesTrigger = nonNegative(level0StopWritesTrigger, "level0StopWritesTrigger");
+            this.enableStatistics = enableStatistics;
+            this.optimizeFiltersForHits = optimizeFiltersForHits;
+            this.compressionType = normalizeNullable(compressionType);
+            this.walSyncMode = walSyncMode == null ? RocksDBWalSyncMode.NONE : walSyncMode;
+            this.walSyncIntervalMillis = positive(walSyncIntervalMillis, "walSyncIntervalMillis");
+            this.walSyncWriteThreshold = positive(walSyncWriteThreshold, "walSyncWriteThreshold");
+            this.walSyncOnShutdown = walSyncOnShutdown;
+            this.walSyncWarnThresholdMillis = positive(walSyncWarnThresholdMillis, "walSyncWarnThresholdMillis");
+            this.walSyncCompareMode = walSyncCompareMode == null ? this.walSyncMode : walSyncCompareMode;
             this.cleanup = cleanup;
             this.warmupRounds = nonNegative(warmupRounds, "warmupRounds");
             this.measureRounds = positive(measureRounds, "measureRounds");
@@ -1288,17 +1526,42 @@ public final class RocksDBFileModeBenchmark {
             this.dbPath = dbPath;
             this.benchmarks = benchmarks;
             this.compare = compare;
+            this.tuningProfile = StringUtils.isBlank(tuningProfile) ? "baseline" : tuningProfile.trim();
         }
 
         private static BenchmarkOptions parse(String[] args) {
             Map<String, String> values = parseArgs(args);
-            return new BenchmarkOptions(
+            String compare = stringValue(values, "compare", null);
+            String defaultWalSyncMode = "walSyncMode".equals(compare) ? "periodic" : "none";
+            RocksDBWalSyncMode requestedWalSyncMode =
+                    RocksDBWalSyncMode.of(stringValue(values, "walSyncMode", defaultWalSyncMode));
+            RocksDBWalSyncMode effectiveWalSyncMode =
+                    "walSyncMode".equals(compare) ? RocksDBWalSyncMode.NONE : requestedWalSyncMode;
+            BenchmarkOptions options = new BenchmarkOptions(
                     intValue(values, "globalCount", 1000),
                     intValue(values, "branchPerGlobal", 2),
                     intValue(values, "lockPerBranch", 2),
                     booleanValue(values, "syncWrite", false),
                     booleanValue(values, "enableRangeDelete", false),
                     parseSizeOption(values, "blockCacheSize", 0L),
+                    parseSizeOption(values, "writeBufferSize", 0L),
+                    intValue(values, "maxWriteBufferNumber", 0),
+                    intValue(values, "minWriteBufferNumberToMerge", 0),
+                    intValue(values, "maxBackgroundJobs", 0),
+                    intValue(values, "maxOpenFiles", 0),
+                    parseSizeOption(values, "targetFileSizeBase", 0L),
+                    intValue(values, "level0FileNumCompactionTrigger", 0),
+                    intValue(values, "level0SlowdownWritesTrigger", 0),
+                    intValue(values, "level0StopWritesTrigger", 0),
+                    booleanValue(values, "enableStatistics", false),
+                    booleanValue(values, "optimizeFiltersForHits", false),
+                    stringValue(values, "compressionType", null),
+                    effectiveWalSyncMode,
+                    intValue(values, "walSyncIntervalMillis", 2000),
+                    longValue(values, "walSyncWriteThreshold", 10L),
+                    booleanValue(values, "walSyncOnShutdown", true),
+                    intValue(values, "walSyncWarnThresholdMillis", 1000),
+                    requestedWalSyncMode,
                     booleanValue(values, "cleanup", false),
                     intValue(values, "warmupRounds", 1),
                     intValue(values, "measureRounds", 3),
@@ -1307,7 +1570,12 @@ public final class RocksDBFileModeBenchmark {
                     longValue(values, "seed", 20260606L),
                     stringValue(values, "dbPath", null),
                     parseBenchmarks(stringValue(values, "benchmark", "all")),
-                    stringValue(values, "compare", null));
+                    compare,
+                    stringValue(values, "tuningProfile", "baseline"));
+            if (options.compare == null) {
+                return options.withTuningProfile(options.tuningProfile);
+            }
+            return options;
         }
 
         private BenchmarkOptions withAtLeastOneLock() {
@@ -1318,6 +1586,24 @@ public final class RocksDBFileModeBenchmark {
                     syncWrite,
                     enableRangeDelete,
                     blockCacheSize,
+                    writeBufferSize,
+                    maxWriteBufferNumber,
+                    minWriteBufferNumberToMerge,
+                    maxBackgroundJobs,
+                    maxOpenFiles,
+                    targetFileSizeBase,
+                    level0FileNumCompactionTrigger,
+                    level0SlowdownWritesTrigger,
+                    level0StopWritesTrigger,
+                    enableStatistics,
+                    optimizeFiltersForHits,
+                    compressionType,
+                    walSyncMode,
+                    walSyncIntervalMillis,
+                    walSyncWriteThreshold,
+                    walSyncOnShutdown,
+                    walSyncWarnThresholdMillis,
+                    walSyncCompareMode,
                     cleanup,
                     warmupRounds,
                     measureRounds,
@@ -1326,7 +1612,8 @@ public final class RocksDBFileModeBenchmark {
                     seed,
                     dbPath,
                     benchmarks,
-                    compare);
+                    compare,
+                    tuningProfile);
         }
 
         private BenchmarkOptions flipCompareOption() {
@@ -1386,9 +1673,187 @@ public final class RocksDBFileModeBenchmark {
                             dbPath,
                             benchmarks,
                             compare);
+                case "tuningProfile":
+                    return withTuningProfile(tuningProfile);
+                case "walSyncMode":
+                    return withWalSyncMode(walSyncCompareMode);
                 default:
                     throw new IllegalArgumentException("Unsupported compare option: " + compare);
             }
+        }
+
+        private BenchmarkOptions withTuningProfile(String profile) {
+            String normalized = profile == null ? "baseline" : profile.trim().toLowerCase(Locale.ROOT);
+            switch (normalized) {
+                case "baseline":
+                    return withTuning(normalized, 0L, 0, 0, 0, 0, 0L, 0, 0, 0, enableStatistics, false, null);
+                case "write-heavy":
+                    return withTuning(
+                            normalized,
+                            128L * 1024 * 1024,
+                            4,
+                            2,
+                            4,
+                            0,
+                            64L * 1024 * 1024,
+                            8,
+                            20,
+                            36,
+                            true,
+                            false,
+                            null);
+                case "no-compression":
+                    return withTuning(
+                            normalized,
+                            128L * 1024 * 1024,
+                            4,
+                            2,
+                            4,
+                            0,
+                            64L * 1024 * 1024,
+                            8,
+                            20,
+                            36,
+                            true,
+                            false,
+                            "no");
+                case "compaction-relaxed":
+                    return withTuning(
+                            normalized,
+                            64L * 1024 * 1024,
+                            4,
+                            1,
+                            6,
+                            0,
+                            64L * 1024 * 1024,
+                            12,
+                            32,
+                            64,
+                            true,
+                            false,
+                            null);
+                case "balanced":
+                    return withTuning(
+                            normalized, 64L * 1024 * 1024, 3, 1, 4, 0, 64L * 1024 * 1024, 8, 20, 36, true, false, null);
+                default:
+                    throw new IllegalArgumentException("Unsupported tuningProfile:" + profile);
+            }
+        }
+
+        private BenchmarkOptions withTuning(
+                String profile,
+                long newWriteBufferSize,
+                int newMaxWriteBufferNumber,
+                int newMinWriteBufferNumberToMerge,
+                int newMaxBackgroundJobs,
+                int newMaxOpenFiles,
+                long newTargetFileSizeBase,
+                int newLevel0FileNumCompactionTrigger,
+                int newLevel0SlowdownWritesTrigger,
+                int newLevel0StopWritesTrigger,
+                boolean newEnableStatistics,
+                boolean newOptimizeFiltersForHits,
+                String newCompressionType) {
+            return new BenchmarkOptions(
+                    globalCount,
+                    branchPerGlobal,
+                    lockPerBranch,
+                    syncWrite,
+                    enableRangeDelete,
+                    blockCacheSize,
+                    newWriteBufferSize,
+                    newMaxWriteBufferNumber,
+                    newMinWriteBufferNumberToMerge,
+                    newMaxBackgroundJobs,
+                    newMaxOpenFiles,
+                    newTargetFileSizeBase,
+                    newLevel0FileNumCompactionTrigger,
+                    newLevel0SlowdownWritesTrigger,
+                    newLevel0StopWritesTrigger,
+                    newEnableStatistics,
+                    newOptimizeFiltersForHits,
+                    newCompressionType,
+                    walSyncMode,
+                    walSyncIntervalMillis,
+                    walSyncWriteThreshold,
+                    walSyncOnShutdown,
+                    walSyncWarnThresholdMillis,
+                    walSyncCompareMode,
+                    cleanup,
+                    warmupRounds,
+                    measureRounds,
+                    batchSize,
+                    sampleEvery,
+                    seed,
+                    dbPath,
+                    benchmarks,
+                    compare,
+                    profile);
+        }
+
+        private BenchmarkOptions withWalSyncMode(RocksDBWalSyncMode newWalSyncMode) {
+            return new BenchmarkOptions(
+                    globalCount,
+                    branchPerGlobal,
+                    lockPerBranch,
+                    syncWrite,
+                    enableRangeDelete,
+                    blockCacheSize,
+                    writeBufferSize,
+                    maxWriteBufferNumber,
+                    minWriteBufferNumberToMerge,
+                    maxBackgroundJobs,
+                    maxOpenFiles,
+                    targetFileSizeBase,
+                    level0FileNumCompactionTrigger,
+                    level0SlowdownWritesTrigger,
+                    level0StopWritesTrigger,
+                    enableStatistics,
+                    optimizeFiltersForHits,
+                    compressionType,
+                    newWalSyncMode,
+                    walSyncIntervalMillis,
+                    walSyncWriteThreshold,
+                    walSyncOnShutdown,
+                    walSyncWarnThresholdMillis,
+                    newWalSyncMode,
+                    cleanup,
+                    warmupRounds,
+                    measureRounds,
+                    batchSize,
+                    sampleEvery,
+                    seed,
+                    dbPath,
+                    benchmarks,
+                    compare,
+                    tuningProfile);
+        }
+
+        private String tuningSummary() {
+            return "writeBufferSize="
+                    + humanReadableSize(writeBufferSize)
+                    + ",maxWriteBufferNumber="
+                    + maxWriteBufferNumber
+                    + ",minWriteBufferNumberToMerge="
+                    + minWriteBufferNumberToMerge
+                    + ",maxBackgroundJobs="
+                    + maxBackgroundJobs
+                    + ",maxOpenFiles="
+                    + maxOpenFiles
+                    + ",targetFileSizeBase="
+                    + humanReadableSize(targetFileSizeBase)
+                    + ",level0FileNumCompactionTrigger="
+                    + level0FileNumCompactionTrigger
+                    + ",level0SlowdownWritesTrigger="
+                    + level0SlowdownWritesTrigger
+                    + ",level0StopWritesTrigger="
+                    + level0StopWritesTrigger
+                    + ",enableStatistics="
+                    + enableStatistics
+                    + ",optimizeFiltersForHits="
+                    + optimizeFiltersForHits
+                    + ",compressionType="
+                    + compressionType;
         }
 
         private boolean isEnabled(String benchmark) {
@@ -1473,6 +1938,13 @@ public final class RocksDBFileModeBenchmark {
             return value.trim();
         }
 
+        private static String normalizeNullable(String value) {
+            if (value == null || value.trim().isEmpty()) {
+                return null;
+            }
+            return value.trim();
+        }
+
         private static int positive(int value, String name) {
             if (value <= 0) {
                 throw new IllegalArgumentException(name + " must be positive");
@@ -1480,7 +1952,21 @@ public final class RocksDBFileModeBenchmark {
             return value;
         }
 
+        private static long positive(long value, String name) {
+            if (value <= 0) {
+                throw new IllegalArgumentException(name + " must be positive");
+            }
+            return value;
+        }
+
         private static int nonNegative(int value, String name) {
+            if (value < 0) {
+                throw new IllegalArgumentException(name + " must be non-negative");
+            }
+            return value;
+        }
+
+        private static long nonNegative(long value, String name) {
             if (value < 0) {
                 throw new IllegalArgumentException(name + " must be non-negative");
             }

@@ -39,7 +39,11 @@ public class RocksDBLockManager extends AbstractLockManager {
     }
 
     public RocksDBLockManager(RocksDBStoreEngine storeEngine) {
-        this.locker = new RocksDBLocker(storeEngine, new RocksDBLocalLocks());
+        this(storeEngine, RocksDBLocker.DEFAULT_LOCK_INDEX_SCAN_BATCH_SIZE);
+    }
+
+    RocksDBLockManager(RocksDBStoreEngine storeEngine, int lockIndexScanBatchSize) {
+        this.locker = new RocksDBLocker(storeEngine, new RocksDBLocalLocks(), lockIndexScanBatchSize);
     }
 
     @Override
@@ -64,6 +68,10 @@ public class RocksDBLockManager extends AbstractLockManager {
 
     public int cleanOrphanLocks() {
         return locker.cleanOrphanLocks();
+    }
+
+    public int cleanOrphanLocks(int limit) {
+        return locker.cleanOrphanLocks(limit);
     }
 
     @Override

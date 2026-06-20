@@ -93,6 +93,9 @@ public class RocksDBMaintenanceService {
                 throw new StoreException(e, "create checkpoint parent directory failed:" + parent);
             }
         }
+        if (flush) {
+            storeEngine.flush();
+        }
         try (Checkpoint checkpoint = Checkpoint.create(storeEngine.getDB())) {
             checkpoint.createCheckpoint(checkpointPath.toString());
         } catch (RocksDBException e) {

@@ -85,6 +85,39 @@ final class RocksDBStoreMetrics {
                 RocksDBStoreEngine current = engine;
                 return current == null ? 0L : current.getBlockCacheCapacity();
             });
+            gauge(registry, "walSyncCount", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getSyncCount());
+            gauge(registry, "walSyncFailureCount", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getSyncFailureCount());
+            gauge(registry, "walSyncLastCostMillis", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getLastSyncCostMillis());
+            gauge(registry, "walSyncAvgCostMillis", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getAvgSyncCostMillis());
+            gauge(registry, "walSyncMaxCostMillis", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getMaxSyncCostMillis());
+            gauge(registry, "walUnsyncedWriteRequests", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getUnsyncedWriteRequests());
+            gauge(registry, "walMaxUnsyncedWriteRequests", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getMaxUnsyncedWriteRequests());
+            gauge(registry, "walUnsyncedMillis", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getUnsyncedMillis());
+            gauge(registry, "walMaxUnsyncedMillis", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getMaxUnsyncedMillis());
+            gauge(registry, "walLatestSequenceNumber", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getLatestSequenceNumber());
+            gauge(registry, "walLastSyncedSequenceNumber", () -> diagnostics()
+                    .getWalSyncStats()
+                    .getLastSyncedSequenceNumber());
         } catch (Exception e) {
             LOGGER.warn("register RocksDB file store metrics failed", e);
         }
