@@ -149,6 +149,48 @@ public class RocksDBIndexManager {
                 (key, value) -> consumer.accept(string(value)));
     }
 
+    public StatusScanResult scanXidsByStatus(GlobalStatus status, long maxBeginTimeInclusive, int limit) {
+        List<String> xids = new ArrayList<>();
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
+                RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
+                RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
+                limit,
+                (key, value) -> RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(key) <= maxBeginTimeInclusive,
+                (key, value) -> xids.add(string(value)));
+        return new StatusScanResult(xids, stats);
+    }
+
+    public static class StatusScanResult {
+        private final List<String> xids;
+        private final int rowsScanned;
+        private final int rowsReturned;
+        private final boolean limitReached;
+
+        StatusScanResult(List<String> xids, RocksDBStoreEngine.ScanStats scanStats) {
+            this.xids = xids;
+            this.rowsScanned = scanStats.getRowsScanned();
+            this.rowsReturned = scanStats.getRowsReturned();
+            this.limitReached = scanStats.isLimitReached();
+        }
+
+        public List<String> getXids() {
+            return xids;
+        }
+
+        public int getRowsScanned() {
+            return rowsScanned;
+        }
+
+        public int getRowsReturned() {
+            return rowsReturned;
+        }
+
+        public boolean isLimitReached() {
+            return limitReached;
+        }
+    }
+
     private GlobalSession decodeGlobalSession(byte[] value) {
         RocksDBValueCodec.DecodedValue decodedValue = RocksDBValueCodec.decode(value);
         if (decodedValue.getType() != RocksDBValueCodec.ValueType.GLOBAL_SESSION) {

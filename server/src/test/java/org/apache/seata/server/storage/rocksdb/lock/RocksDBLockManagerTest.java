@@ -149,6 +149,27 @@ class RocksDBLockManagerTest {
     }
 
     @Test
+    void testReleaseGlobalSessionLockHandlesMultipleLockIndexBatches() throws Exception {
+        try (RocksDBStoreEngine engine = open("release-global-batches")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine, 1);
+            BranchSession first = branchSession(1001L, 1L, "t_order:1");
+            BranchSession second = branchSession(1001L, 2L, "t_order:2");
+            BranchSession third = branchSession(1001L, 3L, "t_order:3");
+            BranchSession next = branchSession(1002L, 4L, "t_order:1,2,3");
+            GlobalSession globalSession = new GlobalSession("app", "group", "tx", 60000);
+            globalSession.setXid(first.getXid());
+
+            Assertions.assertTrue(lockManager.acquireLock(first));
+            Assertions.assertTrue(lockManager.acquireLock(second));
+            Assertions.assertTrue(lockManager.acquireLock(third));
+            Assertions.assertFalse(lockManager.acquireLock(next));
+
+            Assertions.assertTrue(lockManager.releaseGlobalSessionLock(globalSession));
+            Assertions.assertTrue(lockManager.acquireLock(next));
+        }
+    }
+
+    @Test
     void testIsLockable() throws Exception {
         try (RocksDBStoreEngine engine = open("lockable")) {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
@@ -169,6 +190,24 @@ class RocksDBLockManagerTest {
             BranchSession conflict = branchSession(1002L, 2L, "t_order:1");
 
             Assertions.assertTrue(lockManager.acquireLock(first));
+            lockManager.updateLockStatus(first.getXid(), LockStatus.Rollbacking);
+
+            StoreException exception = Assertions.assertThrows(
+                    StoreException.class, () -> lockManager.acquireLock(conflict, false, false));
+            Assertions.assertTrue(exception.getCause() instanceof BranchTransactionException);
+        }
+    }
+
+    @Test
+    void testUpdateLockStatusHandlesMultipleLockIndexBatches() throws Exception {
+        try (RocksDBStoreEngine engine = open("rollbacking-batches")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine, 1);
+            BranchSession first = branchSession(1001L, 1L, "t_order:1");
+            BranchSession second = branchSession(1001L, 2L, "t_order:2");
+            BranchSession conflict = branchSession(1002L, 3L, "t_order:2");
+
+            Assertions.assertTrue(lockManager.acquireLock(first));
+            Assertions.assertTrue(lockManager.acquireLock(second));
             lockManager.updateLockStatus(first.getXid(), LockStatus.Rollbacking);
 
             StoreException exception = Assertions.assertThrows(
@@ -219,6 +258,32 @@ class RocksDBLockManagerTest {
 
             Assertions.assertEquals(1, lockManager.cleanOrphanLocks());
             Assertions.assertTrue(lockManager.acquireLock(next));
+        }
+    }
+
+    @Test
+    void testCleanOrphanLocksWithLimitLeavesRemainingLocksForNextBatch() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-orphan-limit")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession first = branchSession(1001L, 1L, "t_order:1");
+            BranchSession second = branchSession(1002L, 2L, "t_order:2");
+
+            Assertions.assertTrue(lockManager.acquireLock(first));
+            Assertions.assertTrue(lockManager.acquireLock(second));
+
+            Assertions.assertEquals(1, lockManager.cleanOrphanLocks(1));
+            Assertions.assertEquals(
+                    1, engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).size());
+            Assertions.assertEquals(
+                    1,
+                    engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                            .size());
+
+            Assertions.assertEquals(1, lockManager.cleanOrphanLocks(1));
+            Assertions.assertTrue(
+                    engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty());
+            Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                    .isEmpty());
         }
     }
 

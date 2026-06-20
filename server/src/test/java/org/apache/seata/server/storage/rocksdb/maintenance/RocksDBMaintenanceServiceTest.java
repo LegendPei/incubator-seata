@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
 import org.rocksdb.WriteBatch;
 import org.springframework.mock.env.MockEnvironment;
 
@@ -125,6 +126,20 @@ class RocksDBMaintenanceServiceTest {
             Assertions.assertTrue(metadata.contains("branch_session"));
             Assertions.assertTrue(metadata.contains("rocksdbVersion="));
             Assertions.assertTrue(metadata.contains("seataVersion="));
+        }
+    }
+
+    @Test
+    void testCheckpointFlushFlagControlsExplicitFlush() {
+        try (RocksDBStoreEngine engine = open("checkpoint-flush")) {
+            RocksDBStoreEngine spyEngine = Mockito.spy(engine);
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(spyEngine);
+
+            service.createCheckpoint(tempDir.resolve("checkpoint-no-flush-out"), false);
+            Mockito.verify(spyEngine, Mockito.never()).flush();
+
+            service.createCheckpoint(tempDir.resolve("checkpoint-flush-out"), true);
+            Mockito.verify(spyEngine).flush();
         }
     }
 
