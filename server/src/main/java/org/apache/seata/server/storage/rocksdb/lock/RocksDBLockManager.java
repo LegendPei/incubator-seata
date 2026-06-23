@@ -80,6 +80,40 @@ public class RocksDBLockManager extends AbstractLockManager {
         return locker.cleanOrphanLocks(seekKey, limit);
     }
 
+    public boolean wasLastShutdownClean() {
+        return locker.wasLastShutdownClean();
+    }
+
+    public CleanOrphanLocksResult cleanOrphanLocksBatches(int batchLimit, int maxBatches) {
+        return cleanOrphanLocksBatches(null, batchLimit, maxBatches);
+    }
+
+    public CleanOrphanLocksResult cleanOrphanLocksBatches(byte[] seekKey, int batchLimit, int maxBatches) {
+        if (batchLimit <= 0) {
+            throw new IllegalArgumentException("batchLimit must be positive");
+        }
+        if (maxBatches <= 0) {
+            throw new IllegalArgumentException("maxBatches must be positive");
+        }
+        int cleaned = 0;
+        int scanned = 0;
+        int batches = 0;
+        boolean limitReached = false;
+        byte[] cursor = CleanOrphanLocksResult.copy(seekKey);
+        for (int i = 0; i < maxBatches; i++) {
+            CleanOrphanLocksResult result = cleanOrphanLocks(cursor, batchLimit);
+            batches++;
+            cleaned += result.getCleaned();
+            scanned += result.getScanned();
+            limitReached = result.isLimitReached();
+            cursor = result.getNextSeekKey();
+            if (!limitReached) {
+                break;
+            }
+        }
+        return new CleanOrphanLocksResult(cleaned, scanned, limitReached, cursor, batches);
+    }
+
     @Override
     protected Locker getLocker(BranchSession branchSession) {
         return locker;
@@ -90,12 +124,18 @@ public class RocksDBLockManager extends AbstractLockManager {
         private final int scanned;
         private final boolean limitReached;
         private final byte[] nextSeekKey;
+        private final int batches;
 
         CleanOrphanLocksResult(int cleaned, int scanned, boolean limitReached, byte[] nextSeekKey) {
+            this(cleaned, scanned, limitReached, nextSeekKey, 1);
+        }
+
+        CleanOrphanLocksResult(int cleaned, int scanned, boolean limitReached, byte[] nextSeekKey, int batches) {
             this.cleaned = cleaned;
             this.scanned = scanned;
             this.limitReached = limitReached;
             this.nextSeekKey = copy(nextSeekKey);
+            this.batches = batches;
         }
 
         public int getCleaned() {
@@ -112,6 +152,10 @@ public class RocksDBLockManager extends AbstractLockManager {
 
         public byte[] getNextSeekKey() {
             return copy(nextSeekKey);
+        }
+
+        public int getBatches() {
+            return batches;
         }
 
         private static byte[] copy(byte[] value) {

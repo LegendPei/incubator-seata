@@ -28,6 +28,7 @@ public class SessionCondition {
     private GlobalStatus status;
     private GlobalStatus[] statuses;
     private Long overTimeAliveMills;
+    private Integer limit;
     private boolean lazyLoadBranch;
 
     /**
@@ -131,6 +132,14 @@ public class SessionCondition {
 
     public void setStatuses(GlobalStatus... statuses) {
         this.statuses = statuses;
+    }
+
+    public Integer getLimit() {
+        return limit;
+    }
+
+    public void setLimit(Integer limit) {
+        this.limit = limit;
     }
 
     public boolean isLazyLoadBranch() {

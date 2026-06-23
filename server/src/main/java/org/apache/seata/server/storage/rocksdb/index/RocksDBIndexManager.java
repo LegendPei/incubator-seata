@@ -28,6 +28,7 @@ import org.rocksdb.WriteBatch;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -156,15 +157,33 @@ public class RocksDBIndexManager {
     }
 
     public StatusScanResult scanXidsByStatus(GlobalStatus status, long maxBeginTimeInclusive, int limit) {
+        return scanXidsByStatus(status, 0L, maxBeginTimeInclusive, null, limit);
+    }
+
+    public StatusScanResult scanXidsByStatus(
+            GlobalStatus status, long minBeginTimeInclusive, long maxBeginTimeInclusive, byte[] cursor, int limit) {
         List<String> xids = new ArrayList<>();
+        if (maxBeginTimeInclusive < minBeginTimeInclusive) {
+            return new StatusScanResult(xids, new RocksDBStoreEngine.ScanStats(0, 0, false), null);
+        }
+        byte[] prefix = RocksDBKeyCodec.encodeGlobalStatusPrefix(status);
+        byte[] seekKey = cursor == null
+                ? RocksDBKeyCodec.encodeGlobalStatusSeekKey(status, minBeginTimeInclusive)
+                : Arrays.copyOf(cursor, cursor.length);
+        byte[][] lastReturnedKey = new byte[1][];
         RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
                 RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
-                RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
-                RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
+                seekKey,
+                prefix,
                 limit,
                 (key, value) -> RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(key) <= maxBeginTimeInclusive,
-                (key, value) -> xids.add(string(value)));
-        return new StatusScanResult(xids, stats);
+                (key, value) -> {
+                    xids.add(string(value));
+                    lastReturnedKey[0] = Arrays.copyOf(key, key.length);
+                });
+        byte[] nextCursor =
+                stats.isLimitReached() && lastReturnedKey[0] != null ? nextSeekKey(lastReturnedKey[0]) : null;
+        return new StatusScanResult(xids, stats, nextCursor);
     }
 
     public static class StatusScanResult {
@@ -172,12 +191,18 @@ public class RocksDBIndexManager {
         private final int rowsScanned;
         private final int rowsReturned;
         private final boolean limitReached;
+        private final byte[] nextCursor;
 
         StatusScanResult(List<String> xids, RocksDBStoreEngine.ScanStats scanStats) {
+            this(xids, scanStats, null);
+        }
+
+        StatusScanResult(List<String> xids, RocksDBStoreEngine.ScanStats scanStats, byte[] nextCursor) {
             this.xids = xids;
             this.rowsScanned = scanStats.getRowsScanned();
             this.rowsReturned = scanStats.getRowsReturned();
             this.limitReached = scanStats.isLimitReached();
+            this.nextCursor = nextCursor == null ? null : Arrays.copyOf(nextCursor, nextCursor.length);
         }
 
         public List<String> getXids() {
@@ -194,6 +219,10 @@ public class RocksDBIndexManager {
 
         public boolean isLimitReached() {
             return limitReached;
+        }
+
+        public byte[] getNextCursor() {
+            return nextCursor == null ? null : Arrays.copyOf(nextCursor, nextCursor.length);
         }
     }
 
@@ -230,5 +259,11 @@ public class RocksDBIndexManager {
 
     private static String string(byte[] value) {
         return new String(value, StandardCharsets.UTF_8);
+    }
+
+    private static byte[] nextSeekKey(byte[] key) {
+        byte[] next = Arrays.copyOf(key, key.length + 1);
+        next[key.length] = 0;
+        return next;
     }
 }

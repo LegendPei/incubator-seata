@@ -69,6 +69,10 @@ public class RocksDBLocker extends AbstractLocker {
                 lockIndexScanBatchSize > 0 ? lockIndexScanBatchSize : DEFAULT_LOCK_INDEX_SCAN_BATCH_SIZE;
     }
 
+    boolean wasLastShutdownClean() {
+        return storeEngine.wasLastShutdownClean();
+    }
+
     @Override
     public boolean acquireLock(List<RowLock> locks) {
         return acquireLock(locks, true, false);

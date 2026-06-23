@@ -358,6 +358,37 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByStatusAndOvertimeHonorsLimitInBeginTimeOrder() {
+        try (RocksDBStoreEngine engine = open("condition-status-overtime-limit")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            long now = System.currentTimeMillis();
+            GlobalSession oldest = globalSession("tx-oldest-status", GlobalStatus.Begin);
+            oldest.setBeginTime(now - 60000);
+            GlobalSession middle = globalSession("tx-middle-status", GlobalStatus.Begin);
+            middle.setBeginTime(now - 50000);
+            GlobalSession newestExpired = globalSession("tx-newest-expired-status", GlobalStatus.Begin);
+            newestExpired.setBeginTime(now - 40000);
+            GlobalSession active = globalSession("tx-active-status", GlobalStatus.Begin);
+            active.setBeginTime(now);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, newestExpired);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, active);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, oldest);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, middle);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setLazyLoadBranch(true);
+            condition.setOverTimeAliveMills(1000L);
+            condition.setLimit(2);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(oldest.getXid(), actual.get(0).getXid());
+            Assertions.assertEquals(middle.getXid(), actual.get(1).getXid());
+        }
+    }
+
+    @Test
     void testReadByEmptySessionConditionScansAll() {
         try (RocksDBStoreEngine engine = open("condition-all")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);

@@ -64,6 +64,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private static final int DELETE_BATCH_SIZE = 1024;
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBStoreEngine.class);
     private static final byte[] FORMAT_VERSION_KEY = "format_version".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_KEY = "clean_shutdown".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_TRUE = "true".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_FALSE = "false".getBytes(StandardCharsets.UTF_8);
     private static final String ROCKS_DB_VERSION;
     private static final String[] DB_LONG_PROPERTIES = {
         RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE,
@@ -110,6 +113,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final RocksDBWalSyncController walSyncController;
     private final RocksDB db;
     private final ReentrantReadWriteLock maintenanceLock = new ReentrantReadWriteLock(true);
+    private final boolean lastShutdownClean;
 
     private volatile boolean closed;
 
@@ -161,8 +165,12 @@ public class RocksDBStoreEngine implements AutoCloseable {
             }
             boolean metadataUpdated =
                     initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
+            boolean openedLastShutdownClean =
+                    isCleanShutdown(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA));
+            boolean cleanShutdownMarkerUpdated = markCleanShutdown(
+                    openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions, false);
             openedWalSyncController = RocksDBWalSyncController.create(openedDb, config);
-            if (metadataUpdated) {
+            if (metadataUpdated || cleanShutdownMarkerUpdated) {
                 openedWalSyncController.afterWrite();
             }
             dbOptions = openedDbOptions;
@@ -173,6 +181,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
             statistics = openedStatistics;
             walSyncController = openedWalSyncController;
             db = openedDb;
+            lastShutdownClean = openedLastShutdownClean;
             handles.putAll(openedHandleMap);
             LOGGER.info(
                     "RocksDB file store engine opened, path:{}, columnFamilies:{}, formatVersion:{}, "
@@ -222,6 +231,10 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public RocksDBStoreConfig getConfig() {
         return config;
+    }
+
+    public boolean wasLastShutdownClean() {
+        return lastShutdownClean;
     }
 
     public boolean isSyncWrite() {
@@ -741,9 +754,16 @@ public class RocksDBStoreEngine implements AutoCloseable {
             RocksDBStoreMetrics.unregister(this);
             RuntimeException syncFailure = null;
             try {
+                markCleanShutdown(true);
+                walSyncController.afterWrite();
                 walSyncController.close();
             } catch (RuntimeException e) {
                 syncFailure = e;
+                try {
+                    markCleanShutdown(false);
+                } catch (RuntimeException markerFailure) {
+                    syncFailure.addSuppressed(markerFailure);
+                }
             } finally {
                 closeQuietly(
                         new ArrayList<>(handles.values()),
@@ -811,6 +831,34 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     "unsupported RocksDB format version:" + existingFormatVersion + ", expected:" + FORMAT_VERSION);
         }
         return false;
+    }
+
+    private void markCleanShutdown(boolean clean) {
+        try {
+            db.put(
+                    handle(RocksDBColumnFamily.METADATA),
+                    writeOptions,
+                    CLEAN_SHUTDOWN_KEY,
+                    clean ? CLEAN_SHUTDOWN_TRUE : CLEAN_SHUTDOWN_FALSE);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "write RocksDB clean shutdown marker failed");
+        }
+    }
+
+    private static boolean markCleanShutdown(
+            RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions, boolean clean)
+            throws RocksDBException {
+        byte[] expected = clean ? CLEAN_SHUTDOWN_TRUE : CLEAN_SHUTDOWN_FALSE;
+        byte[] existing = db.get(metadataHandle, CLEAN_SHUTDOWN_KEY);
+        if (Arrays.equals(existing, expected)) {
+            return false;
+        }
+        db.put(metadataHandle, writeOptions, CLEAN_SHUTDOWN_KEY, expected);
+        return true;
+    }
+
+    private static boolean isCleanShutdown(RocksDB db, ColumnFamilyHandle metadataHandle) throws RocksDBException {
+        return Arrays.equals(db.get(metadataHandle, CLEAN_SHUTDOWN_KEY), CLEAN_SHUTDOWN_TRUE);
     }
 
     private static void closeQuietly(
