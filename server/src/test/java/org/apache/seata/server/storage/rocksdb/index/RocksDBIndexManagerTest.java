@@ -144,6 +144,48 @@ class RocksDBIndexManagerTest {
     }
 
     @Test
+    void testScanXidsByStatusUsesLowerBoundAndCursor() {
+        try (RocksDBStoreEngine engine = open("paged-status")) {
+            GlobalSession beforeLowerBound = globalSession("tx-before-lower", GlobalStatus.Begin);
+            beforeLowerBound.setBeginTime(100L);
+            GlobalSession first = globalSession("tx-first-page", GlobalStatus.Begin);
+            first.setBeginTime(200L);
+            GlobalSession second = globalSession("tx-second-page", GlobalStatus.Begin);
+            second.setBeginTime(300L);
+            GlobalSession third = globalSession("tx-third-page", GlobalStatus.Begin);
+            third.setBeginTime(400L);
+            GlobalSession afterUpperBound = globalSession("tx-after-upper", GlobalStatus.Begin);
+            afterUpperBound.setBeginTime(500L);
+            putGlobal(engine, beforeLowerBound);
+            putGlobal(engine, first);
+            putGlobal(engine, second);
+            putGlobal(engine, third);
+            putGlobal(engine, afterUpperBound);
+
+            RocksDBIndexManager indexManager = new RocksDBIndexManager(engine);
+            indexManager.ensureReady();
+
+            RocksDBIndexManager.StatusScanResult firstPage =
+                    indexManager.scanXidsByStatus(GlobalStatus.Begin, 200L, 400L, null, 2);
+
+            Assertions.assertEquals(List.of(first.getXid(), second.getXid()), firstPage.getXids());
+            Assertions.assertEquals(2, firstPage.getRowsScanned());
+            Assertions.assertEquals(2, firstPage.getRowsReturned());
+            Assertions.assertTrue(firstPage.isLimitReached());
+            Assertions.assertNotNull(firstPage.getNextCursor());
+
+            RocksDBIndexManager.StatusScanResult secondPage =
+                    indexManager.scanXidsByStatus(GlobalStatus.Begin, 200L, 400L, firstPage.getNextCursor(), 2);
+
+            Assertions.assertEquals(List.of(third.getXid()), secondPage.getXids());
+            Assertions.assertEquals(2, secondPage.getRowsScanned());
+            Assertions.assertEquals(1, secondPage.getRowsReturned());
+            Assertions.assertFalse(secondPage.isLimitReached());
+            Assertions.assertNull(secondPage.getNextCursor());
+        }
+    }
+
+    @Test
     void testFutureIndexVersionFailsFast() {
         try (RocksDBStoreEngine engine = open("future")) {
             engine.put(

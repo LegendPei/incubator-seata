@@ -295,6 +295,43 @@ class RocksDBLockManagerTest {
     }
 
     @Test
+    void testCleanOrphanLocksBatchesStopsAtMaxBatchesWithCursor() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-orphan-batches")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession first = branchSession(1001L, 1L, "t_order:1");
+            BranchSession second = branchSession(1002L, 2L, "t_order:2");
+            BranchSession third = branchSession(1003L, 3L, "t_order:3");
+
+            Assertions.assertTrue(lockManager.acquireLock(first));
+            Assertions.assertTrue(lockManager.acquireLock(second));
+            Assertions.assertTrue(lockManager.acquireLock(third));
+
+            RocksDBLockManager.CleanOrphanLocksResult result = lockManager.cleanOrphanLocksBatches(1, 2);
+
+            Assertions.assertEquals(2, result.getCleaned());
+            Assertions.assertEquals(2, result.getScanned());
+            Assertions.assertEquals(2, result.getBatches());
+            Assertions.assertTrue(result.isLimitReached());
+            Assertions.assertNotNull(result.getNextSeekKey());
+            Assertions.assertEquals(
+                    1,
+                    engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                            .size());
+
+            RocksDBLockManager.CleanOrphanLocksResult finalResult =
+                    lockManager.cleanOrphanLocksBatches(result.getNextSeekKey(), 1, 2);
+
+            Assertions.assertEquals(1, finalResult.getCleaned());
+            Assertions.assertEquals(1, finalResult.getScanned());
+            Assertions.assertEquals(2, finalResult.getBatches());
+            Assertions.assertFalse(finalResult.isLimitReached());
+            Assertions.assertNull(finalResult.getNextSeekKey());
+            Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                    .isEmpty());
+        }
+    }
+
+    @Test
     void testCleanOrphanLocksWithLimitReportsRemainingWhenScannedLocksAreValid() throws Exception {
         try (RocksDBStoreEngine engine = open("clean-orphan-valid-prefix")) {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
