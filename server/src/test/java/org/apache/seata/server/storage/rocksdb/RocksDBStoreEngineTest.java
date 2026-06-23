@@ -394,8 +394,22 @@ class RocksDBStoreEngineTest {
         Assertions.assertTrue(exception.getMessage().contains("shutdown"));
         Assertions.assertTrue(executor.isShutdown());
         try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
+            Assertions.assertFalse(reopened.wasLastShutdownClean());
             Assertions.assertNotNull(
                     reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid("xid-close-failure")));
+        }
+    }
+
+    @Test
+    void testCleanShutdownMarkerTracksPreviousClose() {
+        RocksDBStoreConfig config = config("clean-shutdown-marker", false);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            Assertions.assertFalse(engine.wasLastShutdownClean());
+        }
+
+        try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
+            Assertions.assertTrue(reopened.wasLastShutdownClean());
         }
     }
 

@@ -184,8 +184,13 @@ public class SessionHolder {
         if (!(lockManager instanceof RocksDBLockManager)) {
             return;
         }
+        RocksDBLockManager rocksDBLockManager = (RocksDBLockManager) lockManager;
+        if (rocksDBLockManager.wasLastShutdownClean()) {
+            LOGGER.info("Skip RocksDB startup orphan lock cleanup because previous shutdown was clean");
+            return;
+        }
         RocksDBLockManager.CleanOrphanLocksResult result =
-                ((RocksDBLockManager) lockManager).cleanOrphanLocks(ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT);
+                rocksDBLockManager.cleanOrphanLocks(ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT);
         if (result.getCleaned() > 0) {
             LOGGER.warn("Cleaned RocksDB orphan locks, count:{}, scanned:{}", result.getCleaned(), result.getScanned());
         }
