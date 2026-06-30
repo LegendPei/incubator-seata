@@ -156,9 +156,9 @@ public class RocksDBIndexManager {
 
     public StatusScanResult scanXidsByStatus(
             GlobalStatus status, long minBeginTimeInclusive, long maxBeginTimeInclusive, byte[] cursor, int limit) {
-        List<String> xids = new ArrayList<>();
+        List<StatusIndexEntry> entries = new ArrayList<>();
         if (maxBeginTimeInclusive < minBeginTimeInclusive) {
-            return new StatusScanResult(xids, new RocksDBStoreEngine.ScanStats(0, 0, false), null);
+            return new StatusScanResult(entries, new RocksDBStoreEngine.ScanStats(0, 0, false), null);
         }
         byte[] prefix = RocksDBKeyCodec.encodeGlobalStatusPrefix(status);
         byte[] seekKey = cursor == null
@@ -172,27 +172,52 @@ public class RocksDBIndexManager {
                 limit,
                 (key, value) -> RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(key) <= maxBeginTimeInclusive,
                 (key, value) -> {
-                    xids.add(string(value));
+                    entries.add(new StatusIndexEntry(
+                            status, string(value), RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(key)));
                     lastReturnedKey[0] = Arrays.copyOf(key, key.length);
                 });
         byte[] nextCursor =
                 stats.isLimitReached() && lastReturnedKey[0] != null ? nextSeekKey(lastReturnedKey[0]) : null;
-        return new StatusScanResult(xids, stats, nextCursor);
+        return new StatusScanResult(entries, stats, nextCursor);
+    }
+
+    public static class StatusIndexEntry {
+        private final GlobalStatus status;
+        private final String xid;
+        private final long beginTime;
+
+        StatusIndexEntry(GlobalStatus status, String xid, long beginTime) {
+            this.status = status;
+            this.xid = xid;
+            this.beginTime = beginTime;
+        }
+
+        public GlobalStatus getStatus() {
+            return status;
+        }
+
+        public String getXid() {
+            return xid;
+        }
+
+        public long getBeginTime() {
+            return beginTime;
+        }
     }
 
     public static class StatusScanResult {
-        private final List<String> xids;
+        private final List<StatusIndexEntry> entries;
         private final int rowsScanned;
         private final int rowsReturned;
         private final boolean limitReached;
         private final byte[] nextCursor;
 
-        StatusScanResult(List<String> xids, RocksDBStoreEngine.ScanStats scanStats) {
-            this(xids, scanStats, null);
+        StatusScanResult(List<StatusIndexEntry> entries, RocksDBStoreEngine.ScanStats scanStats) {
+            this(entries, scanStats, null);
         }
 
-        StatusScanResult(List<String> xids, RocksDBStoreEngine.ScanStats scanStats, byte[] nextCursor) {
-            this.xids = xids;
+        StatusScanResult(List<StatusIndexEntry> entries, RocksDBStoreEngine.ScanStats scanStats, byte[] nextCursor) {
+            this.entries = entries;
             this.rowsScanned = scanStats.getRowsScanned();
             this.rowsReturned = scanStats.getRowsReturned();
             this.limitReached = scanStats.isLimitReached();
@@ -200,7 +225,15 @@ public class RocksDBIndexManager {
         }
 
         public List<String> getXids() {
+            List<String> xids = new ArrayList<>(entries.size());
+            for (StatusIndexEntry entry : entries) {
+                xids.add(entry.getXid());
+            }
             return xids;
+        }
+
+        public List<StatusIndexEntry> getEntries() {
+            return entries;
         }
 
         public int getRowsScanned() {

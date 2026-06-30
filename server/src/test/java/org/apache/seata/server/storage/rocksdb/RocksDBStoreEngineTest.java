@@ -414,6 +414,20 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testStartupDirtyShutdownMarkerIsDurablySynced() {
+        RocksDBStoreConfig config = periodicWalSyncConfig("dirty-shutdown-marker-sync", false, Long.MAX_VALUE);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            Assertions.assertFalse(engine.wasLastShutdownClean());
+        }
+
+        try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
+            Assertions.assertTrue(reopened.wasLastShutdownClean());
+            Assertions.assertEquals(0L, reopened.diagnostics().getWalSyncStats().getUnsyncedWriteRequests());
+        }
+    }
+
+    @Test
     void testFactoryRejectsDifferentTuningOptions() {
         RocksDBStoreConfig config = tunedConfig("factory-tuning", true);
         RocksDBStoreEngineFactory.getInstance(config);
