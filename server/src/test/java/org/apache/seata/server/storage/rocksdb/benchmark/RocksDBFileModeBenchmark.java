@@ -16,6 +16,8 @@
  */
 package org.apache.seata.server.storage.rocksdb.benchmark;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.common.util.StringUtils;
@@ -71,6 +73,7 @@ import java.util.stream.Stream;
  */
 public final class RocksDBFileModeBenchmark {
 
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String CSV_HEADER =
             "scenario,globalCount,branchPerGlobal,lockPerBranch,syncWrite,enableRangeDelete,warmupRounds,"
                     + "measureRounds,batchSize,queryIterationsPerRound,queryLimit,repeatRun,compareOrder,ops,totalMs,"
@@ -94,6 +97,20 @@ public final class RocksDBFileModeBenchmark {
         GlobalStatus.Committed
     };
     private static final GlobalStatus TARGET_STATUS = GlobalStatus.RollbackRetrying;
+    private static final int SESSION_TIMEOUT_MILLIS = 60000;
+    private static final String LOCK_OP_ACQUIRE = "acquire";
+    private static final String LOCK_OP_CONFLICT = "conflict";
+    private static final String LOCK_OP_UPDATE_STATUS = "update_status";
+    private static final String LOCK_OP_RELEASE_BRANCH = "release_branch";
+    private static final String LOCK_OP_RELEASE_GLOBAL = "release_global";
+    private static final String LOCK_OP_CLEAN_ORPHAN = "clean_orphan";
+    private static final List<String> ALL_LOCK_WORKLOADS = Arrays.asList(
+            LOCK_OP_ACQUIRE,
+            LOCK_OP_CONFLICT,
+            LOCK_OP_UPDATE_STATUS,
+            LOCK_OP_RELEASE_BRANCH,
+            LOCK_OP_RELEASE_GLOBAL,
+            LOCK_OP_CLEAN_ORPHAN);
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private static volatile int sinkCount;
@@ -252,19 +269,51 @@ public final class RocksDBFileModeBenchmark {
     }
 
     private static void emitSummary(List<String> csvLines) {
-        List<String> summaryLines = summarizeCsvLines(csvLines);
-        if (summaryLines.isEmpty()) {
+        List<BenchmarkSummary> summaries = collectSummaries(csvLines);
+        if (summaries.isEmpty()) {
             return;
         }
         System.out.println();
         log("=== REPEAT SUMMARY ===");
         System.out.println(SUMMARY_CSV_HEADER);
-        for (String line : summaryLines) {
-            System.out.println(line);
+        for (BenchmarkSummary summary : summaries) {
+            System.out.println(summary.toCsvLine());
         }
+        log("=== REPEAT SUMMARY JSON ===");
+        System.out.println(summariesAsJson(summaries));
     }
 
     private static List<String> summarizeCsvLines(List<String> csvLines) {
+        List<BenchmarkSummary> summaries = collectSummaries(csvLines);
+        List<String> result = new ArrayList<>(summaries.size());
+        for (BenchmarkSummary summary : summaries) {
+            result.add(summary.toCsvLine());
+        }
+        return result;
+    }
+
+    private static String summarizeCsvLinesAsJson(List<String> csvLines) {
+        return summariesAsJson(collectSummaries(csvLines));
+    }
+
+    private static String summariesAsJson(List<BenchmarkSummary> summaries) {
+        Map<String, Object> root = new LinkedHashMap<>();
+        List<Map<String, Object>> items = new ArrayList<>(summaries.size());
+        List<String> summaryKeys = new ArrayList<>(summaries.size());
+        for (BenchmarkSummary summary : summaries) {
+            items.add(summary.toMap());
+            summaryKeys.add(summary.scenario + ":" + summary.runGroup);
+        }
+        root.put("summaryKeys", summaryKeys);
+        root.put("summaries", items);
+        try {
+            return OBJECT_MAPPER.writeValueAsString(root);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize benchmark summary JSON", e);
+        }
+    }
+
+    private static List<BenchmarkSummary> collectSummaries(List<String> csvLines) {
         Map<String, BenchmarkSummary> summaries = new LinkedHashMap<>();
         int scenarioIndex = csvColumnIndex("scenario");
         int repeatRunIndex = csvColumnIndex("repeatRun");
@@ -314,11 +363,7 @@ public final class RocksDBFileModeBenchmark {
                     doubleValue(parts[rowsUpdatedIndex]),
                     doubleValue(parts[innerOperationsIndex]));
         }
-        List<String> result = new ArrayList<>(summaries.size());
-        for (BenchmarkSummary summary : summaries.values()) {
-            result.add(summary.toCsvLine());
-        }
-        return result;
+        return new ArrayList<>(summaries.values());
     }
 
     private static Map<String, Double> parseOpsPerSecond(List<String> csvLines) {
@@ -585,14 +630,17 @@ public final class RocksDBFileModeBenchmark {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             writeDataSet(storeManager, dataSet);
             engine.flush();
-            log(
-                    "  query data loaded: %d globals, %d branches",
-                    options.globalCount, options.globalCount * options.branchPerGlobal);
+            log("  query data loaded: %d globals, %d branches", options.globalCount, dataSet.totalBranchCount());
 
             int iterations = options.totalRounds() * options.queryIterationsPerRound;
             int expectedStatusCount = dataSet.countByStatus(TARGET_STATUS);
-            int expectedLimitedStatusCount =
-                    options.queryLimit > 0 ? Math.min(expectedStatusCount, options.queryLimit) : expectedStatusCount;
+            boolean useOvertimeStatusQuery = options.expiredRatio > 0D;
+            int expectedStatusQueryCount = useOvertimeStatusQuery
+                    ? dataSet.countByStatusAndOverTime(TARGET_STATUS, SESSION_TIMEOUT_MILLIS)
+                    : expectedStatusCount;
+            int expectedLimitedStatusCount = options.queryLimit > 0
+                    ? Math.min(expectedStatusQueryCount, options.queryLimit)
+                    : expectedStatusQueryCount;
             int expectedBeginCount = dataSet.countByStatus(GlobalStatus.Begin);
             for (int i = 0; i < iterations; i++) {
                 final int iteration = i;
@@ -621,6 +669,9 @@ public final class RocksDBFileModeBenchmark {
                 measure(statusStats, round, options, () -> {
                     SessionCondition condition = new SessionCondition(TARGET_STATUS);
                     condition.setLazyLoadBranch(true);
+                    if (useOvertimeStatusQuery) {
+                        condition.setOverTimeAliveMills((long) SESSION_TIMEOUT_MILLIS);
+                    }
                     if (options.queryLimit > 0) {
                         condition.setLimit(options.queryLimit);
                     }
@@ -678,98 +729,156 @@ public final class RocksDBFileModeBenchmark {
         Path lastDbPath = null;
         RocksDBWalSyncStats lastWalSyncStats = RocksDBWalSyncStats.NONE;
 
-        for (int round = 0; round < options.totalRounds(); round++) {
-            boolean warmup = round < options.warmupRounds;
-            logRoundStart(scenario, round, options.totalRounds(), warmup);
-            BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
-            Path dbPath = scenarioPath(runPath, "lock-round-" + round);
-            lastDbPath = dbPath;
-            try (RocksDBStoreEngine engine = open(dbPath, options)) {
-                RocksDBLockManager lockManager = new RocksDBLockManager(engine);
-                for (BranchSession branchSession : dataSet.allBranches()) {
-                    measure(acquireStats, round, options, () -> {
-                        boolean locked = lockManager.acquireLock(branchSession);
-                        assertTrue(locked, "lock acquire failed");
-                    });
-                }
-                for (GlobalSession globalSession : dataSet.globalSessions) {
-                    BranchSession branchSession =
-                            dataSet.branchesOf(globalSession).get(0);
-                    BranchSession conflict = dataSet.conflictBranch(branchSession);
-                    measure(conflictCheckStats, round, options, () -> {
-                        boolean lockable = lockManager.isLockable(
-                                conflict.getXid(), conflict.getResourceId(), conflict.getLockKey());
-                        assertTrue(!lockable, "conflict check should be false");
-                    });
-                    measure(conflictAcquireStats, round, options, () -> {
-                        boolean locked = lockManager.acquireLock(conflict);
-                        assertTrue(!locked, "conflict acquire should be false");
-                    });
-                    measure(
-                            updateStatusStats,
-                            round,
-                            options,
-                            () -> lockManager.updateLockStatus(globalSession.getXid(), LockStatus.Rollbacking));
-                    measure(releaseBranchStats, round, options, () -> {
-                        boolean released = lockManager.releaseLock(branchSession);
-                        assertTrue(released, "branch release failed");
-                    });
-                    if (dataSet.branchesOf(globalSession).size() == 1) {
-                        assertTrue(
-                                lockManager.acquireLock(branchSession), "lock reacquire before global release failed");
+        boolean runPrimaryLockWorkload = options.lockWorkloadIncludes(LOCK_OP_ACQUIRE)
+                || options.lockWorkloadIncludes(LOCK_OP_CONFLICT)
+                || options.lockWorkloadIncludes(LOCK_OP_UPDATE_STATUS)
+                || options.lockWorkloadIncludes(LOCK_OP_RELEASE_BRANCH)
+                || options.lockWorkloadIncludes(LOCK_OP_RELEASE_GLOBAL);
+        if (runPrimaryLockWorkload) {
+            for (int round = 0; round < options.totalRounds(); round++) {
+                boolean warmup = round < options.warmupRounds;
+                logRoundStart(scenario, round, options.totalRounds(), warmup);
+                BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
+                Path dbPath = scenarioPath(runPath, "lock-round-" + round);
+                lastDbPath = dbPath;
+                try (RocksDBStoreEngine engine = open(dbPath, options)) {
+                    RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+                    for (BranchSession branchSession : dataSet.allBranches()) {
+                        if (options.lockWorkloadIncludes(LOCK_OP_ACQUIRE)) {
+                            measure(acquireStats, round, options, () -> {
+                                boolean locked = lockManager.acquireLock(branchSession);
+                                assertTrue(locked, "lock acquire failed");
+                                return RowMetrics.updated(lockRows(branchSession));
+                            });
+                        } else {
+                            assertTrue(lockManager.acquireLock(branchSession), "lock setup acquire failed");
+                        }
                     }
-                    measure(releaseGlobalStats, round, options, () -> {
-                        boolean released = lockManager.releaseGlobalSessionLock(globalSession);
-                        assertTrue(released, "global release failed");
-                    });
+                    for (int globalIndex = 0; globalIndex < dataSet.globalSessions.size(); globalIndex++) {
+                        GlobalSession globalSession = dataSet.globalSessions.get(globalIndex);
+                        List<BranchSession> branches = dataSet.branchesOf(globalSession);
+                        if (branches.isEmpty()) {
+                            continue;
+                        }
+                        BranchSession branchSession = branches.get(0);
+                        int branchLockRows = lockRows(branchSession);
+                        int globalLockRows = lockRows(branches);
+                        if (options.lockWorkloadIncludes(LOCK_OP_CONFLICT)
+                                && options.shouldRunLockConflict(globalIndex)) {
+                            BranchSession conflict = dataSet.conflictBranch(branchSession);
+                            measure(conflictCheckStats, round, options, () -> {
+                                boolean lockable = lockManager.isLockable(
+                                        conflict.getXid(), conflict.getResourceId(), conflict.getLockKey());
+                                assertTrue(!lockable, "conflict check should be false");
+                                return RowMetrics.scanned(lockRows(conflict));
+                            });
+                            measure(conflictAcquireStats, round, options, () -> {
+                                boolean locked = lockManager.acquireLock(conflict);
+                                assertTrue(!locked, "conflict acquire should be false");
+                                return RowMetrics.scanned(lockRows(conflict));
+                            });
+                        }
+                        if (options.lockWorkloadIncludes(LOCK_OP_UPDATE_STATUS)) {
+                            measure(updateStatusStats, round, options, () -> {
+                                lockManager.updateLockStatus(globalSession.getXid(), LockStatus.Rollbacking);
+                                return RowMetrics.scannedAndUpdated(globalLockRows, globalLockRows);
+                            });
+                        }
+                        if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_BRANCH)) {
+                            measure(releaseBranchStats, round, options, () -> {
+                                boolean released = lockManager.releaseLock(branchSession);
+                                assertTrue(released, "branch release failed");
+                                return RowMetrics.scannedAndUpdated(branchLockRows, branchLockRows);
+                            });
+                        }
+                        if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_GLOBAL)) {
+                            int remainingGlobalLockRows = globalLockRows;
+                            if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_BRANCH)) {
+                                remainingGlobalLockRows -= branchLockRows;
+                                if (branches.size() == 1) {
+                                    assertTrue(
+                                            lockManager.acquireLock(branchSession),
+                                            "lock reacquire before global release failed");
+                                    remainingGlobalLockRows += branchLockRows;
+                                }
+                            }
+                            final int releaseGlobalRows = remainingGlobalLockRows;
+                            measure(releaseGlobalStats, round, options, () -> {
+                                boolean released = lockManager.releaseGlobalSessionLock(globalSession);
+                                assertTrue(released, "global release failed");
+                                return RowMetrics.scannedAndUpdated(releaseGlobalRows, releaseGlobalRows);
+                            });
+                        }
+                    }
+                    if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_GLOBAL)) {
+                        assertTrue(
+                                engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0])
+                                        .isEmpty(),
+                                "lock table should be empty after release");
+                        assertTrue(
+                                engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                                        .isEmpty(),
+                                "lock branch index should be empty after release");
+                    }
+                    lastWalSyncStats = engine.diagnostics().getWalSyncStats();
                 }
-                assertTrue(
-                        engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty(),
-                        "lock table should be empty after release");
-                assertTrue(
-                        engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
-                                .isEmpty(),
-                        "lock branch index should be empty after release");
-                lastWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
         }
 
         Path lastOrphanDbPath = null;
         RocksDBWalSyncStats lastOrphanWalSyncStats = RocksDBWalSyncStats.NONE;
-        for (int round = 0; round < options.totalRounds(); round++) {
-            log("  [lock.clean_orphan] round %d/%d", round + 1, options.totalRounds());
-            Path orphanDbPath = scenarioPath(runPath, "lock-clean-orphan-round-" + round);
-            lastOrphanDbPath = orphanDbPath;
-            try (RocksDBStoreEngine engine = open(orphanDbPath, options)) {
-                RocksDBLockManager lockManager = new RocksDBLockManager(engine);
-                BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
-                for (BranchSession branchSession : dataSet.allBranches()) {
-                    assertTrue(lockManager.acquireLock(branchSession), "orphan lock prepare failed");
+        if (options.lockWorkloadIncludes(LOCK_OP_CLEAN_ORPHAN)) {
+            for (int round = 0; round < options.totalRounds(); round++) {
+                log("  [lock.clean_orphan] round %d/%d", round + 1, options.totalRounds());
+                Path orphanDbPath = scenarioPath(runPath, "lock-clean-orphan-round-" + round);
+                lastOrphanDbPath = orphanDbPath;
+                try (RocksDBStoreEngine engine = open(orphanDbPath, options)) {
+                    RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+                    BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
+                    List<BranchSession> allBranches = dataSet.allBranches();
+                    int orphanRows = lockRows(allBranches);
+                    for (BranchSession branchSession : allBranches) {
+                        assertTrue(lockManager.acquireLock(branchSession), "orphan lock prepare failed");
+                    }
+                    measure(cleanOrphanStats, round, options, () -> {
+                        int cleaned = lockManager.cleanOrphanLocks();
+                        assertTrue(cleaned > 0 || orphanRows == 0, "cleanOrphanLocks should clean prepared locks");
+                        return RowMetrics.scannedAndUpdated(orphanRows, cleaned);
+                    });
+                    assertTrue(
+                            engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0])
+                                    .isEmpty(),
+                            "lock table should be empty after clean orphan");
+                    lastOrphanWalSyncStats = engine.diagnostics().getWalSyncStats();
                 }
-                measure(cleanOrphanStats, round, options, () -> {
-                    int cleaned = lockManager.cleanOrphanLocks();
-                    assertTrue(cleaned > 0, "cleanOrphanLocks should clean prepared locks");
-                });
-                assertTrue(
-                        engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty(),
-                        "lock table should be empty after clean orphan");
-                lastOrphanWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
         }
 
         DbFootprint footprint = DbFootprint.from(lastDbPath, lastWalSyncStats);
-        emit("lock.acquire", options, acquireStats, footprint, csvLines);
-        emit("lock.conflict_check", options, conflictCheckStats, footprint, csvLines);
-        emit("lock.conflict_acquire", options, conflictAcquireStats, footprint, csvLines);
-        emit("lock.update_status", options, updateStatusStats, footprint, csvLines);
-        emit("lock.release_branch", options, releaseBranchStats, footprint, csvLines);
-        emit("lock.release_global", options, releaseGlobalStats, footprint, csvLines);
-        emit(
-                "lock.clean_orphan",
-                options,
-                cleanOrphanStats,
-                DbFootprint.from(lastOrphanDbPath, lastOrphanWalSyncStats),
-                csvLines);
+        if (options.lockWorkloadIncludes(LOCK_OP_ACQUIRE)) {
+            emit("lock.acquire", options, acquireStats, footprint, csvLines);
+        }
+        if (options.lockWorkloadIncludes(LOCK_OP_CONFLICT)) {
+            emit("lock.conflict_check", options, conflictCheckStats, footprint, csvLines);
+            emit("lock.conflict_acquire", options, conflictAcquireStats, footprint, csvLines);
+        }
+        if (options.lockWorkloadIncludes(LOCK_OP_UPDATE_STATUS)) {
+            emit("lock.update_status", options, updateStatusStats, footprint, csvLines);
+        }
+        if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_BRANCH)) {
+            emit("lock.release_branch", options, releaseBranchStats, footprint, csvLines);
+        }
+        if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_GLOBAL)) {
+            emit("lock.release_global", options, releaseGlobalStats, footprint, csvLines);
+        }
+        if (options.lockWorkloadIncludes(LOCK_OP_CLEAN_ORPHAN)) {
+            emit(
+                    "lock.clean_orphan",
+                    options,
+                    cleanOrphanStats,
+                    DbFootprint.from(lastOrphanDbPath, lastOrphanWalSyncStats),
+                    csvLines);
+        }
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
@@ -885,6 +994,31 @@ public final class RocksDBFileModeBenchmark {
                 storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession);
             }
         }
+    }
+
+    private static int lockRows(Collection<BranchSession> branchSessions) {
+        int rows = 0;
+        for (BranchSession branchSession : branchSessions) {
+            rows += lockRows(branchSession);
+        }
+        return rows;
+    }
+
+    private static int lockRows(BranchSession branchSession) {
+        if (branchSession == null || StringUtils.isBlank(branchSession.getLockKey())) {
+            return 0;
+        }
+        int rows = 0;
+        for (String tableLocks : branchSession.getLockKey().split(";")) {
+            int separator = tableLocks.indexOf(':');
+            String lockKeys = separator >= 0 ? tableLocks.substring(separator + 1) : tableLocks;
+            for (String lockKey : lockKeys.split(",")) {
+                if (!lockKey.trim().isEmpty()) {
+                    rows++;
+                }
+            }
+        }
+        return rows;
     }
 
     private static RocksDBStoreEngine open(Path dbPath, BenchmarkOptions options) {
@@ -1149,6 +1283,13 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("sampleEvery=" + options.sampleEvery);
         System.out.println("cleanup=" + options.cleanup);
         System.out.println("seed=" + options.seed);
+        System.out.println(
+                "statusDistribution=" + (options.statusDistribution == null ? "" : options.statusDistribution));
+        System.out.println("expiredRatio=" + options.expiredRatio);
+        System.out.println("lockWorkload=" + options.lockWorkload);
+        System.out.println("lockConflictRatio=" + options.lockConflictRatio);
+        System.out.println("xidFanoutDistribution="
+                + (options.xidFanoutDistribution == null ? "" : options.xidFanoutDistribution));
         if (options.compare != null) {
             System.out.println("compare=" + options.compare);
         }
@@ -1210,7 +1351,12 @@ public final class RocksDBFileModeBenchmark {
                 + ",walSyncWarnThresholdMillis=" + options.walSyncWarnThresholdMillis
                 + ",globalCount=" + options.globalCount
                 + ",branchPerGlobal=" + options.branchPerGlobal
-                + ",lockPerBranch=" + options.lockPerBranch;
+                + ",lockPerBranch=" + options.lockPerBranch
+                + ",statusDistribution=" + options.statusDistribution
+                + ",expiredRatio=" + options.expiredRatio
+                + ",lockWorkload=" + options.lockWorkload
+                + ",lockConflictRatio=" + options.lockConflictRatio
+                + ",xidFanoutDistribution=" + options.xidFanoutDistribution;
         int hash = raw.hashCode();
         return String.format(Locale.ROOT, "%08x", hash);
     }
@@ -1318,8 +1464,20 @@ public final class RocksDBFileModeBenchmark {
             return new RowMetrics(0L, rowsReturned, 0L, 1L);
         }
 
+        private static RowMetrics scanned(long rowsScanned) {
+            return new RowMetrics(rowsScanned, 0L, 0L, 1L);
+        }
+
+        private static RowMetrics updated(long rowsUpdated) {
+            return new RowMetrics(0L, 0L, rowsUpdated, 1L);
+        }
+
         private static RowMetrics scannedAndReturned(long rowsScanned, long rowsReturned) {
             return new RowMetrics(rowsScanned, rowsReturned, 0L, 1L);
+        }
+
+        private static RowMetrics scannedAndUpdated(long rowsScanned, long rowsUpdated) {
+            return new RowMetrics(rowsScanned, 0L, rowsUpdated, 1L);
         }
     }
 
@@ -1398,6 +1556,27 @@ public final class RocksDBFileModeBenchmark {
                     + format(rowsUpdated.mean())
                     + ","
                     + format(innerOperations.mean());
+        }
+
+        private Map<String, Object> toMap() {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("scenario", scenario);
+            result.put("runGroup", runGroup);
+            result.put("runCount", opsPerSecond.count());
+            result.put("opsPerSecond", opsPerSecond.toMap());
+            Map<String, Object> latencyMs = new LinkedHashMap<>();
+            latencyMs.put("p50Median", p50Ms.median());
+            latencyMs.put("p95Median", p95Ms.median());
+            latencyMs.put("p99Median", p99Ms.median());
+            result.put("latencyMs", latencyMs);
+            Map<String, Object> rows = new LinkedHashMap<>();
+            rows.put("scannedMean", rowsScanned.mean());
+            rows.put("returnedMean", rowsReturned.mean());
+            rows.put("updatedMean", rowsUpdated.mean());
+            result.put("rows", rows);
+            result.put("totalMsMean", totalMs.mean());
+            result.put("innerOperationsMean", innerOperations.mean());
+            return result;
         }
     }
 
@@ -1484,6 +1663,18 @@ public final class RocksDBFileModeBenchmark {
             Collections.sort(sorted);
             return sorted;
         }
+
+        private Map<String, Object> toMap() {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("mean", mean());
+            result.put("median", median());
+            result.put("p95", percentile(95));
+            result.put("p99", percentile(99));
+            result.put("min", min());
+            result.put("max", max());
+            result.put("stddev", stddev());
+            return result;
+        }
     }
 
     private static final class BenchmarkDataSet {
@@ -1498,13 +1689,30 @@ public final class RocksDBFileModeBenchmark {
         private static BenchmarkDataSet create(BenchmarkOptions options, int round) {
             List<GlobalSession> globals = new ArrayList<>(options.globalCount);
             Map<String, List<BranchSession>> branches = new LinkedHashMap<>();
-            long baseBeginTime =
-                    System.currentTimeMillis() - options.globalCount - round - Math.floorMod(options.seed, 1000L);
+            long now = System.currentTimeMillis();
+            long baseBeginTime = now - options.globalCount - round - Math.floorMod(options.seed, 1000L);
+            long expiredBaseBeginTime = now
+                    - SESSION_TIMEOUT_MILLIS
+                    - options.globalCount
+                    - round
+                    - Math.floorMod(options.seed, 1000L)
+                    - 1L;
             for (int i = 0; i < options.globalCount; i++) {
-                GlobalSession globalSession = globalSession(i, round, options.seed, baseBeginTime + i);
+                long beginTime;
+                if (options.expiredRatio > 0D) {
+                    long timeOffset = Math.floorMod(i, 1000);
+                    beginTime = options.isExpiredIndex(i)
+                            ? expiredBaseBeginTime - timeOffset
+                            : now + SESSION_TIMEOUT_MILLIS - timeOffset;
+                } else {
+                    beginTime = baseBeginTime + i;
+                }
+                GlobalSession globalSession =
+                        globalSession(i, round, options.seed, beginTime, options.statusForIndex(i));
                 globals.add(globalSession);
-                List<BranchSession> globalBranches = new ArrayList<>(options.branchPerGlobal);
-                for (int branchIndex = 0; branchIndex < options.branchPerGlobal; branchIndex++) {
+                int branchCount = options.branchCountForIndex(i);
+                List<BranchSession> globalBranches = new ArrayList<>(branchCount);
+                for (int branchIndex = 0; branchIndex < branchCount; branchIndex++) {
                     globalBranches.add(branchSession(globalSession, i, branchIndex, options.lockPerBranch));
                 }
                 branches.put(globalSession.getXid(), globalBranches);
@@ -1532,10 +1740,29 @@ public final class RocksDBFileModeBenchmark {
             return branches;
         }
 
+        private int totalBranchCount() {
+            int count = 0;
+            for (List<BranchSession> globalBranches : branchSessions.values()) {
+                count += globalBranches.size();
+            }
+            return count;
+        }
+
         private int countByStatus(GlobalStatus status) {
             int count = 0;
             for (GlobalSession globalSession : globalSessions) {
                 if (globalSession.getStatus() == status) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private int countByStatusAndOverTime(GlobalStatus status, long overTimeAliveMills) {
+            int count = 0;
+            long now = System.currentTimeMillis();
+            for (GlobalSession globalSession : globalSessions) {
+                if (globalSession.getStatus() == status && now - globalSession.getBeginTime() > overTimeAliveMills) {
                     count++;
                 }
             }
@@ -1554,10 +1781,11 @@ public final class RocksDBFileModeBenchmark {
             return branchSession;
         }
 
-        private static GlobalSession globalSession(int index, int round, long seed, long beginTime) {
+        private static GlobalSession globalSession(
+                int index, int round, long seed, long beginTime, GlobalStatus status) {
             GlobalSession globalSession = new GlobalSession(
                     "benchmark-app", "benchmark-group", "phase4-tx-" + seed + "-" + round + "-" + index, 60000);
-            globalSession.setStatus(STATUSES[index % STATUSES.length]);
+            globalSession.setStatus(status);
             globalSession.setBeginTime(beginTime);
             return globalSession;
         }
@@ -1773,6 +2001,26 @@ public final class RocksDBFileModeBenchmark {
         }
     }
 
+    private static final class StatusWeight {
+        private final GlobalStatus status;
+        private final int weight;
+
+        private StatusWeight(GlobalStatus status, int weight) {
+            this.status = status;
+            this.weight = weight;
+        }
+    }
+
+    private static final class IntWeight {
+        private final int value;
+        private final int weight;
+
+        private IntWeight(int value, int weight) {
+            this.value = value;
+            this.weight = weight;
+        }
+    }
+
     private static final class BenchmarkOptions {
         private final int globalCount;
         private final int branchPerGlobal;
@@ -1813,6 +2061,14 @@ public final class RocksDBFileModeBenchmark {
         private final Set<String> benchmarks;
         private final String compare;
         private final String tuningProfile;
+        private final String statusDistribution;
+        private final List<StatusWeight> parsedStatusDistribution;
+        private final double expiredRatio;
+        private final String lockWorkload;
+        private final Set<String> lockWorkloadOperations;
+        private final double lockConflictRatio;
+        private final String xidFanoutDistribution;
+        private final List<IntWeight> parsedXidFanoutDistribution;
 
         private BenchmarkOptions(
                 int globalCount,
@@ -1869,7 +2125,12 @@ public final class RocksDBFileModeBenchmark {
                     dbPath,
                     benchmarks,
                     compare,
-                    "baseline");
+                    "baseline",
+                    null,
+                    0D,
+                    "full",
+                    1D,
+                    null);
         }
 
         private BenchmarkOptions(
@@ -1911,7 +2172,12 @@ public final class RocksDBFileModeBenchmark {
                 String dbPath,
                 Set<String> benchmarks,
                 String compare,
-                String tuningProfile) {
+                String tuningProfile,
+                String statusDistribution,
+                double expiredRatio,
+                String lockWorkload,
+                double lockConflictRatio,
+                String xidFanoutDistribution) {
             this.globalCount = positive(globalCount, "globalCount");
             this.branchPerGlobal = nonNegative(branchPerGlobal, "branchPerGlobal");
             this.lockPerBranch = nonNegative(lockPerBranch, "lockPerBranch");
@@ -1952,6 +2218,15 @@ public final class RocksDBFileModeBenchmark {
             this.benchmarks = benchmarks;
             this.compare = compare;
             this.tuningProfile = StringUtils.isBlank(tuningProfile) ? "baseline" : tuningProfile.trim();
+            this.statusDistribution = normalizeNullable(statusDistribution);
+            this.parsedStatusDistribution = parseStatusDistribution(this.statusDistribution);
+            this.expiredRatio = ratio(expiredRatio, "expiredRatio");
+            this.lockWorkload = normalizeLockWorkload(lockWorkload);
+            this.lockWorkloadOperations = parseLockWorkload(this.lockWorkload);
+            this.lockConflictRatio = ratio(lockConflictRatio, "lockConflictRatio");
+            this.xidFanoutDistribution = normalizeNullable(xidFanoutDistribution);
+            this.parsedXidFanoutDistribution =
+                    parseIntDistribution(this.xidFanoutDistribution, "xidFanoutDistribution");
         }
 
         private static BenchmarkOptions parse(String[] args) {
@@ -2002,11 +2277,84 @@ public final class RocksDBFileModeBenchmark {
                     stringValue(values, "dbPath", null),
                     parseBenchmarks(stringValue(values, "benchmark", "all")),
                     compare,
-                    stringValue(values, "tuningProfile", "baseline"));
+                    stringValue(values, "tuningProfile", "baseline"),
+                    stringValue(values, "statusDistribution", null),
+                    ratioValue(values, "expiredRatio", 0D),
+                    stringValue(values, "lockWorkload", "full"),
+                    ratioValue(values, "lockConflictRatio", 1D),
+                    stringValue(values, "xidFanoutDistribution", null));
             if (options.compare == null) {
                 return options.withTuningProfile(options.tuningProfile);
             }
             return options;
+        }
+
+        private GlobalStatus statusForIndex(int index) {
+            if (parsedStatusDistribution.isEmpty()) {
+                return STATUSES[Math.floorMod(index, STATUSES.length)];
+            }
+            int totalWeight = 0;
+            for (StatusWeight statusWeight : parsedStatusDistribution) {
+                totalWeight += statusWeight.weight;
+            }
+            int slot = Math.floorMod(index, totalWeight);
+            int cumulative = 0;
+            for (StatusWeight statusWeight : parsedStatusDistribution) {
+                cumulative += statusWeight.weight;
+                if (slot < cumulative) {
+                    return statusWeight.status;
+                }
+            }
+            return parsedStatusDistribution.get(parsedStatusDistribution.size() - 1).status;
+        }
+
+        private int branchCountForIndex(int index) {
+            if (parsedXidFanoutDistribution.isEmpty()) {
+                return branchPerGlobal;
+            }
+            return weightedInt(parsedXidFanoutDistribution, index);
+        }
+
+        private boolean isExpiredIndex(int index) {
+            return includeByRatio(index, expiredRatio);
+        }
+
+        private boolean shouldRunLockConflict(int index) {
+            return includeByRatio(index, lockConflictRatio);
+        }
+
+        private boolean lockWorkloadIncludes(String operation) {
+            return lockWorkloadOperations.contains(normalizeLockOperation(operation));
+        }
+
+        private boolean includeByRatio(int index, double ratioValue) {
+            if (ratioValue <= 0D) {
+                return false;
+            }
+            if (ratioValue >= 1D) {
+                return true;
+            }
+            int selected = (int) Math.round(globalCount * ratioValue);
+            if (selected <= 0) {
+                return false;
+            }
+            return Math.floorMod(index, globalCount) < selected;
+        }
+
+        private static int weightedInt(List<IntWeight> weights, int index) {
+            int totalWeight = 0;
+            for (IntWeight weight : weights) {
+                totalWeight += weight.weight;
+            }
+            int slot = Math.floorMod(index, totalWeight);
+            int cumulative = 0;
+            for (IntWeight weight : weights) {
+                cumulative += weight.weight;
+                if (slot < cumulative) {
+                    return weight.value;
+                }
+            }
+            return weights.get(weights.size() - 1).value;
         }
 
         private BenchmarkOptions withAtLeastOneLock() {
@@ -2049,7 +2397,12 @@ public final class RocksDBFileModeBenchmark {
                     dbPath,
                     benchmarks,
                     compare,
-                    tuningProfile);
+                    tuningProfile,
+                    statusDistribution,
+                    expiredRatio,
+                    lockWorkload,
+                    lockConflictRatio,
+                    xidFanoutDistribution);
         }
 
         private BenchmarkOptions flipCompareOption() {
@@ -2097,7 +2450,12 @@ public final class RocksDBFileModeBenchmark {
                             dbPath,
                             benchmarks,
                             compare,
-                            tuningProfile);
+                            tuningProfile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution);
                 case "enableRangeDelete":
                     return new BenchmarkOptions(
                             globalCount,
@@ -2138,7 +2496,12 @@ public final class RocksDBFileModeBenchmark {
                             dbPath,
                             benchmarks,
                             compare,
-                            tuningProfile);
+                            tuningProfile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution);
                 case "blockCacheSize":
                     long flipped = blockCacheSize > 0 ? 0L : 128L * 1024 * 1024;
                     return new BenchmarkOptions(
@@ -2180,7 +2543,12 @@ public final class RocksDBFileModeBenchmark {
                             dbPath,
                             benchmarks,
                             compare,
-                            tuningProfile);
+                            tuningProfile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution);
                 case "tuningProfile":
                     return withTuningProfile(tuningProfile);
                 case "walSyncMode":
@@ -2301,7 +2669,12 @@ public final class RocksDBFileModeBenchmark {
                     dbPath,
                     benchmarks,
                     compare,
-                    profile);
+                    profile,
+                    statusDistribution,
+                    expiredRatio,
+                    lockWorkload,
+                    lockConflictRatio,
+                    xidFanoutDistribution);
         }
 
         private BenchmarkOptions withWalSyncMode(RocksDBWalSyncMode newWalSyncMode) {
@@ -2344,7 +2717,12 @@ public final class RocksDBFileModeBenchmark {
                     dbPath,
                     benchmarks,
                     compare,
-                    tuningProfile);
+                    tuningProfile,
+                    statusDistribution,
+                    expiredRatio,
+                    lockWorkload,
+                    lockConflictRatio,
+                    xidFanoutDistribution);
         }
 
         private BenchmarkOptions withRunLabel(String newRunLabel) {
@@ -2387,7 +2765,12 @@ public final class RocksDBFileModeBenchmark {
                     dbPath,
                     benchmarks,
                     compare,
-                    tuningProfile);
+                    tuningProfile,
+                    statusDistribution,
+                    expiredRatio,
+                    lockWorkload,
+                    lockConflictRatio,
+                    xidFanoutDistribution);
         }
 
         private List<String> comparisonRunLabels() {
@@ -2486,12 +2869,129 @@ public final class RocksDBFileModeBenchmark {
             return result;
         }
 
+        private static List<StatusWeight> parseStatusDistribution(String value) {
+            if (StringUtils.isBlank(value)) {
+                return Collections.emptyList();
+            }
+            List<StatusWeight> result = new ArrayList<>();
+            for (String item : value.split(",")) {
+                String trimmed = item.trim();
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                int separator = trimmed.indexOf(':');
+                if (separator < 0) {
+                    separator = trimmed.indexOf('=');
+                }
+                if (separator <= 0 || separator == trimmed.length() - 1) {
+                    throw new IllegalArgumentException("Invalid statusDistribution item:" + item);
+                }
+                GlobalStatus status =
+                        parseGlobalStatus(trimmed.substring(0, separator).trim());
+                int weight = positive(
+                        Integer.parseInt(trimmed.substring(separator + 1).trim()), "statusWeight");
+                result.add(new StatusWeight(status, weight));
+            }
+            if (result.isEmpty()) {
+                return Collections.emptyList();
+            }
+            return Collections.unmodifiableList(result);
+        }
+
+        private static List<IntWeight> parseIntDistribution(String value, String optionName) {
+            if (StringUtils.isBlank(value)) {
+                return Collections.emptyList();
+            }
+            List<IntWeight> result = new ArrayList<>();
+            for (String item : value.split(",")) {
+                String trimmed = item.trim();
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                int separator = trimmed.indexOf(':');
+                if (separator < 0) {
+                    separator = trimmed.indexOf('=');
+                }
+                if (separator <= 0 || separator == trimmed.length() - 1) {
+                    throw new IllegalArgumentException("Invalid " + optionName + " item:" + item);
+                }
+                int distributionValue = nonNegative(
+                        Integer.parseInt(trimmed.substring(0, separator).trim()), optionName + "Value");
+                int weight = positive(
+                        Integer.parseInt(trimmed.substring(separator + 1).trim()), optionName + "Weight");
+                result.add(new IntWeight(distributionValue, weight));
+            }
+            if (result.isEmpty()) {
+                return Collections.emptyList();
+            }
+            return Collections.unmodifiableList(result);
+        }
+
+        private static String normalizeLockWorkload(String value) {
+            if (StringUtils.isBlank(value)) {
+                return "full";
+            }
+            return value.trim().toLowerCase(Locale.ROOT).replace('-', '_');
+        }
+
+        private static Set<String> parseLockWorkload(String value) {
+            String normalized = normalizeLockWorkload(value);
+            Set<String> operations = new LinkedHashSet<>();
+            for (String item : normalized.split(",")) {
+                String operation = normalizeLockOperation(item);
+                if (operation.isEmpty()) {
+                    continue;
+                }
+                if ("full".equals(operation)) {
+                    operations.addAll(ALL_LOCK_WORKLOADS);
+                    continue;
+                }
+                if ("release".equals(operation)) {
+                    operations.add(LOCK_OP_RELEASE_BRANCH);
+                    operations.add(LOCK_OP_RELEASE_GLOBAL);
+                    continue;
+                }
+                if ("update".equals(operation)) {
+                    operations.add(LOCK_OP_UPDATE_STATUS);
+                    continue;
+                }
+                if (!ALL_LOCK_WORKLOADS.contains(operation)) {
+                    throw new IllegalArgumentException("Unsupported lockWorkload operation:" + item);
+                }
+                operations.add(operation);
+            }
+            if (operations.isEmpty()) {
+                operations.addAll(ALL_LOCK_WORKLOADS);
+            }
+            return Collections.unmodifiableSet(operations);
+        }
+
+        private static String normalizeLockOperation(String value) {
+            if (value == null) {
+                return "";
+            }
+            return value.trim().toLowerCase(Locale.ROOT).replace('-', '_');
+        }
+
+        private static GlobalStatus parseGlobalStatus(String value) {
+            for (GlobalStatus status : GlobalStatus.values()) {
+                if (status.name().equalsIgnoreCase(value)) {
+                    return status;
+                }
+            }
+            throw new IllegalArgumentException("Unsupported global status:" + value);
+        }
+
         private static int intValue(Map<String, String> values, String key, int defaultValue) {
             return Integer.parseInt(stringValue(values, key, Integer.toString(defaultValue)));
         }
 
         private static long longValue(Map<String, String> values, String key, long defaultValue) {
             return Long.parseLong(stringValue(values, key, Long.toString(defaultValue)));
+        }
+
+        private static double ratioValue(Map<String, String> values, String key, double defaultValue) {
+            return ratio(Double.parseDouble(stringValue(values, key, Double.toString(defaultValue))), key);
         }
 
         private static boolean booleanValue(Map<String, String> values, String key, boolean defaultValue) {
@@ -2551,6 +3051,13 @@ public final class RocksDBFileModeBenchmark {
         private static long nonNegative(long value, String name) {
             if (value < 0) {
                 throw new IllegalArgumentException(name + " must be non-negative");
+            }
+            return value;
+        }
+
+        private static double ratio(double value, String name) {
+            if (value < 0D || value > 1D) {
+                throw new IllegalArgumentException(name + " must be between 0 and 1");
             }
             return value;
         }
