@@ -167,10 +167,10 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
             boolean openedLastShutdownClean =
                     isCleanShutdown(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA));
-            boolean cleanShutdownMarkerUpdated = markCleanShutdown(
-                    openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions, false);
+            boolean dirtyShutdownMarkerUpdated = markDirtyShutdownDurably(
+                    openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
             openedWalSyncController = RocksDBWalSyncController.create(openedDb, config);
-            if (metadataUpdated || cleanShutdownMarkerUpdated) {
+            if (metadataUpdated && !dirtyShutdownMarkerUpdated) {
                 openedWalSyncController.afterWrite();
             }
             dbOptions = openedDbOptions;
@@ -760,8 +760,8 @@ public class RocksDBStoreEngine implements AutoCloseable {
             } catch (RuntimeException e) {
                 syncFailure = e;
                 try {
-                    markCleanShutdown(false);
-                } catch (RuntimeException markerFailure) {
+                    markDirtyShutdownDurably(db, handle(RocksDBColumnFamily.METADATA), writeOptions);
+                } catch (Exception markerFailure) {
                     syncFailure.addSuppressed(markerFailure);
                 }
             } finally {
@@ -855,6 +855,15 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
         db.put(metadataHandle, writeOptions, CLEAN_SHUTDOWN_KEY, expected);
         return true;
+    }
+
+    private static boolean markDirtyShutdownDurably(
+            RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions) throws RocksDBException {
+        if (markCleanShutdown(db, metadataHandle, writeOptions, false)) {
+            db.flushWal(true);
+            return true;
+        }
+        return false;
     }
 
     private static boolean isCleanShutdown(RocksDB db, ColumnFamilyHandle metadataHandle) throws RocksDBException {

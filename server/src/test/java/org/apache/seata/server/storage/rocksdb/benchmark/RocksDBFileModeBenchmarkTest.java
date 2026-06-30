@@ -22,7 +22,9 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 class RocksDBFileModeBenchmarkTest {
 
@@ -71,6 +73,96 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertTrue(header.contains("innerOperations"));
     }
 
+    @Test
+    void testSummaryHeaderIncludesRepeatAggregationColumns() throws Exception {
+        Field field = RocksDBFileModeBenchmark.class.getDeclaredField("SUMMARY_CSV_HEADER");
+        field.setAccessible(true);
+        String header = (String) field.get(null);
+
+        Assertions.assertTrue(header.contains("runGroup"));
+        Assertions.assertTrue(header.contains("runCount"));
+        Assertions.assertTrue(header.contains("opsPerSecondMean"));
+        Assertions.assertTrue(header.contains("opsPerSecondMedian"));
+        Assertions.assertTrue(header.contains("opsPerSecondP95"));
+        Assertions.assertTrue(header.contains("opsPerSecondP99"));
+        Assertions.assertTrue(header.contains("opsPerSecondStddev"));
+    }
+
+    @Test
+    void testParseOpsPerSecondUsesHeaderColumnAfterInterpretabilityFields() throws Exception {
+        String line = csvLine(Map.of("scenario", "query.status", "repeatRun", "A1", "opsPerSecond", "123.4"));
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("parseOpsPerSecond", List.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Double> actual = (Map<String, Double>) method.invoke(null, List.of(line));
+
+        Assertions.assertEquals(123.4D, actual.get("query.status"));
+    }
+
+    @Test
+    void testParseOpsPerSecondAggregatesAllRepeatRuns() throws Exception {
+        List<String> lines = List.of(
+                csvLine(Map.of("scenario", "query.status", "repeatRun", "A1", "opsPerSecond", "100.0")),
+                csvLine(Map.of("scenario", "query.status", "repeatRun", "A2", "opsPerSecond", "300.0")));
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("parseOpsPerSecond", List.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Double> actual = (Map<String, Double>) method.invoke(null, lines);
+
+        Assertions.assertEquals(200.0D, actual.get("query.status"));
+    }
+
+    @Test
+    void testSummarizeCsvLinesAggregatesRepeatStatistics() throws Exception {
+        List<String> lines = List.of(
+                csvLine(map(
+                        "scenario", "query.status",
+                        "repeatRun", "A1",
+                        "opsPerSecond", "100.0",
+                        "totalMs", "30.0",
+                        "p50Ms", "3.0",
+                        "p95Ms", "9.0",
+                        "p99Ms", "10.0",
+                        "rowsScanned", "10",
+                        "rowsReturned", "5",
+                        "rowsUpdated", "0",
+                        "innerOperations", "1")),
+                csvLine(map(
+                        "scenario", "query.status",
+                        "repeatRun", "A2",
+                        "opsPerSecond", "300.0",
+                        "totalMs", "10.0",
+                        "p50Ms", "1.0",
+                        "p95Ms", "4.0",
+                        "p99Ms", "5.0",
+                        "rowsScanned", "30",
+                        "rowsReturned", "15",
+                        "rowsUpdated", "2",
+                        "innerOperations", "3")));
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("summarizeCsvLines", List.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> actual = (List<String>) method.invoke(null, lines);
+
+        Assertions.assertEquals(1, actual.size());
+        Map<String, String> summary = parseSummaryLine(actual.get(0));
+        Assertions.assertEquals("query.status", summary.get("scenario"));
+        Assertions.assertEquals("A", summary.get("runGroup"));
+        Assertions.assertEquals("2", summary.get("runCount"));
+        Assertions.assertEquals("200.000", summary.get("opsPerSecondMean"));
+        Assertions.assertEquals("200.000", summary.get("opsPerSecondMedian"));
+        Assertions.assertEquals("300.000", summary.get("opsPerSecondP95"));
+        Assertions.assertEquals("300.000", summary.get("opsPerSecondP99"));
+        Assertions.assertEquals("100.000", summary.get("opsPerSecondStddev"));
+        Assertions.assertEquals("20.000", summary.get("rowsScannedMean"));
+        Assertions.assertEquals("10.000", summary.get("rowsReturnedMean"));
+        Assertions.assertEquals("1.000", summary.get("rowsUpdatedMean"));
+        Assertions.assertEquals("2.000", summary.get("innerOperationsMean"));
+    }
+
     private Object parseOptions(String... args) throws Exception {
         Class<?> optionsClass = Class.forName(RocksDBFileModeBenchmark.class.getName() + "$BenchmarkOptions");
         Method method = optionsClass.getDeclaredMethod("parse", String[].class);
@@ -88,5 +180,37 @@ class RocksDBFileModeBenchmarkTest {
         Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         return (String) field.get(target);
+    }
+
+    private String csvLine(Map<String, String> valuesByColumn) throws Exception {
+        Field field = RocksDBFileModeBenchmark.class.getDeclaredField("CSV_HEADER");
+        field.setAccessible(true);
+        String[] columns = ((String) field.get(null)).split(",");
+        Map<String, String> values = new LinkedHashMap<>(valuesByColumn);
+        String[] parts = new String[columns.length];
+        for (int i = 0; i < columns.length; i++) {
+            parts[i] = values.getOrDefault(columns[i], "");
+        }
+        return String.join(",", parts);
+    }
+
+    private Map<String, String> map(String... values) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (int i = 0; i < values.length; i += 2) {
+            result.put(values[i], values[i + 1]);
+        }
+        return result;
+    }
+
+    private Map<String, String> parseSummaryLine(String line) throws Exception {
+        Field field = RocksDBFileModeBenchmark.class.getDeclaredField("SUMMARY_CSV_HEADER");
+        field.setAccessible(true);
+        String[] columns = ((String) field.get(null)).split(",");
+        String[] values = line.split(",", -1);
+        Map<String, String> result = new LinkedHashMap<>();
+        for (int i = 0; i < columns.length; i++) {
+            result.put(columns[i], values[i]);
+        }
+        return result;
     }
 }
