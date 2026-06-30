@@ -81,6 +81,10 @@ public final class RocksDBFileModeBenchmark {
                     + "walSyncMode,walSyncIntervalMillis,walSyncWriteThreshold,walSyncCount,walSyncFailureCount,"
                     + "walSyncAvgMs,walSyncMaxMs,walUnsyncedWrites,walMaxUnsyncedWrites,walUnsyncedMs,"
                     + "walMaxUnsyncedMs,walLatestSequenceNumber,walLastSyncedSequenceNumber";
+    private static final String SUMMARY_CSV_HEADER =
+            "scenario,runGroup,runCount,opsPerSecondMean,opsPerSecondMedian,opsPerSecondP95,opsPerSecondP99,"
+                    + "opsPerSecondMin,opsPerSecondMax,opsPerSecondStddev,totalMsMean,p50MsMedian,p95MsMedian,"
+                    + "p99MsMedian,rowsScannedMean,rowsReturnedMean,rowsUpdatedMean,innerOperationsMean";
     private static final List<String> ALL_BENCHMARKS = Arrays.asList("write", "query", "lock", "cleanup", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
@@ -247,22 +251,110 @@ public final class RocksDBFileModeBenchmark {
         System.out.printf(Locale.ROOT, "B: %s%n", describeCompareOption(optionsB));
     }
 
-    private static Map<String, Double> parseOpsPerSecond(List<String> csvLines) {
-        Map<String, Double> result = new LinkedHashMap<>();
+    private static void emitSummary(List<String> csvLines) {
+        List<String> summaryLines = summarizeCsvLines(csvLines);
+        if (summaryLines.isEmpty()) {
+            return;
+        }
+        System.out.println();
+        log("=== REPEAT SUMMARY ===");
+        System.out.println(SUMMARY_CSV_HEADER);
+        for (String line : summaryLines) {
+            System.out.println(line);
+        }
+    }
+
+    private static List<String> summarizeCsvLines(List<String> csvLines) {
+        Map<String, BenchmarkSummary> summaries = new LinkedHashMap<>();
+        int scenarioIndex = csvColumnIndex("scenario");
+        int repeatRunIndex = csvColumnIndex("repeatRun");
+        int opsPerSecondIndex = csvColumnIndex("opsPerSecond");
+        int totalMsIndex = csvColumnIndex("totalMs");
+        int p50MsIndex = csvColumnIndex("p50Ms");
+        int p95MsIndex = csvColumnIndex("p95Ms");
+        int p99MsIndex = csvColumnIndex("p99Ms");
+        int rowsScannedIndex = csvColumnIndex("rowsScanned");
+        int rowsReturnedIndex = csvColumnIndex("rowsReturned");
+        int rowsUpdatedIndex = csvColumnIndex("rowsUpdated");
+        int innerOperationsIndex = csvColumnIndex("innerOperations");
+        int minColumns = max(
+                        scenarioIndex,
+                        repeatRunIndex,
+                        opsPerSecondIndex,
+                        totalMsIndex,
+                        p50MsIndex,
+                        p95MsIndex,
+                        p99MsIndex,
+                        rowsScannedIndex,
+                        rowsReturnedIndex,
+                        rowsUpdatedIndex,
+                        innerOperationsIndex)
+                + 1;
         for (String line : csvLines) {
             if (line.isEmpty() || line.startsWith("#")) {
                 continue;
             }
             String[] parts = line.split(",", -1);
-            if (parts.length < 12) {
+            if (parts.length < minColumns || "scenario".equals(parts[scenarioIndex])) {
+                continue;
+            }
+            String scenario = parts[scenarioIndex];
+            String runGroup = runGroup(parts[repeatRunIndex]);
+            String key = scenario + '\u0000' + runGroup;
+            BenchmarkSummary summary =
+                    summaries.computeIfAbsent(key, ignored -> new BenchmarkSummary(scenario, runGroup));
+            summary.add(
+                    doubleValue(parts[opsPerSecondIndex]),
+                    doubleValue(parts[totalMsIndex]),
+                    doubleValue(parts[p50MsIndex]),
+                    doubleValue(parts[p95MsIndex]),
+                    doubleValue(parts[p99MsIndex]),
+                    doubleValue(parts[rowsScannedIndex]),
+                    doubleValue(parts[rowsReturnedIndex]),
+                    doubleValue(parts[rowsUpdatedIndex]),
+                    doubleValue(parts[innerOperationsIndex]));
+        }
+        List<String> result = new ArrayList<>(summaries.size());
+        for (BenchmarkSummary summary : summaries.values()) {
+            result.add(summary.toCsvLine());
+        }
+        return result;
+    }
+
+    private static Map<String, Double> parseOpsPerSecond(List<String> csvLines) {
+        Map<String, NumericSeries> values = new LinkedHashMap<>();
+        int scenarioIndex = csvColumnIndex("scenario");
+        int opsPerSecondIndex = csvColumnIndex("opsPerSecond");
+        int minColumns = Math.max(scenarioIndex, opsPerSecondIndex) + 1;
+        for (String line : csvLines) {
+            if (line.isEmpty() || line.startsWith("#")) {
+                continue;
+            }
+            String[] parts = line.split(",", -1);
+            if (parts.length < minColumns || "scenario".equals(parts[scenarioIndex])) {
                 continue;
             }
             try {
-                result.put(parts[0], Double.parseDouble(parts[11]));
+                values.computeIfAbsent(parts[scenarioIndex], ignored -> new NumericSeries())
+                        .add(Double.parseDouble(parts[opsPerSecondIndex]));
             } catch (NumberFormatException ignored) {
             }
         }
+        Map<String, Double> result = new LinkedHashMap<>();
+        for (Map.Entry<String, NumericSeries> entry : values.entrySet()) {
+            result.put(entry.getKey(), entry.getValue().mean());
+        }
         return result;
+    }
+
+    private static int csvColumnIndex(String column) {
+        String[] columns = CSV_HEADER.split(",", -1);
+        for (int i = 0; i < columns.length; i++) {
+            if (column.equals(columns[i])) {
+                return i;
+            }
+        }
+        throw new IllegalArgumentException("CSV column not found:" + column);
     }
 
     private static String describeCompareOption(BenchmarkOptions options) {
@@ -310,10 +402,12 @@ public final class RocksDBFileModeBenchmark {
             runOnce(options, null);
             return;
         }
+        List<String> allCsv = new ArrayList<>();
         for (int repeatRun = 1; repeatRun <= options.repeatRuns; repeatRun++) {
             String runLabel = "R" + repeatRun;
-            runOnce(options.withRunLabel(runLabel), runLabel);
+            allCsv.addAll(runOnce(options.withRunLabel(runLabel), runLabel));
         }
+        emitSummary(allCsv);
     }
 
     private void runWithComparison(BenchmarkOptions baseOptions) throws Exception {
@@ -325,20 +419,23 @@ public final class RocksDBFileModeBenchmark {
         log("B: %s", describeCompareOption(optionsB));
         System.out.println();
 
-        List<String> csvA = null;
-        List<String> csvB = null;
+        List<String> csvA = new ArrayList<>();
+        List<String> csvB = new ArrayList<>();
+        List<String> allCsv = new ArrayList<>();
         for (String runLabel : baseOptions.comparisonRunLabels()) {
             BenchmarkOptions runOptions = runLabel.startsWith("A") ? optionsA : optionsB;
             List<String> csv = runOnce(runOptions.withRunLabel(runLabel), runLabel);
-            if (runLabel.startsWith("A") && csvA == null) {
-                csvA = csv;
+            allCsv.addAll(csv);
+            if (runLabel.startsWith("A")) {
+                csvA.addAll(csv);
             }
-            if (runLabel.startsWith("B") && csvB == null) {
-                csvB = csv;
+            if (runLabel.startsWith("B")) {
+                csvB.addAll(csv);
             }
             System.out.println();
         }
 
+        emitSummary(allCsv);
         emitComparison(csvA, csvB, optionsA, optionsB);
     }
 
@@ -1126,6 +1223,36 @@ public final class RocksDBFileModeBenchmark {
         return String.format(Locale.ROOT, "%.3f", value);
     }
 
+    private static int max(int... values) {
+        int result = Integer.MIN_VALUE;
+        for (int value : values) {
+            result = Math.max(result, value);
+        }
+        return result;
+    }
+
+    private static double doubleValue(String value) {
+        if (StringUtils.isBlank(value)) {
+            return 0D;
+        }
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException ignored) {
+            return 0D;
+        }
+    }
+
+    private static String runGroup(String runLabel) {
+        if (StringUtils.isBlank(runLabel)) {
+            return "all";
+        }
+        char first = Character.toUpperCase(runLabel.trim().charAt(0));
+        if (first == 'A' || first == 'B' || first == 'R') {
+            return Character.toString(first);
+        }
+        return runLabel.trim();
+    }
+
     private static void assertTrue(boolean value, String message) {
         if (!value) {
             throw new IllegalStateException(message);
@@ -1193,6 +1320,169 @@ public final class RocksDBFileModeBenchmark {
 
         private static RowMetrics scannedAndReturned(long rowsScanned, long rowsReturned) {
             return new RowMetrics(rowsScanned, rowsReturned, 0L, 1L);
+        }
+    }
+
+    private static final class BenchmarkSummary {
+        private final String scenario;
+        private final String runGroup;
+        private final NumericSeries opsPerSecond = new NumericSeries();
+        private final NumericSeries totalMs = new NumericSeries();
+        private final NumericSeries p50Ms = new NumericSeries();
+        private final NumericSeries p95Ms = new NumericSeries();
+        private final NumericSeries p99Ms = new NumericSeries();
+        private final NumericSeries rowsScanned = new NumericSeries();
+        private final NumericSeries rowsReturned = new NumericSeries();
+        private final NumericSeries rowsUpdated = new NumericSeries();
+        private final NumericSeries innerOperations = new NumericSeries();
+
+        private BenchmarkSummary(String scenario, String runGroup) {
+            this.scenario = scenario;
+            this.runGroup = runGroup;
+        }
+
+        private void add(
+                double opsPerSecondValue,
+                double totalMsValue,
+                double p50MsValue,
+                double p95MsValue,
+                double p99MsValue,
+                double rowsScannedValue,
+                double rowsReturnedValue,
+                double rowsUpdatedValue,
+                double innerOperationsValue) {
+            opsPerSecond.add(opsPerSecondValue);
+            totalMs.add(totalMsValue);
+            p50Ms.add(p50MsValue);
+            p95Ms.add(p95MsValue);
+            p99Ms.add(p99MsValue);
+            rowsScanned.add(rowsScannedValue);
+            rowsReturned.add(rowsReturnedValue);
+            rowsUpdated.add(rowsUpdatedValue);
+            innerOperations.add(innerOperationsValue);
+        }
+
+        private String toCsvLine() {
+            return scenario
+                    + ","
+                    + runGroup
+                    + ","
+                    + opsPerSecond.count()
+                    + ","
+                    + format(opsPerSecond.mean())
+                    + ","
+                    + format(opsPerSecond.median())
+                    + ","
+                    + format(opsPerSecond.percentile(95))
+                    + ","
+                    + format(opsPerSecond.percentile(99))
+                    + ","
+                    + format(opsPerSecond.min())
+                    + ","
+                    + format(opsPerSecond.max())
+                    + ","
+                    + format(opsPerSecond.stddev())
+                    + ","
+                    + format(totalMs.mean())
+                    + ","
+                    + format(p50Ms.median())
+                    + ","
+                    + format(p95Ms.median())
+                    + ","
+                    + format(p99Ms.median())
+                    + ","
+                    + format(rowsScanned.mean())
+                    + ","
+                    + format(rowsReturned.mean())
+                    + ","
+                    + format(rowsUpdated.mean())
+                    + ","
+                    + format(innerOperations.mean());
+        }
+    }
+
+    private static final class NumericSeries {
+        private final List<Double> values = new ArrayList<>();
+
+        private void add(double value) {
+            values.add(value);
+        }
+
+        private int count() {
+            return values.size();
+        }
+
+        private double mean() {
+            if (values.isEmpty()) {
+                return 0D;
+            }
+            double sum = 0D;
+            for (double value : values) {
+                sum += value;
+            }
+            return sum / values.size();
+        }
+
+        private double median() {
+            if (values.isEmpty()) {
+                return 0D;
+            }
+            List<Double> sorted = sortedValues();
+            int middle = sorted.size() / 2;
+            if (sorted.size() % 2 == 0) {
+                return (sorted.get(middle - 1) + sorted.get(middle)) / 2D;
+            }
+            return sorted.get(middle);
+        }
+
+        private double percentile(int percentile) {
+            if (values.isEmpty()) {
+                return 0D;
+            }
+            List<Double> sorted = sortedValues();
+            int index = (int) Math.ceil(sorted.size() * percentile / 100.0D) - 1;
+            return sorted.get(Math.max(0, Math.min(index, sorted.size() - 1)));
+        }
+
+        private double min() {
+            if (values.isEmpty()) {
+                return 0D;
+            }
+            double result = Double.MAX_VALUE;
+            for (double value : values) {
+                result = Math.min(result, value);
+            }
+            return result;
+        }
+
+        private double max() {
+            if (values.isEmpty()) {
+                return 0D;
+            }
+            double result = -Double.MAX_VALUE;
+            for (double value : values) {
+                result = Math.max(result, value);
+            }
+            return result;
+        }
+
+        private double stddev() {
+            if (values.isEmpty()) {
+                return 0D;
+            }
+            double mean = mean();
+            double sumSquares = 0D;
+            for (double value : values) {
+                double delta = value - mean;
+                sumSquares += delta * delta;
+            }
+            return Math.sqrt(sumSquares / values.size());
+        }
+
+        private List<Double> sortedValues() {
+            List<Double> sorted = new ArrayList<>(values);
+            Collections.sort(sorted);
+            return sorted;
         }
     }
 

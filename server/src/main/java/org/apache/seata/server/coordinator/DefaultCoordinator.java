@@ -69,6 +69,7 @@ import org.slf4j.MDC;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -178,6 +179,12 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
             .getInt(
                     org.apache.seata.common.ConfigurationKeys.RETRY_DEAD_THRESHOLD,
                     DefaultValues.DEFAULT_RETRY_DEAD_THRESHOLD);
+
+    protected static final int SESSION_BACKGROUND_TASK_QUERY_LIMIT = Math.max(
+            1,
+            CONFIG.getInt(
+                    ConfigurationKeys.SESSION_BACKGROUND_TASK_QUERY_LIMIT,
+                    DefaultValues.DEFAULT_SESSION_BACKGROUND_TASK_QUERY_LIMIT));
 
     private final ScheduledThreadPoolExecutor retryRollbacking =
             ThreadPoolExecutorFactory.newScheduledThreadPoolExecutor(RETRY_ROLLBACKING, 1);
@@ -449,10 +456,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
      * Handle retry rollbacking.
      */
     protected void handleRetryRollbacking() {
-        SessionCondition sessionCondition = new SessionCondition(retryRollbackingStatuses);
-        sessionCondition.setLazyLoadBranch(true);
-        Collection<GlobalSession> rollbackingSessions =
-                SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        List<GlobalSession> rollbackingSessions = findBackgroundSessions(retryRollbackingStatuses, true);
         if (CollectionUtils.isEmpty(rollbackingSessions)) {
             return;
         }
@@ -485,10 +489,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
      * Handle retry committing.
      */
     protected void handleRetryCommitting() {
-        SessionCondition retryCommittingSessionCondition = new SessionCondition(retryCommittingStatuses);
-        retryCommittingSessionCondition.setLazyLoadBranch(true);
-        Collection<GlobalSession> committingSessions =
-                SessionHolder.getRootSessionManager().findGlobalSessions(retryCommittingSessionCondition);
+        List<GlobalSession> committingSessions = findBackgroundSessions(retryCommittingStatuses, true);
         if (CollectionUtils.isEmpty(committingSessions)) {
             return;
         }
@@ -522,9 +523,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
      * Handle async committing.
      */
     protected void handleAsyncCommitting() {
-        SessionCondition sessionCondition = new SessionCondition(GlobalStatus.AsyncCommitting);
-        Collection<GlobalSession> asyncCommittingSessions =
-                SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        List<GlobalSession> asyncCommittingSessions = findBackgroundSessions(GlobalStatus.AsyncCommitting, false);
         if (CollectionUtils.isEmpty(asyncCommittingSessions)) {
             return;
         }
@@ -573,14 +572,48 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         return timeout >= ALWAYS_RETRY_BOUNDARY && now - beginTime > timeout;
     }
 
+    private List<GlobalSession> findBackgroundSessions(GlobalStatus status, boolean lazyLoadBranch) {
+        return findBackgroundSessions(new GlobalStatus[] {status}, lazyLoadBranch);
+    }
+
+    private List<GlobalSession> findBackgroundSessions(GlobalStatus[] statuses, boolean lazyLoadBranch) {
+        if (statuses == null || statuses.length == 0) {
+            return Collections.emptyList();
+        }
+        if (statuses.length == 1) {
+            return findBackgroundSessionsBySingleStatus(statuses[0], lazyLoadBranch);
+        }
+        List<GlobalSession> sessions = new ArrayList<>();
+        for (GlobalStatus status : statuses) {
+            sessions.addAll(findBackgroundSessionsBySingleStatus(status, lazyLoadBranch));
+        }
+        sessions.sort(Comparator.comparingLong(GlobalSession::getBeginTime));
+        return limitBackgroundSessions(sessions);
+    }
+
+    private List<GlobalSession> findBackgroundSessionsBySingleStatus(GlobalStatus status, boolean lazyLoadBranch) {
+        SessionCondition sessionCondition = new SessionCondition(status);
+        sessionCondition.setLazyLoadBranch(lazyLoadBranch);
+        sessionCondition.setLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        List<GlobalSession> sessions = SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        if (CollectionUtils.isEmpty(sessions)) {
+            return Collections.emptyList();
+        }
+        return limitBackgroundSessions(sessions);
+    }
+
+    private List<GlobalSession> limitBackgroundSessions(List<GlobalSession> sessions) {
+        if (sessions.size() <= SESSION_BACKGROUND_TASK_QUERY_LIMIT) {
+            return sessions;
+        }
+        return new ArrayList<>(sessions.subList(0, SESSION_BACKGROUND_TASK_QUERY_LIMIT));
+    }
+
     /**
      * Handle rollbacking by scheduled.
      */
     protected void handleRollbackingByScheduled() {
-        SessionCondition sessionCondition = new SessionCondition(rollbackingStatuses);
-        sessionCondition.setLazyLoadBranch(true);
-        List<GlobalSession> rollbackingSessions =
-                SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        List<GlobalSession> rollbackingSessions = findBackgroundSessions(rollbackingStatuses, true);
         if (CollectionUtils.isEmpty(rollbackingSessions)) {
             rollbackingSchedule(RETRY_DEAD_THRESHOLD);
             return;
@@ -639,10 +672,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
      * Handle committing by scheduled.
      */
     protected void handleCommittingByScheduled() {
-        SessionCondition sessionCondition = new SessionCondition(committingStatuses);
-        sessionCondition.setLazyLoadBranch(true);
-        List<GlobalSession> committingSessions =
-                SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        List<GlobalSession> committingSessions = findBackgroundSessions(committingStatuses, true);
         if (CollectionUtils.isEmpty(committingSessions)) {
             committingSchedule(RETRY_DEAD_THRESHOLD);
             return;
@@ -699,10 +729,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
      * Handle end status by scheduled.
      */
     protected void handleEndStatesByScheduled() {
-        SessionCondition sessionCondition = new SessionCondition(endStatuses);
-        sessionCondition.setLazyLoadBranch(true);
-        List<GlobalSession> endStatusSessions =
-                SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        List<GlobalSession> endStatusSessions = findBackgroundSessions(endStatuses, true);
         if (CollectionUtils.isEmpty(endStatusSessions)) {
             endSchedule(RETRY_DEAD_THRESHOLD);
             return;

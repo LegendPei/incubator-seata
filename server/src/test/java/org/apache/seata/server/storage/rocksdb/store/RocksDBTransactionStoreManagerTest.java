@@ -31,6 +31,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
 import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.junit.jupiter.api.AfterEach;
@@ -389,6 +390,115 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByStatusAndLimitUsesPagedIndexScan() throws Exception {
+        try (RocksDBStoreEngine engine = open("condition-status-limit-paged")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            CountingIndexManager indexManager = new CountingIndexManager(engine);
+            replaceIndexManager(storeManager, indexManager);
+            GlobalSession oldest = globalSession("tx-oldest-status-only", GlobalStatus.Begin);
+            oldest.setBeginTime(100L);
+            GlobalSession middle = globalSession("tx-middle-status-only", GlobalStatus.Begin);
+            middle.setBeginTime(200L);
+            GlobalSession newest = globalSession("tx-newest-status-only", GlobalStatus.Begin);
+            newest.setBeginTime(300L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, newest);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, oldest);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, middle);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(2);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(oldest.getXid(), actual.get(0).getXid());
+            Assertions.assertEquals(middle.getXid(), actual.get(1).getXid());
+            Assertions.assertEquals(0, indexManager.fullStatusScanCalls);
+            Assertions.assertTrue(indexManager.pagedStatusScanCalls > 0);
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesAndLimitUsesGlobalBeginTimeOrder() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-limit-order")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession firstStatusLate = globalSession("tx-first-status-late", GlobalStatus.Committed);
+            firstStatusLate.setBeginTime(300L);
+            GlobalSession secondStatusEarly = globalSession("tx-second-status-early", GlobalStatus.Rollbacked);
+            secondStatusEarly.setBeginTime(100L);
+            GlobalSession secondStatusMiddle = globalSession("tx-second-status-middle", GlobalStatus.Rollbacked);
+            secondStatusMiddle.setBeginTime(200L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, firstStatusLate);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, secondStatusEarly);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, secondStatusMiddle);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(2);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(secondStatusEarly.getXid(), actual.get(0).getXid());
+            Assertions.assertEquals(secondStatusMiddle.getXid(), actual.get(1).getXid());
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesIgnoresStaleStatusIndexForOrdering() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-stale-index-order")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committed = globalSession("tx-committed-valid-index", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            GlobalSession rollbacked = globalSession("tx-rollbacked-valid-index", GlobalStatus.Rollbacked);
+            rollbacked.setBeginTime(200L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbacked);
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Committed, 50L, rollbacked.getXid()),
+                    rollbacked.getXid().getBytes(StandardCharsets.UTF_8));
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(2);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(committed.getXid(), actual.get(0).getXid());
+            Assertions.assertEquals(rollbacked.getXid(), actual.get(1).getXid());
+        }
+    }
+
+    @Test
+    void testReadByStatusAndLimitIgnoresStaleBeginTimeIndexForOrdering() {
+        try (RocksDBStoreEngine engine = open("condition-status-stale-begin-time-index-order")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession early = globalSession("tx-committed-early-valid-index", GlobalStatus.Committed);
+            early.setBeginTime(100L);
+            GlobalSession late = globalSession("tx-committed-late-valid-index", GlobalStatus.Committed);
+            late.setBeginTime(300L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, early);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, late);
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Committed, 50L, late.getXid()),
+                    late.getXid().getBytes(StandardCharsets.UTF_8));
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(1);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, actual.size());
+            Assertions.assertEquals(early.getXid(), actual.get(0).getXid());
+        }
+    }
+
+    @Test
     void testReadByEmptySessionConditionScansAll() {
         try (RocksDBStoreEngine engine = open("condition-all")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -471,5 +581,34 @@ class RocksDBTransactionStoreManagerTest {
         Field mapField = SessionHolder.class.getDeclaredField("SESSION_MANAGER_MAP");
         mapField.setAccessible(true);
         mapField.set(null, originalSessionManagerMap);
+    }
+
+    private void replaceIndexManager(RocksDBTransactionStoreManager storeManager, RocksDBIndexManager indexManager)
+            throws Exception {
+        Field field = RocksDBTransactionStoreManager.class.getDeclaredField("indexManager");
+        field.setAccessible(true);
+        field.set(storeManager, indexManager);
+    }
+
+    private static final class CountingIndexManager extends RocksDBIndexManager {
+        private int fullStatusScanCalls;
+        private int pagedStatusScanCalls;
+
+        private CountingIndexManager(RocksDBStoreEngine storeEngine) {
+            super(storeEngine);
+        }
+
+        @Override
+        public List<String> scanXidsByStatus(GlobalStatus status) {
+            fullStatusScanCalls++;
+            return super.scanXidsByStatus(status);
+        }
+
+        @Override
+        public StatusScanResult scanXidsByStatus(
+                GlobalStatus status, long minBeginTimeInclusive, long maxBeginTimeInclusive, byte[] cursor, int limit) {
+            pagedStatusScanCalls++;
+            return super.scanXidsByStatus(status, minBeginTimeInclusive, maxBeginTimeInclusive, cursor, limit);
+        }
     }
 }

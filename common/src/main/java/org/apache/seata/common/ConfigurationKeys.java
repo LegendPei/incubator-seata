@@ -1143,6 +1143,11 @@ public interface ConfigurationKeys {
     String ENABLE_BRANCH_ASYNC_REMOVE = SERVER_PREFIX + SESSION_PREFIX + "enableBranchAsyncRemove";
 
     /**
+     * The constant SESSION_BACKGROUND_TASK_QUERY_LIMIT
+     */
+    String SESSION_BACKGROUND_TASK_QUERY_LIMIT = SERVER_PREFIX + SESSION_PREFIX + "backgroundTaskQueryLimit";
+
+    /**
      * The constant SERVER_RAFT.
      */
     String SERVER_RAFT = SERVER_PREFIX + "raft.";

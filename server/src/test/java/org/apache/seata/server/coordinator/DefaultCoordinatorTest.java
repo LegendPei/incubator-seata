@@ -55,7 +55,9 @@ import org.apache.seata.server.BaseSpringBootTest;
 import org.apache.seata.server.metrics.MetricsManager;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
+import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionManager;
 import org.apache.seata.server.util.StoreUtil;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -69,11 +71,18 @@ import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 import org.springframework.context.ApplicationContext;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
@@ -335,6 +344,30 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     @Test
     public void handleRetryCommittingNoSessionsTest() {
         defaultCoordinator.handleRetryCommitting();
+    }
+
+    @Test
+    public void retryBackgroundTasksSetSessionQueryLimit() {
+        List<SessionCondition> conditions = captureBackgroundSessionConditions(() -> {
+            defaultCoordinator.handleRetryRollbacking();
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleAsyncCommitting();
+        });
+
+        Assertions.assertEquals(5, conditions.size());
+        assertBackgroundSessionQueryConditions(conditions);
+    }
+
+    @Test
+    public void scheduledBackgroundTasksSetSessionQueryLimit() {
+        List<SessionCondition> conditions = captureBackgroundSessionConditions(() -> {
+            defaultCoordinator.handleRollbackingByScheduled();
+            defaultCoordinator.handleCommittingByScheduled();
+            defaultCoordinator.handleEndStatesByScheduled();
+        });
+
+        Assertions.assertEquals(6, conditions.size());
+        assertBackgroundSessionQueryConditions(conditions);
     }
 
     @Test
@@ -1271,6 +1304,45 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
             // Just verify the method exists by getting its reference
             defaultCoordinator.getClass().getMethod("destroy");
         });
+    }
+
+    private List<SessionCondition> captureBackgroundSessionConditions(Runnable action) {
+        SessionManager sessionManager = mock(SessionManager.class);
+        List<SessionCondition> conditions = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            conditions.add(invocation.getArgument(0));
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            try {
+                action.run();
+            } finally {
+                clearSyncProcessingQueue();
+            }
+        }
+        return conditions;
+    }
+
+    private void assertBackgroundSessionQueryConditions(List<SessionCondition> conditions) {
+        Assertions.assertFalse(conditions.isEmpty());
+        for (SessionCondition condition : conditions) {
+            Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, condition.getLimit());
+            Assertions.assertNotNull(condition.getStatuses());
+            Assertions.assertEquals(1, condition.getStatuses().length);
+        }
+    }
+
+    private void clearSyncProcessingQueue() {
+        try {
+            Field field = DefaultCoordinator.class.getDeclaredField("syncProcessing");
+            field.setAccessible(true);
+            ScheduledThreadPoolExecutor executor = (ScheduledThreadPoolExecutor) field.get(defaultCoordinator);
+            executor.getQueue().clear();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     public static class MockServerMessageSender implements RemotingServer {
