@@ -16,7 +16,7 @@
 - R1：新增 `RocksDBLockManager.cleanOrphanLocks(int limit)` / `cleanOrphanLocks(byte[] seekKey, int limit)` / `cleanOrphanLocksBatches(...)` / `RocksDBLocker.cleanOrphanLocks(...)` 的结构化结果，返回 cleaned/scanned/batches/limitReached/nextSeekKey；启动期 orphan lock cleanup 改为最多扫描 1024 条，并在上次 clean shutdown 时跳过启动清理，在 scan limitReached 时输出 warning，避免启动关键路径无界清理且可靠暴露剩余风险；打开 DB 时会读取上次 clean marker 后立即 durable sync dirty marker，正常 close 时写回 clean marker；维护任务可用 nextSeekKey 做 bounded 续扫。
 - R3：`RocksDBLocker.updateLockStatus` 和按 xid/branch release 改为按 `LOCK_BRANCH_INDEX` 分批扫描、分批 `WriteBatch`，并对已扫描到的 index key 做精确删除，避免一次性物化大 fanout 锁索引和 live prefix delete。
 - R5：`RocksDBMaintenanceService.createCheckpoint(path, flush=true)` 已在 checkpoint 前显式调用 `storeEngine.flush()`；`flush=false` 表示跳过显式 flush，但不承诺 RocksDB JNI 内部不会做自己的 checkpoint 行为。
-- R7：benchmark 增强了 tuning profile、WAL sync 对比、RocksDB 配置摘要和 WAL sync 统计输出；本轮新增 `queryIterationsPerRound`、`queryLimit`、`repeatRuns`、`compareOrder`，CSV 增加 repeat/order/query limit 与 `rowsScanned` / `rowsReturned` / `rowsUpdated` / `innerOperations` 解释性列，query status 场景已接入 `queryLimit`；A/B comparison 的 ops/s 解析已改为按 CSV header 定位列，避免新增解释性列后读错下标。
+- R7：benchmark 增强了 tuning profile、WAL sync 对比、RocksDB 配置摘要和 WAL sync 统计输出；本轮新增 `queryIterationsPerRound`、`queryLimit`、`repeatRuns`、`compareOrder`，CSV 增加 repeat/order/query limit 与 `rowsScanned` / `rowsReturned` / `rowsUpdated` / `innerOperations` 解释性列；query status 场景已接入 `queryLimit`，并可在 `expiredRatio > 0` 时走 overtime bounded scan；A/B comparison 的 ops/s 解析已改为按 CSV header 定位列，避免新增解释性列后读错下标；跨 repeat summary CSV/JSON、`statusDistribution`、`expiredRatio`、`lockWorkload`、`lockConflictRatio`、`xidFanoutDistribution` 已接入。
 - R8：新增 periodic WAL sync 配置、控制器、统计快照和 metrics。默认仍为 `none`，仅在 `flush-disk-mode=async` 且 `walSyncMode=periodic` 时启用；后台 periodic sync 仍按 best-effort 语义管理，`walSyncOnShutdown=true` 的 final sync 已改为 strict failure observable，且 `RocksDBStoreEngine.close()` 会在 final sync 失败时仍关闭 CF handle、DB、options、cache、statistics 后再抛出；关闭竞态下的调度拒绝不会改变已成功写入的返回语义；crash-injection 验证仍未完成。
 
 已验证的 focused suite：
@@ -25,14 +25,14 @@
 .\mvnw.cmd -pl server "-DskipITs=true" "-Dcheckstyle.skip=true" "-Dlicense.skip=true" "-Dspotless.check.skip=true" "-Dtest=RocksDBStoreEngineTest,RocksDBIndexManagerTest,RocksDBTransactionStoreManagerTest,RocksDBLockManagerTest,RocksDBFileModeBenchmarkTest" test
 ```
 
-结果：exit 0；67 tests, 0 failures, 0 errors, 0 skipped。测试日志仍有既有的 SpringBootConfigurationProvider / SLF4J 噪声。
+结果：exit 0；76 tests, 0 failures, 0 errors, 0 skipped。测试日志仍有既有的 SpringBootConfigurationProvider / SLF4J 噪声。
 
 ## 2026-06-30 当前状态快照
 
 - 架构主线：RocksDB file mode 的 CF 切分、主记录 + 二级索引模型、lock branch index、migration/index rebuild、maintenance/checkpoint/diagnostics 的方向仍然成立。
 - 恢复复杂度：R1/R2/R3 已把最危险的启动全量 orphan cleanup、status 全量扫描和大 fanout lock release/update 做了首轮 bounded/streaming 化；当前风险从“单次无界阻塞”下降为“后台任务调度、进度、限速、观测还未产品化”。
 - 可靠性：R8 的 periodic WAL sync 仍是默认关闭的 best-effort 能力；shutdown final sync 已 strict failure observable，close 失败后资源释放已补；R1 clean shutdown marker 已能区分 clean/dirty restart，且启动 dirty marker 已 durable sync，避免崩溃窗口误跳过 orphan cleanup。
-- benchmark：R7 已能输出 repeat/order/query limit、rows scanned/returned/updated、innerOperations 和 WAL sync 指标；A/B ops/s 解析已随 CSV header 对齐，跨 repeat summary CSV 已输出 mean/median/p95/p99/min/max/stddev。剩余不足是 summary JSON、statusDistribution/lockWorkload 配置和 rowsUpdated 精细口径还没有完成。
+- benchmark：R7 已能输出 repeat/order/query limit、rows scanned/returned/updated、innerOperations 和 WAL sync 指标；A/B ops/s 解析已随 CSV header 对齐，跨 repeat summary CSV/JSON 已输出 mean/median/p95/p99/min/max/stddev；`statusDistribution`、`expiredRatio`、`lockWorkload`、`lockConflictRatio`、`xidFanoutDistribution` 均可配置，lock acquire/conflict/update/release/orphan clean 已具备基于 lock key 数量的 rows scanned/updated 解释口径。剩余不足是 pointReads、iteratorNext、writeBatchBytes 等更底层 RocksDB 操作计数还没有完成。
 - 当前进入阶段：已从“验证可行性和修明显 O(N) 风险”进入“后台任务产品化 + 运维调参矩阵 + crash-injection/RPO 验证”的阶段。
 
 ## 剩余优化工作包
@@ -89,8 +89,12 @@
 - 主要任务：
   - 已完成：对 repeatRuns 输出跨 repeat summary CSV：mean、median、p95、p99、min、max、stddev。
   - 已完成：A/B comparison 不只比较第一组 A/B，而是比较所有 repeat 聚合结果。
-  - 增加 workload 参数：statusDistribution、expiredRatio、lockWorkload、lockConflictRatio、xidFanoutDistribution。
-  - 细化 rowsUpdated、pointReads、iteratorNext、writeBatchBytes 等解释性指标，至少先覆盖 query/status、orphan clean、lock release/update。
+  - 已完成：增加 `statusDistribution` workload 参数，可按权重生成不同 GlobalStatus 分布。
+  - 已完成：增加 `expiredRatio` workload 参数；`query.status` 在 `expiredRatio > 0` 时设置 `overTimeAliveMills`，用于覆盖 R2 overtime bounded scan 路径。
+  - 已完成：增加 `lockWorkload` / `lockConflictRatio` workload 参数，可按 acquire/conflict/update/release/clean-orphan 子场景拆分 lock benchmark，并控制冲突比例。
+  - 已完成：增加 `xidFanoutDistribution` workload 参数，可按权重生成不同 branch fanout，避免固定 `branchPerGlobal` 模型。
+  - 已完成：lock acquire/conflict/update/release/orphan clean 已输出基于 lock key 数量估算的 `rowsScanned` / `rowsUpdated`。
+  - 待完成：继续细化 pointReads、iteratorNext、writeBatchBytes 等更底层 RocksDB 操作计数。
   - 输出汇总 CSV/JSON，保留 raw CSV 方便复查。
 - 验收：
   - `repeatRuns >= 3` 时自动输出 raw + summary，两者 scenario/runLabel 可互相追踪。
@@ -496,8 +500,10 @@ Phase4 benchmark 已经有价值，但部分参数口径仍会影响优化结论
 - 已完成：`RocksDBStoreEngine.scanByPrefix` 可返回 `rowsScanned` / `rowsReturned` / `limitReached`，核心 scan API 已具备指标口径。
 - 已完成：benchmark 主流程 CSV 已输出 `queryIterationsPerRound`、`queryLimit`、`repeatRun`、`compareOrder`、`rowsScanned`、`rowsReturned`、`rowsUpdated`、`innerOperations`；compare 支持 `repeatRuns` 和 `compareOrder=AB|BA|ABBA` 等顺序控制。
 - 已完成：A/B comparison 的 `opsPerSecond` 解析改为 header-driven column lookup，新增解释性列后不会再误读 `repeatRun` 等旧下标位置。
-- 已完成：repeatRuns 会输出 summary CSV，按 scenario + runGroup 聚合 `opsPerSecond` 的 mean/median/p95/p99/min/max/stddev，并汇总 totalMs、latency 和 rows 指标；A/B comparison 使用所有 repeat 的聚合 ops/s。
-- 待完成：statusDistribution、lockWorkload、rowsUpdated 更细粒度口径和 summary JSON 仍需继续增强。
+- 已完成：repeatRuns 会输出 summary CSV/JSON，按 scenario + runGroup 聚合 `opsPerSecond` 的 mean/median/p95/p99/min/max/stddev，并汇总 totalMs、latency 和 rows 指标；A/B comparison 使用所有 repeat 的聚合 ops/s。
+- 已完成：新增 `statusDistribution`，支持 `Status:weight` / `Status=weight` 形式配置状态分布，避免 benchmark 固定 round-robin 状态模型。
+- 已完成：新增 `expiredRatio`、`lockWorkload`、`lockConflictRatio`、`xidFanoutDistribution`，覆盖 overtime status query、lock 子 workload、冲突比例和可变 branch fanout；lock 相关场景已补 `rowsScanned` / `rowsUpdated` 解释口径。
+- 待完成：pointReads、iteratorNext、writeBatchBytes 等更底层 RocksDB 操作计数仍需继续增强。
 
 ### 为什么
 
@@ -729,7 +735,7 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 1. R2：status + beginTime bounded scan 已完成 lower-bound/cursor API，`overTimeAliveMills` 读取路径已按 cursor 分页并支持 limit，status-only + limit 也已走 paged status index scan；retry/end-state 后台任务已显式传入 batch limit，coordinator 侧保留单状态 bounded fan-in，RocksDB store 层已支持多状态 k-way merge 并跳过 stale status/beginTime index；下一步补后台任务 scan stats/benchmark、timeoutCheck deadline-aware bounded scan 和跨轮 cursor merge。
 2. R1：orphan lock 清理已支持限量扫描、cleaned/scanned/batches/limitReached 结果、nextSeekKey 续扫入口和 bounded maintenance loop；启动路径已从全量清理改为 clean shutdown 跳过、非 clean shutdown 最多扫描 1024 条，启动 dirty marker 已 durable sync；下一步做异步任务调度、进度持久化、中断恢复、限速和告警。
 3. R8：periodic WAL sync 已落地为默认关闭的 best-effort 能力，shutdown final sync 已 strict failure observable，engine close 已补资源释放异常安全；下一步补 crash-injection、RPO 矩阵、backpressure/强可靠模式和生产告警策略。
-4. R7：benchmark 已增强 tuning/WAL sync 指标、repeat/order/query limit、rows 解释性列、header-driven A/B 解析和跨 repeat summary CSV；下一步补 statusDistribution、lockWorkload、rowsUpdated 精细统计和 summary JSON。
+4. R7：benchmark 已增强 tuning/WAL sync 指标、repeat/order/query limit、rows 解释性列、header-driven A/B 解析、跨 repeat summary CSV/JSON、statusDistribution、expiredRatio、lockWorkload、lockConflictRatio 和 xidFanoutDistribution；下一步补 pointReads、iteratorNext、writeBatchBytes 等更底层解释性指标。
 5. R3：锁 release/update 已 streaming/分批化；下一步补 fanout 指标、并发语义测试和 10K/100K fanout benchmark。
 6. R4/R6：加入全局内存预算、per-CF profile、RocksDB 内存/flush/compaction/stall 指标，并把 verify 拆成 sample/page/full 三档。
 7. R5/R9：checkpoint `flush` 语义和 range delete 使用边界进入运维文档收口；range delete 默认继续关闭，不进入锁热路径。
@@ -751,9 +757,10 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 - 待验证：1M 级数据下 timeout check 和 end-state scan 的耗时随过期数据量增长，而不是随总数据量增长。
 - 已具备基础能力：orphan clean 支持每批处理上限，仍需补大规模 benchmark。
 - 待验证：lock release/update 在 10K+ fanout 下仍能稳定输出 p95/p99。
-- 已完成：benchmark repeat summary 自动输出 mean/median/p95/p99/min/max/stddev，不再依赖人工拼多轮 CSV；summary JSON 仍待补。
-- 待完成：statusDistribution、lockWorkload、expiredRatio、xidFanoutDistribution 等 workload 参数可配置。
-- 已部分满足：RocksDB stats/WAL sync stats 已增强，仍需继续补 rows scanned/updated、pointReads、iteratorNext、writeBatchBytes 等 workload 级指标。
+- 已完成：benchmark repeat summary 自动输出 mean/median/p95/p99/min/max/stddev，并同时提供 CSV/JSON，不再依赖人工拼多轮 CSV。
+- 已完成：statusDistribution workload 参数可配置。
+- 已完成：lockWorkload、expiredRatio、lockConflictRatio、xidFanoutDistribution 等 workload 参数可配置。
+- 已部分满足：RocksDB stats/WAL sync stats 已增强，lock 场景已补 rows scanned/updated 解释口径；仍需继续补 pointReads、iteratorNext、writeBatchBytes 等更底层 workload 级指标。
 - 待完成：R4 的全局内存预算和 per-CF profile 有 RSS、memtable、block cache、table reader、flush/compaction/stall 指标支撑。
 
 ### 可靠性验收
