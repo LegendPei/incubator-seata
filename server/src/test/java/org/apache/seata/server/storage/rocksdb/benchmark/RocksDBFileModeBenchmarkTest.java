@@ -21,6 +21,7 @@ import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.session.GlobalSession;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
@@ -133,6 +134,76 @@ class RocksDBFileModeBenchmarkTest {
             ConfigurationCache.clear();
             restoreEnvironment(originalEnvironment);
             deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testQueryStatusBenchmarkUsesBoundedScanStats() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-query-stats-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=query",
+                    "--globalCount=6",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=RollbackRetrying:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--queryIterationsPerRound=1",
+                    "--queryLimit=2",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> statusLine = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("query.status,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("query.status row missing")));
+            Assertions.assertEquals("2", statusLine.get("rowsScanned"));
+            Assertions.assertEquals("2", statusLine.get("rowsReturned"));
+            Assertions.assertEquals("2", statusLine.get("pointReads"));
+            Assertions.assertEquals("2", statusLine.get("iteratorNext"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testExpiredRatioActiveSamplesStayOutsideLongBenchmarkWindow() throws Exception {
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions("--globalCount=10", "--branchPerGlobal=0", "--expiredRatio=0.5");
+            Object dataSet = createDataSet(options, 0);
+            long now = System.currentTimeMillis();
+            long sessionTimeoutMillis = staticLongField(RocksDBFileModeBenchmark.class, "SESSION_TIMEOUT_MILLIS");
+
+            List<GlobalSession> globalSessions = globalSessions(dataSet);
+            for (int i = 0; i < globalSessions.size(); i++) {
+                if (!isExpiredIndex(options, i)) {
+                    long activeWindowMillis = globalSessions.get(i).getBeginTime() - now;
+                    Assertions.assertTrue(
+                            activeWindowMillis > sessionTimeoutMillis * 5L,
+                            "active sample should stay outside a long benchmark overtime window");
+                }
+            }
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
         }
     }
 
@@ -346,6 +417,26 @@ class RocksDBFileModeBenchmarkTest {
         return result;
     }
 
+    private boolean isExpiredIndex(Object options, int index) throws Exception {
+        Method method = options.getClass().getDeclaredMethod("isExpiredIndex", int.class);
+        method.setAccessible(true);
+        return (Boolean) method.invoke(options, index);
+    }
+
+    private Object createDataSet(Object options, int round) throws Exception {
+        Class<?> dataSetClass = Class.forName(RocksDBFileModeBenchmark.class.getName() + "$BenchmarkDataSet");
+        Method method = dataSetClass.getDeclaredMethod("create", options.getClass(), int.class);
+        method.setAccessible(true);
+        return method.invoke(null, options, round);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<GlobalSession> globalSessions(Object dataSet) throws Exception {
+        Field field = dataSet.getClass().getDeclaredField("globalSessions");
+        field.setAccessible(true);
+        return (List<GlobalSession>) field.get(dataSet);
+    }
+
     private List<Integer> branchCountsForFirstIndexes(Object options, int count) throws Exception {
         Method method = options.getClass().getDeclaredMethod("branchCountForIndex", int.class);
         method.setAccessible(true);
@@ -374,6 +465,12 @@ class RocksDBFileModeBenchmarkTest {
         return (String) field.get(target);
     }
 
+    private long staticLongField(Class<?> target, String name) throws Exception {
+        Field field = target.getDeclaredField(name);
+        field.setAccessible(true);
+        return ((Number) field.get(null)).longValue();
+    }
+
     private String csvLine(Map<String, String> valuesByColumn) throws Exception {
         Field field = RocksDBFileModeBenchmark.class.getDeclaredField("CSV_HEADER");
         field.setAccessible(true);
@@ -384,6 +481,18 @@ class RocksDBFileModeBenchmarkTest {
             parts[i] = values.getOrDefault(columns[i], "");
         }
         return String.join(",", parts);
+    }
+
+    private Map<String, String> parseCsvLine(String line) throws Exception {
+        Field field = RocksDBFileModeBenchmark.class.getDeclaredField("CSV_HEADER");
+        field.setAccessible(true);
+        String[] columns = ((String) field.get(null)).split(",");
+        String[] values = line.split(",", -1);
+        Map<String, String> result = new LinkedHashMap<>();
+        for (int i = 0; i < columns.length; i++) {
+            result.put(columns[i], values[i]);
+        }
+        return result;
     }
 
     private Map<String, String> map(String... values) {
