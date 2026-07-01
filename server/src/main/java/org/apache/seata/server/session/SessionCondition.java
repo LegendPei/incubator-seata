@@ -35,6 +35,7 @@ public class SessionCondition {
     private boolean lazyLoadBranch;
     private byte[] statusScanCursor;
     private byte[] nextStatusScanCursor;
+    private SessionScanStats scanStats = SessionScanStats.empty();
 
     /**
      * Instantiates a new Session condition.
@@ -179,5 +180,17 @@ public class SessionCondition {
     public void setNextStatusScanCursor(byte[] nextStatusScanCursor) {
         this.nextStatusScanCursor =
                 nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
+    }
+
+    public SessionScanStats getScanStats() {
+        return scanStats;
+    }
+
+    public void setScanStats(SessionScanStats scanStats) {
+        this.scanStats = scanStats == null ? SessionScanStats.empty() : scanStats;
+    }
+
+    public void clearScanStats() {
+        this.scanStats = SessionScanStats.empty();
     }
 }

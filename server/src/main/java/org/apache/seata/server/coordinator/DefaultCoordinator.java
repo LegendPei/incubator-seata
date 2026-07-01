@@ -62,6 +62,7 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.session.SessionHelper;
 import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.store.StoreConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -644,12 +645,35 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         if (statusScanCursor != null) {
             sessionCondition.setStatusScanCursor(statusScanCursor);
         }
+        long startedAt = System.nanoTime();
         List<GlobalSession> sessions = SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        logBackgroundSessionScan(status, sessions, sessionCondition.getScanStats(), startedAt);
         updateBackgroundSessionCursor(status, sessionCondition);
         if (CollectionUtils.isEmpty(sessions)) {
             return Collections.emptyList();
         }
         return sessions;
+    }
+
+    private void logBackgroundSessionScan(
+            GlobalStatus status, List<GlobalSession> sessions, SessionScanStats scanStats, long startedAtNanos) {
+        if (!LOGGER.isDebugEnabled()) {
+            return;
+        }
+        SessionScanStats stats = scanStats == null ? SessionScanStats.empty() : scanStats;
+        int sessionsReturned = sessions == null ? 0 : sessions.size();
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+        LOGGER.debug(
+                "Background session scan status:{}, sessionsReturned:{}, rowsScanned:{}, rowsReturned:{}, "
+                        + "pointReads:{}, limitReached:{}, elapsedMillis:{}, storeElapsedMillis:{}",
+                status,
+                sessionsReturned,
+                stats.getRowsScanned(),
+                stats.getRowsReturned(),
+                stats.getPointReads(),
+                stats.isLimitReached(),
+                elapsedMillis,
+                stats.getElapsedMillis());
     }
 
     private void updateBackgroundSessionCursor(GlobalStatus status, SessionCondition sessionCondition) {
