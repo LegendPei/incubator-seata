@@ -359,6 +359,63 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     }
 
     @Test
+    public void retryBackgroundTasksCarryStatusScanCursorAcrossRounds() {
+        SessionManager sessionManager = mock(SessionManager.class);
+        byte[] nextCursor = new byte[] {1, 2, 3};
+        List<byte[]> cursors = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            cursors.add(condition.getStatusScanCursor());
+            if (cursors.size() == 1) {
+                condition.setNextStatusScanCursor(nextCursor);
+            }
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+        }
+
+        Assertions.assertEquals(3, cursors.size());
+        Assertions.assertNull(cursors.get(0));
+        Assertions.assertArrayEquals(nextCursor, cursors.get(1));
+        Assertions.assertNull(cursors.get(2));
+    }
+
+    @Test
+    public void multiStatusBackgroundScanKeepsEachStatusBoundedPage() throws Exception {
+        SessionManager sessionManager = mock(SessionManager.class);
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            GlobalStatus status = condition.getStatuses()[0];
+            if (status == GlobalStatus.TimeoutRollbacking) {
+                List<GlobalSession> sessions = new ArrayList<>();
+                for (int i = 0; i < DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT; i++) {
+                    sessions.add(backgroundSession("tx-timeout-rollbacking-" + i, status, i));
+                }
+                return sessions;
+            }
+            return Collections.singletonList(backgroundSession("tx-" + status.name(), status, 10000L));
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            List<GlobalSession> sessions = invokeFindBackgroundSessions(
+                    new GlobalStatus[] {
+                        GlobalStatus.TimeoutRollbacking,
+                        GlobalStatus.TimeoutRollbackRetrying,
+                        GlobalStatus.RollbackRetrying
+                    },
+                    true);
+
+            Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT + 2, sessions.size());
+        }
+    }
+
+    @Test
     public void scheduledBackgroundTasksSetSessionQueryLimit() {
         List<SessionCondition> conditions = captureBackgroundSessionConditions(() -> {
             defaultCoordinator.handleRollbackingByScheduled();
@@ -1323,6 +1380,23 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
             }
         }
         return conditions;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<GlobalSession> invokeFindBackgroundSessions(GlobalStatus[] statuses, boolean lazyLoadBranch)
+            throws Exception {
+        java.lang.reflect.Method method = DefaultCoordinator.class.getDeclaredMethod(
+                "findBackgroundSessions", GlobalStatus[].class, boolean.class);
+        method.setAccessible(true);
+        return (List<GlobalSession>) method.invoke(defaultCoordinator, statuses, lazyLoadBranch);
+    }
+
+    private GlobalSession backgroundSession(String xid, GlobalStatus status, long beginTime) {
+        GlobalSession session = mock(GlobalSession.class);
+        when(session.getXid()).thenReturn(xid);
+        when(session.getStatus()).thenReturn(status);
+        when(session.getBeginTime()).thenReturn(beginTime);
+        return session;
     }
 
     private void assertBackgroundSessionQueryConditions(List<SessionCondition> conditions) {

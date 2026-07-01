@@ -291,6 +291,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         SessionScanStatsAccumulator scanStats = new SessionScanStatsAccumulator();
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
+        sessionCondition.setNextStatusScanCursor(null);
         Long overTimeAliveMills = sessionCondition.getOverTimeAliveMills();
         Integer limit = sessionCondition.getLimit();
         Long maxBeginTime = overTimeAliveMills != null && overTimeAliveMills > 0
@@ -312,7 +313,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
         statusLoop:
         for (GlobalStatus status : sessionCondition.getStatuses()) {
-            byte[] cursor = null;
+            byte[] cursor = sessionCondition.getStatusScanCursor();
             do {
                 RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
                         status,
@@ -331,6 +332,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                                     entry.getBeginTime(),
                                     scanStats)
                             && isLimitReached(limit, result)) {
+                        sessionCondition.setNextStatusScanCursor(scanResult.getNextCursor());
                         break statusLoop;
                     }
                 }
