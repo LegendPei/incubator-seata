@@ -17,17 +17,26 @@
 package org.apache.seata.server.storage.rocksdb.benchmark;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.seata.common.Constants;
+import org.apache.seata.common.holder.ObjectHolder;
+import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.model.GlobalStatus;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.springframework.mock.env.MockEnvironment;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 class RocksDBFileModeBenchmarkTest {
 
@@ -92,6 +101,42 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testWriteBenchmarkSkipsFanoutZeroBranchRemove() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-fanout-zero-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=write",
+                    "--globalCount=4",
+                    "--branchPerGlobal=1",
+                    "--lockPerBranch=0",
+                    "--xidFanoutDistribution=0:1,1:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--batchSize=1",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Assertions.assertTrue(lines.stream().anyMatch(line -> line.startsWith("write.branch_remove,")));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
     void testCsvHeaderIncludesInterpretabilityColumns() throws Exception {
         Field field = RocksDBFileModeBenchmark.class.getDeclaredField("CSV_HEADER");
         field.setAccessible(true);
@@ -105,6 +150,9 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertTrue(header.contains("rowsReturned"));
         Assertions.assertTrue(header.contains("rowsUpdated"));
         Assertions.assertTrue(header.contains("innerOperations"));
+        Assertions.assertTrue(header.contains("pointReads"));
+        Assertions.assertTrue(header.contains("iteratorNext"));
+        Assertions.assertTrue(header.contains("writeBatchBytes"));
     }
 
     @Test
@@ -120,6 +168,9 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertTrue(header.contains("opsPerSecondP95"));
         Assertions.assertTrue(header.contains("opsPerSecondP99"));
         Assertions.assertTrue(header.contains("opsPerSecondStddev"));
+        Assertions.assertTrue(header.contains("pointReadsMean"));
+        Assertions.assertTrue(header.contains("iteratorNextMean"));
+        Assertions.assertTrue(header.contains("writeBatchBytesMean"));
     }
 
     @Test
@@ -162,6 +213,9 @@ class RocksDBFileModeBenchmarkTest {
                         "rowsScanned", "10",
                         "rowsReturned", "5",
                         "rowsUpdated", "0",
+                        "pointReads", "2",
+                        "iteratorNext", "10",
+                        "writeBatchBytes", "100",
                         "innerOperations", "1")),
                 csvLine(map(
                         "scenario", "query.status",
@@ -174,6 +228,9 @@ class RocksDBFileModeBenchmarkTest {
                         "rowsScanned", "30",
                         "rowsReturned", "15",
                         "rowsUpdated", "2",
+                        "pointReads", "6",
+                        "iteratorNext", "30",
+                        "writeBatchBytes", "300",
                         "innerOperations", "3")));
         Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("summarizeCsvLines", List.class);
         method.setAccessible(true);
@@ -194,6 +251,9 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals("20.000", summary.get("rowsScannedMean"));
         Assertions.assertEquals("10.000", summary.get("rowsReturnedMean"));
         Assertions.assertEquals("1.000", summary.get("rowsUpdatedMean"));
+        Assertions.assertEquals("4.000", summary.get("pointReadsMean"));
+        Assertions.assertEquals("20.000", summary.get("iteratorNextMean"));
+        Assertions.assertEquals("200.000", summary.get("writeBatchBytesMean"));
         Assertions.assertEquals("2.000", summary.get("innerOperationsMean"));
     }
 
@@ -211,6 +271,9 @@ class RocksDBFileModeBenchmarkTest {
                         "rowsScanned", "10",
                         "rowsReturned", "5",
                         "rowsUpdated", "0",
+                        "pointReads", "2",
+                        "iteratorNext", "10",
+                        "writeBatchBytes", "100",
                         "innerOperations", "1")),
                 csvLine(map(
                         "scenario", "query.status",
@@ -223,6 +286,9 @@ class RocksDBFileModeBenchmarkTest {
                         "rowsScanned", "30",
                         "rowsReturned", "15",
                         "rowsUpdated", "2",
+                        "pointReads", "6",
+                        "iteratorNext", "30",
+                        "writeBatchBytes", "300",
                         "innerOperations", "3")));
         Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("summarizeCsvLinesAsJson", List.class);
         method.setAccessible(true);
@@ -242,6 +308,10 @@ class RocksDBFileModeBenchmarkTest {
         Map<?, ?> rows = (Map<?, ?>) summary.get("rows");
         Assertions.assertEquals(20.0D, ((Number) rows.get("scannedMean")).doubleValue());
         Assertions.assertEquals(10.0D, ((Number) rows.get("returnedMean")).doubleValue());
+        Map<?, ?> operations = (Map<?, ?>) summary.get("operations");
+        Assertions.assertEquals(4.0D, ((Number) operations.get("pointReadsMean")).doubleValue());
+        Assertions.assertEquals(20.0D, ((Number) operations.get("iteratorNextMean")).doubleValue());
+        Assertions.assertEquals(200.0D, ((Number) operations.get("writeBatchBytesMean")).doubleValue());
         Assertions.assertEquals(Collections.singletonList("query.status:B"), root.get("summaryKeys"));
     }
 
@@ -334,5 +404,32 @@ class RocksDBFileModeBenchmarkTest {
             result.put(columns[i], values[i]);
         }
         return result;
+    }
+
+    private void deleteRecursively(Path path) throws Exception {
+        if (path == null || !Files.exists(path)) {
+            return;
+        }
+        try (Stream<Path> stream = Files.walk(path)) {
+            stream.sorted(Comparator.reverseOrder()).forEach(file -> {
+                try {
+                    Files.deleteIfExists(file);
+                } catch (Exception ignored) {
+                    // best-effort cleanup for benchmark temp files
+                }
+            });
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void restoreEnvironment(Object originalEnvironment) throws Exception {
+        Field field = ObjectHolder.class.getDeclaredField("OBJECT_MAP");
+        field.setAccessible(true);
+        Map<String, Object> objectMap = (Map<String, Object>) field.get(ObjectHolder.INSTANCE);
+        if (originalEnvironment == null) {
+            objectMap.remove(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        } else {
+            objectMap.put(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, originalEnvironment);
+        }
     }
 }
