@@ -30,6 +30,7 @@ public class SessionCondition {
     private Long overTimeAliveMills;
     private Integer limit;
     private boolean lazyLoadBranch;
+    private SessionScanStats scanStats = SessionScanStats.empty();
 
     /**
      * Instantiates a new Session condition.
@@ -148,5 +149,17 @@ public class SessionCondition {
 
     public void setLazyLoadBranch(boolean lazyLoadBranch) {
         this.lazyLoadBranch = lazyLoadBranch;
+    }
+
+    public SessionScanStats getScanStats() {
+        return scanStats;
+    }
+
+    public void setScanStats(SessionScanStats scanStats) {
+        this.scanStats = scanStats == null ? SessionScanStats.empty() : scanStats;
+    }
+
+    public void clearScanStats() {
+        this.scanStats = SessionScanStats.empty();
     }
 }

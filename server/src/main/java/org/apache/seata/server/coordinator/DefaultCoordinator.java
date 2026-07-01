@@ -62,6 +62,7 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.session.SessionHelper;
 import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.store.StoreConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -595,11 +596,34 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         SessionCondition sessionCondition = new SessionCondition(status);
         sessionCondition.setLazyLoadBranch(lazyLoadBranch);
         sessionCondition.setLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        long startedAt = System.nanoTime();
         List<GlobalSession> sessions = SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        logBackgroundSessionScan(status, sessions, sessionCondition.getScanStats(), startedAt);
         if (CollectionUtils.isEmpty(sessions)) {
             return Collections.emptyList();
         }
         return limitBackgroundSessions(sessions);
+    }
+
+    private void logBackgroundSessionScan(
+            GlobalStatus status, List<GlobalSession> sessions, SessionScanStats scanStats, long startedAtNanos) {
+        if (!LOGGER.isDebugEnabled()) {
+            return;
+        }
+        SessionScanStats stats = scanStats == null ? SessionScanStats.empty() : scanStats;
+        int sessionsReturned = sessions == null ? 0 : sessions.size();
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+        LOGGER.debug(
+                "Background session scan status:{}, sessionsReturned:{}, rowsScanned:{}, rowsReturned:{}, "
+                        + "pointReads:{}, limitReached:{}, elapsedMillis:{}, storeElapsedMillis:{}",
+                status,
+                sessionsReturned,
+                stats.getRowsScanned(),
+                stats.getRowsReturned(),
+                stats.getPointReads(),
+                stats.isLimitReached(),
+                elapsedMillis,
+                stats.getElapsedMillis());
     }
 
     private List<GlobalSession> limitBackgroundSessions(List<GlobalSession> sessions) {

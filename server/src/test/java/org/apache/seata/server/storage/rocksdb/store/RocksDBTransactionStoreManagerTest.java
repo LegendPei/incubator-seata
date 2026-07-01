@@ -27,6 +27,7 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.session.SessionHolder;
 import org.apache.seata.server.session.SessionManager;
+import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
@@ -416,6 +417,37 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertEquals(middle.getXid(), actual.get(1).getXid());
             Assertions.assertEquals(0, indexManager.fullStatusScanCalls);
             Assertions.assertTrue(indexManager.pagedStatusScanCalls > 0);
+        }
+    }
+
+    @Test
+    void testReadByStatusAndLimitRecordsScanStats() {
+        try (RocksDBStoreEngine engine = open("condition-status-limit-stats")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession oldest = globalSession("tx-stats-oldest", GlobalStatus.Begin);
+            oldest.setBeginTime(100L);
+            GlobalSession middle = globalSession("tx-stats-middle", GlobalStatus.Begin);
+            middle.setBeginTime(200L);
+            GlobalSession newest = globalSession("tx-stats-newest", GlobalStatus.Begin);
+            newest.setBeginTime(300L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, newest);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, oldest);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, middle);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(2);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+            SessionScanStats stats = condition.getScanStats();
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(2, stats.getRowsScanned());
+            Assertions.assertEquals(2, stats.getRowsReturned());
+            Assertions.assertEquals(2, stats.getPointReads());
+            Assertions.assertEquals(2, stats.getSessionsReturned());
+            Assertions.assertTrue(stats.isLimitReached());
+            Assertions.assertTrue(stats.getElapsedMillis() >= 0);
         }
     }
 

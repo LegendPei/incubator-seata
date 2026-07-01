@@ -12,7 +12,7 @@
 
 本轮按“先降低复杂度，再调 RocksDB 参数”的顺序，优先完成了几类高收益、低歧义的改动：
 
-- R2：新增 `RocksDBStoreEngine.scanByPrefix(seekKey, prefix, limit, filter, consumer)` 和 `ScanStats`；`RocksDBIndexManager.scanXidsByStatus(status, minBeginTimeInclusive, maxBeginTimeInclusive, cursor, limit)` 已使用 status | beginTime lower-bound seek 和 cursor 续扫；`RocksDBTransactionStoreManager.readByStatuses` 在 `overTimeAliveMills` 存在时按 cursor 分页读取，在 status-only 且 `SessionCondition.limit > 0` 时也走 paged status index scan，避免先全量扫描再在 JVM 层截断。
+- R2：新增 `RocksDBStoreEngine.scanByPrefix(seekKey, prefix, limit, filter, consumer)` 和 `ScanStats`；`RocksDBIndexManager.scanXidsByStatus(status, minBeginTimeInclusive, maxBeginTimeInclusive, cursor, limit)` 已使用 status | beginTime lower-bound seek 和 cursor 续扫；`RocksDBTransactionStoreManager.readByStatuses` 在 `overTimeAliveMills` 存在时按 cursor 分页读取，status-only 路径也统一走 paged status index scan，避免先全量扫描再在 JVM 层截断；RocksDB status 查询会通过 `SessionCondition.getScanStats()` 回填 rowsScanned/rowsReturned/pointReads/sessionsReturned/elapsedMillis/limitReached，coordinator 后台任务已接入 debug 级扫描统计日志。
 - R1：新增 `RocksDBLockManager.cleanOrphanLocks(int limit)` / `cleanOrphanLocks(byte[] seekKey, int limit)` / `cleanOrphanLocksBatches(...)` / `RocksDBLocker.cleanOrphanLocks(...)` 的结构化结果，返回 cleaned/scanned/batches/limitReached/nextSeekKey；启动期 orphan lock cleanup 改为最多扫描 1024 条，并在上次 clean shutdown 时跳过启动清理，在 scan limitReached 时输出 warning，避免启动关键路径无界清理且可靠暴露剩余风险；打开 DB 时会读取上次 clean marker 后立即 durable sync dirty marker，正常 close 时写回 clean marker；维护任务可用 nextSeekKey 做 bounded 续扫。
 - R3：`RocksDBLocker.updateLockStatus` 和按 xid/branch release 改为按 `LOCK_BRANCH_INDEX` 分批扫描、分批 `WriteBatch`，并对已扫描到的 index key 做精确删除，避免一次性物化大 fanout 锁索引和 live prefix delete。
 - R5：`RocksDBMaintenanceService.createCheckpoint(path, flush=true)` 已在 checkpoint 前显式调用 `storeEngine.flush()`；`flush=false` 表示跳过显式 flush，但不承诺 RocksDB JNI 内部不会做自己的 checkpoint 行为。
@@ -25,7 +25,7 @@
 .\mvnw.cmd -pl server "-DskipITs=true" "-Dcheckstyle.skip=true" "-Dlicense.skip=true" "-Dspotless.check.skip=true" "-Dtest=RocksDBStoreEngineTest,RocksDBIndexManagerTest,RocksDBTransactionStoreManagerTest,RocksDBLockManagerTest,RocksDBFileModeBenchmarkTest" test
 ```
 
-结果：exit 0；77 tests, 0 failures, 0 errors, 0 skipped。测试日志仍有既有的 SpringBootConfigurationProvider / SLF4J 噪声。
+结果：exit 0；78 tests, 0 failures, 0 errors, 0 skipped。测试日志仍有既有的 SpringBootConfigurationProvider / SLF4J 噪声。
 
 ## 2026-06-30 当前状态快照
 
@@ -42,14 +42,14 @@
 ### WP1：R2 后台任务 batch limit 和多状态有序读取
 
 - 目标：让 timeout / retry committing / async committing / end-state 后台任务的扫描成本与“本轮到期数量”绑定，而不是与状态全集绑定。
-- 当前进展：retry rollbacking、retry committing、async committing、rollbacking/committing scheduled、end-state scheduled 已显式传入 `SessionCondition.limit`；coordinator 侧多状态任务先拆成单状态 bounded 查询，再按 beginTime 排序并截断到本轮全局 batch；RocksDB store 层 `readByStatuses` 已支持多状态 k-way merge，按 beginTime 全局有序读取并校验 stale status/beginTime index，不再按 status 顺序拼接导致单个状态占满本轮结果。
+- 当前进展：retry rollbacking、retry committing、async committing、rollbacking/committing scheduled、end-state scheduled 已显式传入 `SessionCondition.limit`；coordinator 侧多状态任务先拆成单状态 bounded 查询，再按 beginTime 排序并截断到本轮全局 batch；RocksDB store 层 `readByStatuses` 已支持多状态 k-way merge，按 beginTime 全局有序读取并校验 stale status/beginTime index，不再按 status 顺序拼接导致单个状态占满本轮结果；status 查询已回填 `SessionCondition.getScanStats()`，后台任务会记录每个 status 子查询的 rowsScanned/rowsReturned/pointReads/limitReached 和耗时。
 - 主要任务：
   - 已完成：为 retry/end-state 相关后台路径显式传入 batch limit，新增 `server.session.backgroundTaskQueryLimit`，默认 1024。
   - 复用 `SessionCondition.limit` 和 status beginTime cursor scan，避免后台任务无界读取。
   - 暂不直接 limit `timeoutCheck`：该路径按每个事务自己的 timeout 判断，直接限定最早 beginTime 的前 N 条可能漏掉“后创建但 timeout 更短”的事务，需要单独的 deadline-aware 索引或算法。
-  - 记录每轮 rowsScanned、rowsReturned、pointReads、耗时和 limitReached。
+  - 已完成：RocksDB status 查询回填每轮 rowsScanned、rowsReturned、pointReads、sessionsReturned、耗时和 limitReached；coordinator 后台任务按 status 子查询输出 debug 级扫描统计。
   - 已完成：store 层多状态 k-way merge，复用每个 status 的 cursor/page scan，并按 beginTime/status/xid 稳定合并。
-  - 待完成：跨轮 cursor merge、后台任务 scan stats/耗时指标和专项 benchmark。
+  - 待完成：跨轮 cursor merge、专项 benchmark 对比和 timeoutCheck deadline-aware bounded scan。
 - 验收：
   - 构造 1M+ sessions、每轮只到期 1K/10K 的数据集，后台任务耗时主要随到期数量增长。
   - 单测覆盖 retry/end-state limit、空结果、相同 beginTime、多状态、分页续扫。
@@ -242,10 +242,11 @@ orphan lock 清理本质上是维护动作，不应该无条件成为启动关�
 - 已完成：`RocksDBStoreEngine.scanByPrefix` 支持 `seekKey`、`prefix`、`limit`、提前停止 filter 和 `ScanStats`。
 - 已完成：`RocksDBIndexManager.scanXidsByStatus(status, minBeginTimeInclusive, maxBeginTimeInclusive, cursor, limit)` 使用 lower-bound seek、upper-bound stop 和 cursor 续扫。
 - 已完成：`RocksDBTransactionStoreManager.readByStatuses` 在 `SessionCondition.overTimeAliveMills > 0` 时按 cursor 分页读取，并支持 `SessionCondition.limit` 限制本轮返回数量。
-- 已完成：status-only 且 `SessionCondition.limit > 0` 时也走 paged status index scan，不再先扫描状态全集再在 JVM 层截断；query benchmark 的 `queryLimit` 因此可以触发真实限量 scan 路径。
+- 已完成：status-only 路径统一走 paged status index scan，不再先扫描状态全集再在 JVM 层截断；query benchmark 的 `queryLimit` 因此可以触发真实限量 scan 路径。
 - 已完成：retry/end-state 相关后台任务已显式传入 `SessionCondition.limit`，并通过 coordinator 侧单状态 bounded fan-in 避免多状态任务被当前按 status 顺序拼接的实现占满本轮 batch。
 - 已完成：RocksDB store 层多状态 `readByStatuses` 已使用 k-way merge，按 beginTime 全局有序返回，并跳过 stale status/beginTime index 对排序和去重的影响。
-- 待完成：后台任务每轮 scan stats/耗时指标、专项 benchmark 对比、timeoutCheck 的 deadline-aware bounded scan，以及跨轮 cursor merge 还未全面接入。
+- 已完成：RocksDB status 查询会通过 `SessionCondition.getScanStats()` 回填 rowsScanned/rowsReturned/pointReads/sessionsReturned/elapsedMillis/limitReached，coordinator 后台任务已接入 debug 级扫描统计日志。
+- 待完成：专项 benchmark 对比、timeoutCheck 的 deadline-aware bounded scan，以及跨轮 cursor merge 还未全面接入。
 
 ### 为什么
 
@@ -734,7 +735,7 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 
 ## 推荐实施顺序
 
-1. R2：status + beginTime bounded scan 已完成 lower-bound/cursor API，`overTimeAliveMills` 读取路径已按 cursor 分页并支持 limit，status-only + limit 也已走 paged status index scan；retry/end-state 后台任务已显式传入 batch limit，coordinator 侧保留单状态 bounded fan-in，RocksDB store 层已支持多状态 k-way merge 并跳过 stale status/beginTime index；下一步补后台任务 scan stats/benchmark、timeoutCheck deadline-aware bounded scan 和跨轮 cursor merge。
+1. R2：status + beginTime bounded scan 已完成 lower-bound/cursor API，`overTimeAliveMills` 读取路径已按 cursor 分页并支持 limit，status-only 路径也已统一走 paged status index scan；retry/end-state 后台任务已显式传入 batch limit，coordinator 侧保留单状态 bounded fan-in，RocksDB store 层已支持多状态 k-way merge 并跳过 stale status/beginTime index，后台任务基础 scan stats/耗时日志已接入；下一步补专项 benchmark、timeoutCheck deadline-aware bounded scan 和跨轮 cursor merge。
 2. R1：orphan lock 清理已支持限量扫描、cleaned/scanned/batches/limitReached 结果、nextSeekKey 续扫入口和 bounded maintenance loop；启动路径已从全量清理改为 clean shutdown 跳过、非 clean shutdown 最多扫描 1024 条，启动 dirty marker 已 durable sync；下一步做异步任务调度、进度持久化、中断恢复、限速和告警。
 3. R8：periodic WAL sync 已落地为默认关闭的 best-effort 能力，shutdown final sync 已 strict failure observable，engine close 已补资源释放异常安全；下一步补 crash-injection、RPO 矩阵、backpressure/强可靠模式和生产告警策略。
 4. R7：benchmark 已增强 tuning/WAL sync 指标、repeat/order/query limit、rows 解释性列、benchmark 级 pointReads/iteratorNext/writeBatchBytes 估算、header-driven A/B 解析、跨 repeat summary CSV/JSON、statusDistribution、expiredRatio、lockWorkload、lockConflictRatio 和 xidFanoutDistribution；下一步补 RocksDB 内部 stats/perf snapshot 与 scenario 关联。
@@ -752,7 +753,7 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 - 已满足首批目标：启动路径不再默认执行不可控的全量 orphan lock 清理，而是限量 1024 条并告警。
 - 已满足首批目标：大 fanout lock release/update 不再一次性物化全部索引项。
 - 待完成：orphan cleanup、verify、end-state 清理等维护任务都有分页、进度、限速、中断恢复和失败语义。
-- 已完成：多状态 `readByStatuses` 已提供 store 层 k-way merge；待补跨轮 cursor merge 和后台任务 scan stats/耗时指标。
+- 已完成：多状态 `readByStatuses` 已提供 store 层 k-way merge；后台任务基础 scan stats/耗时日志已接入；待补跨轮 cursor merge、专项 benchmark 和 timeoutCheck deadline-aware bounded scan。
 
 ### 性能验收
 

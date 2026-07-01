@@ -23,6 +23,7 @@ import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBLocalLocks;
@@ -46,6 +47,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /**
  * RocksDB transaction store manager for file store engine.
@@ -178,6 +180,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         if (sessionCondition == null) {
             return Collections.emptyList();
         }
+        sessionCondition.clearScanStats();
         if (StringUtils.isNotBlank(sessionCondition.getXid())) {
             GlobalSession globalSession = readSession(sessionCondition.getXid(), !sessionCondition.isLazyLoadBranch());
             if (globalSession == null || !matches(globalSession, sessionCondition)) {
@@ -285,6 +288,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     }
 
     private List<GlobalSession> readByStatuses(SessionCondition sessionCondition) {
+        SessionScanStatsAccumulator scanStats = new SessionScanStatsAccumulator();
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
         Long overTimeAliveMills = sessionCondition.getOverTimeAliveMills();
@@ -293,21 +297,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 ? System.currentTimeMillis() - overTimeAliveMills
                 : null;
         if (sessionCondition.getStatuses().length > 1) {
-            return readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit);
+            result = readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit, scanStats);
+            sessionCondition.setScanStats(scanStats.toStats(result.size()));
+            return result;
         }
         statusLoop:
         for (GlobalStatus status : sessionCondition.getStatuses()) {
-            if (maxBeginTime == null) {
-                if (limit == null || limit <= 0) {
-                    for (String xid : indexManager.scanXidsByStatus(status)) {
-                        if (appendMatchingSession(sessionCondition, seenXids, result, xid, status, null)
-                                && isLimitReached(limit, result)) {
-                            break statusLoop;
-                        }
-                    }
-                    continue;
-                }
-            }
             byte[] cursor = null;
             do {
                 RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
@@ -316,6 +311,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                         maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime,
                         cursor,
                         nextPageLimit(limit, result));
+                scanStats.record(scanResult);
                 for (RocksDBIndexManager.StatusIndexEntry entry : scanResult.getEntries()) {
                     if (appendMatchingSession(
                                     sessionCondition,
@@ -323,7 +319,8 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                                     result,
                                     entry.getXid(),
                                     entry.getStatus(),
-                                    entry.getBeginTime())
+                                    entry.getBeginTime(),
+                                    scanStats)
                             && isLimitReached(limit, result)) {
                         break statusLoop;
                     }
@@ -331,11 +328,15 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 cursor = scanResult.getNextCursor();
             } while (cursor != null && !isLimitReached(limit, result));
         }
+        sessionCondition.setScanStats(scanStats.toStats(result.size()));
         return result;
     }
 
     private List<GlobalSession> readByStatusesWithKWayMerge(
-            SessionCondition sessionCondition, Long maxBeginTime, Integer limit) {
+            SessionCondition sessionCondition,
+            Long maxBeginTime,
+            Integer limit,
+            SessionScanStatsAccumulator scanStats) {
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
         PriorityQueue<StatusScanCursor> queue =
@@ -343,7 +344,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                         .thenComparingInt(StatusScanCursor::statusCode)
                         .thenComparing(StatusScanCursor::xid));
         for (GlobalStatus status : sessionCondition.getStatuses()) {
-            StatusScanCursor cursor = new StatusScanCursor(status, maxBeginTime, limit);
+            StatusScanCursor cursor = new StatusScanCursor(status, maxBeginTime, limit, scanStats);
             if (cursor.hasCurrent()) {
                 queue.offer(cursor);
             }
@@ -352,11 +353,17 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             StatusScanCursor cursor = queue.poll();
             RocksDBIndexManager.StatusIndexEntry entry = cursor.current();
             appendMatchingSession(
-                    sessionCondition, seenXids, result, entry.getXid(), entry.getStatus(), entry.getBeginTime());
+                    sessionCondition,
+                    seenXids,
+                    result,
+                    entry.getXid(),
+                    entry.getStatus(),
+                    entry.getBeginTime(),
+                    scanStats);
             if (isLimitReached(limit, result)) {
                 break;
             }
-            cursor.advance(limit, result);
+            cursor.advance(limit, result, scanStats);
             if (cursor.hasCurrent()) {
                 queue.offer(cursor);
             }
@@ -370,10 +377,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             List<GlobalSession> result,
             String xid,
             GlobalStatus indexStatus,
-            Long indexBeginTime) {
+            Long indexBeginTime,
+            SessionScanStatsAccumulator scanStats) {
         if (seenXids.contains(xid)) {
             return false;
         }
+        scanStats.recordPointRead();
         GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
         if (globalSession != null
                 && globalSession.getStatus() == indexStatus
@@ -405,10 +414,10 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         private int index;
         private boolean exhausted;
 
-        StatusScanCursor(GlobalStatus status, Long maxBeginTime, Integer limit) {
+        StatusScanCursor(GlobalStatus status, Long maxBeginTime, Integer limit, SessionScanStatsAccumulator scanStats) {
             this.status = status;
             this.maxBeginTime = maxBeginTime;
-            loadNextPage(limit, Collections.emptyList());
+            loadNextPage(limit, Collections.emptyList(), scanStats);
         }
 
         boolean hasCurrent() {
@@ -431,14 +440,14 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return current().getXid();
         }
 
-        void advance(Integer limit, List<GlobalSession> result) {
+        void advance(Integer limit, List<GlobalSession> result, SessionScanStatsAccumulator scanStats) {
             index++;
             if (index >= entries.size()) {
-                loadNextPage(limit, result);
+                loadNextPage(limit, result, scanStats);
             }
         }
 
-        private void loadNextPage(Integer limit, List<GlobalSession> result) {
+        private void loadNextPage(Integer limit, List<GlobalSession> result, SessionScanStatsAccumulator scanStats) {
             if (exhausted) {
                 entries = Collections.emptyList();
                 index = 0;
@@ -450,10 +459,35 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                     maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime,
                     nextCursor,
                     nextPageLimit(limit, result));
+            scanStats.record(scanResult);
             entries = scanResult.getEntries();
             index = 0;
             nextCursor = scanResult.getNextCursor();
             exhausted = nextCursor == null;
+        }
+    }
+
+    private static class SessionScanStatsAccumulator {
+        private final long startedAtNanos = System.nanoTime();
+        private long rowsScanned;
+        private long rowsReturned;
+        private long pointReads;
+        private boolean limitReached;
+
+        private void record(RocksDBIndexManager.StatusScanResult scanResult) {
+            rowsScanned += scanResult.getRowsScanned();
+            rowsReturned += scanResult.getRowsReturned();
+            limitReached |= scanResult.isLimitReached();
+        }
+
+        private void recordPointRead() {
+            pointReads++;
+        }
+
+        private SessionScanStats toStats(int sessionsReturned) {
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+            return new SessionScanStats(
+                    rowsScanned, rowsReturned, pointReads, sessionsReturned, elapsedMillis, limitReached);
         }
     }
 
