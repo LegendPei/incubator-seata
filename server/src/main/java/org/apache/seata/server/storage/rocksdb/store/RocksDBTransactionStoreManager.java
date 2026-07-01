@@ -297,6 +297,15 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         Long maxBeginTime = overTimeAliveMills != null && overTimeAliveMills > 0
                 ? System.currentTimeMillis() - overTimeAliveMills
                 : null;
+        if (!shouldUseBoundedStatusScan(sessionCondition, maxBeginTime, limit, scanBudget)) {
+            for (GlobalStatus status : sessionCondition.getStatuses()) {
+                indexManager.scanXidsByStatus(
+                        status,
+                        xid -> appendMatchingSession(sessionCondition, seenXids, result, xid, status, null, scanStats));
+            }
+            sessionCondition.setScanStats(scanStats.toStats(result.size()));
+            return result;
+        }
         if (sessionCondition.getStatuses().length > 1) {
             result = readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit, scanBudget, scanStats);
             sessionCondition.setScanStats(scanStats.toStats(result.size()));
@@ -399,6 +408,14 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return true;
         }
         return false;
+    }
+
+    private boolean shouldUseBoundedStatusScan(
+            SessionCondition sessionCondition, Long maxBeginTime, Integer limit, StatusScanBudget scanBudget) {
+        return maxBeginTime != null
+                || limit != null && limit > 0
+                || scanBudget.isBounded()
+                || sessionCondition.getStatusScanCursor() != null;
     }
 
     private int nextPageLimit(Integer limit, List<GlobalSession> result) {
