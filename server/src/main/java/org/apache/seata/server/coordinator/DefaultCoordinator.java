@@ -69,6 +69,7 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -76,6 +77,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -216,6 +218,8 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     private final GlobalStatus[] endStatuses = new GlobalStatus[] {
         GlobalStatus.Rollbacked, GlobalStatus.TimeoutRollbacked, GlobalStatus.Committed, GlobalStatus.Finished
     };
+
+    private final Map<GlobalStatus, byte[]> backgroundSessionStatusCursors = new ConcurrentHashMap<>();
 
     private final ThreadPoolExecutor branchRemoveExecutor;
 
@@ -589,20 +593,34 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
             sessions.addAll(findBackgroundSessionsBySingleStatus(status, lazyLoadBranch));
         }
         sessions.sort(Comparator.comparingLong(GlobalSession::getBeginTime));
-        return limitBackgroundSessions(sessions);
+        return sessions;
     }
 
     private List<GlobalSession> findBackgroundSessionsBySingleStatus(GlobalStatus status, boolean lazyLoadBranch) {
         SessionCondition sessionCondition = new SessionCondition(status);
         sessionCondition.setLazyLoadBranch(lazyLoadBranch);
         sessionCondition.setLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        byte[] statusScanCursor = backgroundSessionStatusCursors.get(status);
+        if (statusScanCursor != null) {
+            sessionCondition.setStatusScanCursor(statusScanCursor);
+        }
         long startedAt = System.nanoTime();
         List<GlobalSession> sessions = SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        updateBackgroundSessionCursor(status, sessionCondition);
         logBackgroundSessionScan(status, sessions, sessionCondition.getScanStats(), startedAt);
         if (CollectionUtils.isEmpty(sessions)) {
             return Collections.emptyList();
         }
         return limitBackgroundSessions(sessions);
+    }
+
+    private void updateBackgroundSessionCursor(GlobalStatus status, SessionCondition sessionCondition) {
+        byte[] nextStatusScanCursor = sessionCondition.getNextStatusScanCursor();
+        if (nextStatusScanCursor == null) {
+            backgroundSessionStatusCursors.remove(status);
+            return;
+        }
+        backgroundSessionStatusCursors.put(status, Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length));
     }
 
     private void logBackgroundSessionScan(

@@ -18,6 +18,8 @@ package org.apache.seata.server.session;
 
 import org.apache.seata.core.model.GlobalStatus;
 
+import java.util.Arrays;
+
 /**
  * The type Session condition.
  *
@@ -30,6 +32,8 @@ public class SessionCondition {
     private Long overTimeAliveMills;
     private Integer limit;
     private boolean lazyLoadBranch;
+    private byte[] statusScanCursor;
+    private byte[] nextStatusScanCursor;
     private SessionScanStats scanStats = SessionScanStats.empty();
 
     /**
@@ -149,6 +153,24 @@ public class SessionCondition {
 
     public void setLazyLoadBranch(boolean lazyLoadBranch) {
         this.lazyLoadBranch = lazyLoadBranch;
+    }
+
+    public byte[] getStatusScanCursor() {
+        return statusScanCursor == null ? null : Arrays.copyOf(statusScanCursor, statusScanCursor.length);
+    }
+
+    public void setStatusScanCursor(byte[] statusScanCursor) {
+        this.statusScanCursor =
+                statusScanCursor == null ? null : Arrays.copyOf(statusScanCursor, statusScanCursor.length);
+    }
+
+    public byte[] getNextStatusScanCursor() {
+        return nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
+    }
+
+    public void setNextStatusScanCursor(byte[] nextStatusScanCursor) {
+        this.nextStatusScanCursor =
+                nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
     }
 
     public SessionScanStats getScanStats() {

@@ -475,6 +475,43 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByStatusAndLimitHonorsScanCursor() {
+        try (RocksDBStoreEngine engine = open("condition-status-limit-cursor")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession oldest = globalSession("tx-cursor-oldest", GlobalStatus.Begin);
+            oldest.setBeginTime(100L);
+            GlobalSession middle = globalSession("tx-cursor-middle", GlobalStatus.Begin);
+            middle.setBeginTime(200L);
+            GlobalSession newest = globalSession("tx-cursor-newest", GlobalStatus.Begin);
+            newest.setBeginTime(300L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, newest);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, oldest);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, middle);
+
+            SessionCondition firstPage = new SessionCondition(GlobalStatus.Begin);
+            firstPage.setLazyLoadBranch(true);
+            firstPage.setLimit(2);
+            List<GlobalSession> firstActual = storeManager.readSession(firstPage);
+
+            Assertions.assertEquals(2, firstActual.size());
+            Assertions.assertEquals(oldest.getXid(), firstActual.get(0).getXid());
+            Assertions.assertEquals(middle.getXid(), firstActual.get(1).getXid());
+            Assertions.assertNotNull(firstPage.getNextStatusScanCursor());
+
+            SessionCondition secondPage = new SessionCondition(GlobalStatus.Begin);
+            secondPage.setLazyLoadBranch(true);
+            secondPage.setLimit(2);
+            secondPage.setStatusScanCursor(firstPage.getNextStatusScanCursor());
+            List<GlobalSession> secondActual = storeManager.readSession(secondPage);
+
+            Assertions.assertEquals(1, secondActual.size());
+            Assertions.assertEquals(newest.getXid(), secondActual.get(0).getXid());
+            Assertions.assertNull(secondPage.getNextStatusScanCursor());
+        }
+    }
+
+    @Test
     void testReadByMultipleStatusesWithoutLimitUsesSingleIteratorScan() throws Exception {
         try (RocksDBStoreEngine engine = open("condition-multi-status-unlimited-fast")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
