@@ -47,6 +47,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 class RocksDBTransactionStoreManagerTest {
 
@@ -421,6 +422,28 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByStatusWithoutLimitUsesSingleIteratorScan() throws Exception {
+        try (RocksDBStoreEngine engine = open("condition-status-unlimited-fast")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            CountingIndexManager indexManager = new CountingIndexManager(engine);
+            replaceIndexManager(storeManager, indexManager);
+            GlobalSession first = globalSession("tx-status-unlimited-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("tx-status-unlimited-second", GlobalStatus.Begin);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setLazyLoadBranch(true);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(1, indexManager.fullStatusScanCalls);
+            Assertions.assertEquals(0, indexManager.pagedStatusScanCalls);
+        }
+    }
+
+    @Test
     void testReadByStatusAndLimitRecordsScanStats() {
         try (RocksDBStoreEngine engine = open("condition-status-limit-stats")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -448,6 +471,28 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertEquals(2, stats.getSessionsReturned());
             Assertions.assertTrue(stats.isLimitReached());
             Assertions.assertTrue(stats.getElapsedMillis() >= 0);
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesWithoutLimitUsesSingleIteratorScan() throws Exception {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-unlimited-fast")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            CountingIndexManager indexManager = new CountingIndexManager(engine);
+            replaceIndexManager(storeManager, indexManager);
+            GlobalSession committed = globalSession("tx-multi-unlimited-committed", GlobalStatus.Committed);
+            GlobalSession rollbacked = globalSession("tx-multi-unlimited-rollbacked", GlobalStatus.Rollbacked);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbacked);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            condition.setLazyLoadBranch(true);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(2, actual.size());
+            Assertions.assertEquals(2, indexManager.fullStatusScanCalls);
+            Assertions.assertEquals(0, indexManager.pagedStatusScanCalls);
         }
     }
 
@@ -628,6 +673,12 @@ class RocksDBTransactionStoreManagerTest {
 
         private CountingIndexManager(RocksDBStoreEngine storeEngine) {
             super(storeEngine);
+        }
+
+        @Override
+        public void scanXidsByStatus(GlobalStatus status, Consumer<String> consumer) {
+            fullStatusScanCalls++;
+            super.scanXidsByStatus(status, consumer);
         }
 
         @Override
