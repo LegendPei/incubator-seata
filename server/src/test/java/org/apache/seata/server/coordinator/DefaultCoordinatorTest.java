@@ -363,6 +363,33 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     }
 
     @Test
+    public void retryBackgroundTasksCarryStatusScanCursorAcrossRounds() {
+        SessionManager sessionManager = mock(SessionManager.class);
+        byte[] nextCursor = new byte[] {1, 2, 3};
+        List<byte[]> cursors = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            cursors.add(condition.getStatusScanCursor());
+            if (cursors.size() == 1) {
+                condition.setNextStatusScanCursor(nextCursor);
+            }
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+        }
+
+        Assertions.assertEquals(3, cursors.size());
+        Assertions.assertNull(cursors.get(0));
+        Assertions.assertArrayEquals(nextCursor, cursors.get(1));
+        Assertions.assertNull(cursors.get(2));
+    }
+
+    @Test
     public void retryBackgroundScanReachesSession1025AfterFullFailingPage() throws Exception {
         int firstPageSize = 1024;
         Assertions.assertEquals(firstPageSize, DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT);
