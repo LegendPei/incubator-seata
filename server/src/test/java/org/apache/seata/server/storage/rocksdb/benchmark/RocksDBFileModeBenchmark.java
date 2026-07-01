@@ -29,6 +29,7 @@ import org.apache.seata.core.model.LockStatus;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
@@ -102,6 +103,7 @@ public final class RocksDBFileModeBenchmark {
     };
     private static final GlobalStatus TARGET_STATUS = GlobalStatus.RollbackRetrying;
     private static final int SESSION_TIMEOUT_MILLIS = 60000;
+    private static final long ACTIVE_BENCHMARK_WINDOW_MULTIPLIER = 10L;
     private static final String LOCK_OP_ACQUIRE = "acquire";
     private static final String LOCK_OP_CONFLICT = "conflict";
     private static final String LOCK_OP_UPDATE_STATUS = "update_status";
@@ -690,7 +692,7 @@ public final class RocksDBFileModeBenchmark {
                     List<GlobalSession> actual = storeManager.readSession(condition);
                     assertEquals(expectedLimitedStatusCount, actual.size(), "status query size");
                     sinkCount = actual.size();
-                    return RowMetrics.scannedAndReturned(actual.size(), actual.size());
+                    return statusQueryMetrics(condition, actual.size());
                 });
                 measure(beginSortedStats, round, options, () -> {
                     List<GlobalSession> actual = storeManager.readSortByTimeoutBeginSessions(false);
@@ -723,6 +725,19 @@ public final class RocksDBFileModeBenchmark {
         emit("query.begin_sorted", options, beginSortedStats, footprint, csvLines);
         emit("query.full_scan_filter", options, fullScanStats, footprint, csvLines);
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
+    }
+
+    private static RowMetrics statusQueryMetrics(SessionCondition condition, int returnedEstimate) {
+        if (isBoundedStatusQuery(condition)) {
+            return RowMetrics.fromScanStats(condition.getScanStats(), returnedEstimate);
+        }
+        return RowMetrics.scannedAndReturned(returnedEstimate, returnedEstimate);
+    }
+
+    private static boolean isBoundedStatusQuery(SessionCondition condition) {
+        Long overTimeAliveMills = condition.getOverTimeAliveMills();
+        Integer limit = condition.getLimit();
+        return (overTimeAliveMills != null && overTimeAliveMills > 0) || (limit != null && limit > 0);
     }
 
     private void runLockBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
@@ -1671,6 +1686,20 @@ public final class RocksDBFileModeBenchmark {
             return new RowMetrics(rowsScanned, rowsReturned, 0L, 0L, rowsScanned, 0L, 1L);
         }
 
+        private static RowMetrics fromScanStats(SessionScanStats scanStats, long returnedEstimate) {
+            if (scanStats == null) {
+                return scannedAndReturned(returnedEstimate, returnedEstimate);
+            }
+            return new RowMetrics(
+                    scanStats.getRowsScanned(),
+                    scanStats.getRowsReturned(),
+                    0L,
+                    scanStats.getPointReads(),
+                    scanStats.getRowsScanned(),
+                    0L,
+                    1L);
+        }
+
         private static RowMetrics scannedAndUpdated(long rowsScanned, long rowsUpdated) {
             return scannedPointReadAndUpdated(rowsScanned, rowsScanned, rowsUpdated, rowsUpdated);
         }
@@ -1917,13 +1946,14 @@ public final class RocksDBFileModeBenchmark {
                     - round
                     - Math.floorMod(options.seed, 1000L)
                     - 1L;
+            long activeBaseBeginTime = now + SESSION_TIMEOUT_MILLIS * ACTIVE_BENCHMARK_WINDOW_MULTIPLIER;
             for (int i = 0; i < options.globalCount; i++) {
                 long beginTime;
                 if (options.expiredRatio > 0D) {
                     long timeOffset = Math.floorMod(i, 1000);
                     beginTime = options.isExpiredIndex(i)
                             ? expiredBaseBeginTime - timeOffset
-                            : now + SESSION_TIMEOUT_MILLIS - timeOffset;
+                            : activeBaseBeginTime + timeOffset;
                 } else {
                     beginTime = baseBeginTime + i;
                 }
