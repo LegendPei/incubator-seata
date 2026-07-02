@@ -53,6 +53,10 @@ public enum RocksDBColumnFamily {
      */
     GLOBAL_STATUS_INDEX("global_status_index"),
     /**
+     * Global timeout deadline query index column family.
+     */
+    GLOBAL_TIMEOUT_INDEX("global_timeout_index"),
+    /**
      * Global transaction id query index column family.
      */
     TRANSACTION_ID_INDEX("transaction_id_index");

@@ -62,7 +62,9 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.session.SessionHelper;
 import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionManager;
 import org.apache.seata.server.session.SessionScanStats;
+import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.store.StoreConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -220,6 +222,8 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     };
 
     private final Map<GlobalStatus, byte[]> backgroundSessionStatusCursors = new ConcurrentHashMap<>();
+
+    private volatile byte[] timeoutCheckCursor;
 
     private final ThreadPoolExecutor branchRemoveExecutor;
 
@@ -418,8 +422,12 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     protected void timeoutCheck() {
         SessionCondition sessionCondition = new SessionCondition(GlobalStatus.Begin);
         sessionCondition.setLazyLoadBranch(true);
-        Collection<GlobalSession> beginGlobalSessions =
-                SessionHolder.getRootSessionManager().findGlobalSessions(sessionCondition);
+        SessionManager rootSessionManager = SessionHolder.getRootSessionManager();
+        boolean deadlineBoundedScan = configureTimeoutCheckDeadlineScan(rootSessionManager, sessionCondition);
+        Collection<GlobalSession> beginGlobalSessions = rootSessionManager.findGlobalSessions(sessionCondition);
+        if (deadlineBoundedScan) {
+            updateTimeoutCheckCursor(sessionCondition);
+        }
         if (CollectionUtils.isEmpty(beginGlobalSessions)) {
             return;
         }
@@ -455,6 +463,34 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         if (!beginGlobalSessions.isEmpty() && LOGGER.isDebugEnabled()) {
             LOGGER.debug("Global transaction timeout check end. ");
         }
+    }
+
+    private boolean configureTimeoutCheckDeadlineScan(
+            SessionManager rootSessionManager, SessionCondition sessionCondition) {
+        if (!(rootSessionManager instanceof RocksDBSessionManager)) {
+            return false;
+        }
+        sessionCondition.setLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        sessionCondition.setMaxTimeoutDeadlineMillis(timeoutDeadlineUpperBound());
+        byte[] cursor = timeoutCheckCursor;
+        if (cursor != null) {
+            sessionCondition.setTimeoutScanCursor(cursor);
+        }
+        return true;
+    }
+
+    private long timeoutDeadlineUpperBound() {
+        long now = System.currentTimeMillis();
+        return now == Long.MIN_VALUE ? Long.MIN_VALUE : now - 1;
+    }
+
+    private void updateTimeoutCheckCursor(SessionCondition sessionCondition) {
+        byte[] nextCursor = sessionCondition.getNextTimeoutScanCursor();
+        if (nextCursor == null) {
+            timeoutCheckCursor = null;
+            return;
+        }
+        timeoutCheckCursor = Arrays.copyOf(nextCursor, nextCursor.length);
     }
 
     /**

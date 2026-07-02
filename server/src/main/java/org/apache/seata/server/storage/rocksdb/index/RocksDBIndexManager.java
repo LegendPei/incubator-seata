@@ -38,7 +38,7 @@ import java.util.function.Consumer;
  */
 public class RocksDBIndexManager {
 
-    public static final int INDEX_VERSION = 1;
+    public static final int INDEX_VERSION = 2;
     public static final String INDEX_VERSION_KEY = "index_version";
     public static final String INDEX_BUILD_STATUS_KEY = "index_build_status";
     public static final String INDEX_BUILD_STATUS_IN_PROGRESS = "in_progress";
@@ -70,6 +70,7 @@ public class RocksDBIndexManager {
     public void rebuildFromGlobalSessions() {
         putMetadata(INDEX_BUILD_STATUS_KEY, INDEX_BUILD_STATUS_IN_PROGRESS);
         storeEngine.deleteByPrefix(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, EMPTY_PREFIX);
+        storeEngine.deleteByPrefix(RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX, EMPTY_PREFIX);
         storeEngine.deleteByPrefix(RocksDBColumnFamily.TRANSACTION_ID_INDEX, EMPTY_PREFIX);
 
         WriteBatch[] batch = new WriteBatch[] {new WriteBatch()};
@@ -114,6 +115,13 @@ public class RocksDBIndexManager {
                 RocksDBKeyCodec.encodeGlobalStatusIndex(
                         globalSession.getStatus(), globalSession.getBeginTime(), globalSession.getXid()),
                 xidValue);
+        if (globalSession.getStatus() == GlobalStatus.Begin) {
+            batch.put(
+                    storeEngine.handle(RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX),
+                    RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                            timeoutDeadlineMillis(globalSession), globalSession.getXid()),
+                    xidValue);
+        }
         batch.put(
                 storeEngine.handle(RocksDBColumnFamily.TRANSACTION_ID_INDEX),
                 RocksDBKeyCodec.encodeTransactionIdIndex(globalSession.getTransactionId()),
@@ -125,6 +133,12 @@ public class RocksDBIndexManager {
                 storeEngine.handle(RocksDBColumnFamily.GLOBAL_STATUS_INDEX),
                 RocksDBKeyCodec.encodeGlobalStatusIndex(
                         globalSession.getStatus(), globalSession.getBeginTime(), globalSession.getXid()));
+        if (globalSession.getStatus() == GlobalStatus.Begin) {
+            batch.delete(
+                    storeEngine.handle(RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX),
+                    RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                            timeoutDeadlineMillis(globalSession), globalSession.getXid()));
+        }
         batch.delete(
                 storeEngine.handle(RocksDBColumnFamily.TRANSACTION_ID_INDEX),
                 RocksDBKeyCodec.encodeTransactionIdIndex(globalSession.getTransactionId()));
@@ -181,6 +195,39 @@ public class RocksDBIndexManager {
         return new StatusScanResult(entries, stats, nextCursor);
     }
 
+    public TimeoutScanResult scanXidsByTimeoutDeadline(long maxDeadlineMillisInclusive, byte[] cursor, int limit) {
+        List<TimeoutIndexEntry> entries = new ArrayList<>();
+        byte[] seekKey =
+                cursor == null ? RocksDBKeyCodec.encodeGlobalTimeoutSeekKey(0L) : Arrays.copyOf(cursor, cursor.length);
+        byte[][] lastReturnedKey = new byte[1][];
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
+                RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                seekKey,
+                EMPTY_PREFIX,
+                limit,
+                (key, value) -> RocksDBKeyCodec.extractDeadlineFromTimeoutIndexKey(key) <= maxDeadlineMillisInclusive,
+                (key, value) -> {
+                    entries.add(new TimeoutIndexEntry(
+                            string(value), RocksDBKeyCodec.extractDeadlineFromTimeoutIndexKey(key)));
+                    lastReturnedKey[0] = Arrays.copyOf(key, key.length);
+                });
+        byte[] nextCursor =
+                stats.isLimitReached() && lastReturnedKey[0] != null ? nextSeekKey(lastReturnedKey[0]) : null;
+        return new TimeoutScanResult(entries, stats, nextCursor);
+    }
+
+    public static long timeoutDeadlineMillis(GlobalSession globalSession) {
+        long beginTime = globalSession.getBeginTime();
+        int timeout = globalSession.getTimeout();
+        if (timeout > 0 && beginTime > Long.MAX_VALUE - timeout) {
+            return Long.MAX_VALUE;
+        }
+        if (timeout < 0 && beginTime < Long.MIN_VALUE - timeout) {
+            return Long.MIN_VALUE;
+        }
+        return beginTime + timeout;
+    }
+
     public static class StatusIndexEntry {
         private final GlobalStatus status;
         private final String xid;
@@ -202,6 +249,60 @@ public class RocksDBIndexManager {
 
         public long getBeginTime() {
             return beginTime;
+        }
+    }
+
+    public static class TimeoutIndexEntry {
+        private final String xid;
+        private final long deadlineMillis;
+
+        TimeoutIndexEntry(String xid, long deadlineMillis) {
+            this.xid = xid;
+            this.deadlineMillis = deadlineMillis;
+        }
+
+        public String getXid() {
+            return xid;
+        }
+
+        public long getDeadlineMillis() {
+            return deadlineMillis;
+        }
+    }
+
+    public static class TimeoutScanResult {
+        private final List<TimeoutIndexEntry> entries;
+        private final int rowsScanned;
+        private final int rowsReturned;
+        private final boolean limitReached;
+        private final byte[] nextCursor;
+
+        TimeoutScanResult(List<TimeoutIndexEntry> entries, RocksDBStoreEngine.ScanStats scanStats, byte[] nextCursor) {
+            this.entries = entries;
+            this.rowsScanned = scanStats.getRowsScanned();
+            this.rowsReturned = scanStats.getRowsReturned();
+            this.limitReached = scanStats.isLimitReached();
+            this.nextCursor = nextCursor == null ? null : Arrays.copyOf(nextCursor, nextCursor.length);
+        }
+
+        public List<TimeoutIndexEntry> getEntries() {
+            return entries;
+        }
+
+        public int getRowsScanned() {
+            return rowsScanned;
+        }
+
+        public int getRowsReturned() {
+            return rowsReturned;
+        }
+
+        public boolean isLimitReached() {
+            return limitReached;
+        }
+
+        public byte[] getNextCursor() {
+            return nextCursor == null ? null : Arrays.copyOf(nextCursor, nextCursor.length);
         }
     }
 
