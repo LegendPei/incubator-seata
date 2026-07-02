@@ -34,6 +34,9 @@ public class SessionCondition {
     private boolean lazyLoadBranch;
     private byte[] statusScanCursor;
     private byte[] nextStatusScanCursor;
+    private Long maxTimeoutDeadlineMillis;
+    private byte[] timeoutScanCursor;
+    private byte[] nextTimeoutScanCursor;
     private SessionScanStats scanStats = SessionScanStats.empty();
 
     /**
@@ -171,6 +174,35 @@ public class SessionCondition {
     public void setNextStatusScanCursor(byte[] nextStatusScanCursor) {
         this.nextStatusScanCursor =
                 nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
+    }
+
+    public Long getMaxTimeoutDeadlineMillis() {
+        return maxTimeoutDeadlineMillis;
+    }
+
+    public void setMaxTimeoutDeadlineMillis(Long maxTimeoutDeadlineMillis) {
+        this.maxTimeoutDeadlineMillis = maxTimeoutDeadlineMillis;
+    }
+
+    public byte[] getTimeoutScanCursor() {
+        return timeoutScanCursor == null ? null : Arrays.copyOf(timeoutScanCursor, timeoutScanCursor.length);
+    }
+
+    public void setTimeoutScanCursor(byte[] timeoutScanCursor) {
+        this.timeoutScanCursor =
+                timeoutScanCursor == null ? null : Arrays.copyOf(timeoutScanCursor, timeoutScanCursor.length);
+    }
+
+    public byte[] getNextTimeoutScanCursor() {
+        return nextTimeoutScanCursor == null
+                ? null
+                : Arrays.copyOf(nextTimeoutScanCursor, nextTimeoutScanCursor.length);
+    }
+
+    public void setNextTimeoutScanCursor(byte[] nextTimeoutScanCursor) {
+        this.nextTimeoutScanCursor = nextTimeoutScanCursor == null
+                ? null
+                : Arrays.copyOf(nextTimeoutScanCursor, nextTimeoutScanCursor.length);
     }
 
     public SessionScanStats getScanStats() {

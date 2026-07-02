@@ -191,6 +191,9 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         if (sessionCondition.getTransactionId() != null && sessionCondition.getTransactionId() > 0) {
             return readByTransactionId(sessionCondition);
         }
+        if (shouldUseTimeoutDeadlineScan(sessionCondition)) {
+            return readByTimeoutDeadline(sessionCondition);
+        }
         if (CollectionUtils.isNotEmpty(sessionCondition.getStatuses())) {
             return readByStatuses(sessionCondition);
         }
@@ -285,6 +288,30 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return Collections.emptyList();
         }
         return Collections.singletonList(globalSession);
+    }
+
+    private List<GlobalSession> readByTimeoutDeadline(SessionCondition sessionCondition) {
+        SessionScanStatsAccumulator scanStats = new SessionScanStatsAccumulator();
+        Set<String> seenXids = new LinkedHashSet<>();
+        List<GlobalSession> result = new ArrayList<>();
+        sessionCondition.setNextTimeoutScanCursor(null);
+        Integer limit = sessionCondition.getLimit();
+        byte[] cursor = sessionCondition.getTimeoutScanCursor();
+        do {
+            RocksDBIndexManager.TimeoutScanResult scanResult = indexManager.scanXidsByTimeoutDeadline(
+                    sessionCondition.getMaxTimeoutDeadlineMillis(), cursor, nextPageLimit(limit, result));
+            scanStats.record(scanResult);
+            for (RocksDBIndexManager.TimeoutIndexEntry entry : scanResult.getEntries()) {
+                if (appendMatchingTimeoutSession(sessionCondition, seenXids, result, entry, scanStats)
+                        && isLimitReached(limit, result)) {
+                    sessionCondition.setNextTimeoutScanCursor(scanResult.getNextCursor());
+                    break;
+                }
+            }
+            cursor = scanResult.getNextCursor();
+        } while (cursor != null && !isLimitReached(limit, result));
+        sessionCondition.setScanStats(scanStats.toStats(result.size()));
+        return result;
     }
 
     private List<GlobalSession> readByStatuses(SessionCondition sessionCondition) {
@@ -406,8 +433,39 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return false;
     }
 
+    private boolean appendMatchingTimeoutSession(
+            SessionCondition sessionCondition,
+            Set<String> seenXids,
+            List<GlobalSession> result,
+            RocksDBIndexManager.TimeoutIndexEntry entry,
+            SessionScanStatsAccumulator scanStats) {
+        if (seenXids.contains(entry.getXid())) {
+            return false;
+        }
+        scanStats.recordPointRead();
+        GlobalSession globalSession = readSession(entry.getXid(), !sessionCondition.isLazyLoadBranch());
+        if (globalSession != null
+                && globalSession.getStatus() == GlobalStatus.Begin
+                && RocksDBIndexManager.timeoutDeadlineMillis(globalSession) == entry.getDeadlineMillis()
+                && matches(globalSession, sessionCondition)) {
+            seenXids.add(entry.getXid());
+            result.add(globalSession);
+            return true;
+        }
+        return false;
+    }
+
     private boolean shouldUseBoundedStatusScan(Long maxBeginTime, Integer limit) {
         return maxBeginTime != null || limit != null && limit > 0;
+    }
+
+    private boolean shouldUseTimeoutDeadlineScan(SessionCondition sessionCondition) {
+        if (sessionCondition.getMaxTimeoutDeadlineMillis() == null
+                || CollectionUtils.isEmpty(sessionCondition.getStatuses())
+                || sessionCondition.getStatuses().length != 1) {
+            return false;
+        }
+        return sessionCondition.getStatuses()[0] == GlobalStatus.Begin;
     }
 
     private int nextPageLimit(Integer limit, List<GlobalSession> result) {
@@ -495,6 +553,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             limitReached |= scanResult.isLimitReached();
         }
 
+        private void record(RocksDBIndexManager.TimeoutScanResult scanResult) {
+            rowsScanned += scanResult.getRowsScanned();
+            rowsReturned += scanResult.getRowsReturned();
+            limitReached |= scanResult.isLimitReached();
+        }
+
         private void recordPointRead() {
             pointReads++;
         }
@@ -524,6 +588,11 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                     return true;
                 }
             }
+            return false;
+        }
+        if (sessionCondition.getMaxTimeoutDeadlineMillis() != null
+                && RocksDBIndexManager.timeoutDeadlineMillis(globalSession)
+                        > sessionCondition.getMaxTimeoutDeadlineMillis()) {
             return false;
         }
         if (sessionCondition.getStatus() != null) {
