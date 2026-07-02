@@ -58,6 +58,7 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.session.SessionHolder;
 import org.apache.seata.server.session.SessionManager;
+import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.util.StoreUtil;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -342,6 +343,77 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         Assertions.assertEquals(GlobalStatus.Begin, afterCheck.getStatus());
 
         globalSession.end();
+    }
+
+    @Test
+    public void timeoutCheckUsesDeadlineBoundedScanForRocksDBSessionManager() {
+        RocksDBSessionManager sessionManager = mock(RocksDBSessionManager.class);
+        List<SessionCondition> conditions = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            conditions.add(invocation.getArgument(0));
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            defaultCoordinator.timeoutCheck();
+        }
+
+        Assertions.assertEquals(1, conditions.size());
+        SessionCondition condition = conditions.get(0);
+        Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, condition.getLimit());
+        Assertions.assertEquals(GlobalStatus.Begin, condition.getStatus());
+        Assertions.assertTrue(condition.isLazyLoadBranch());
+        Assertions.assertNotNull(condition.getMaxTimeoutDeadlineMillis());
+        Assertions.assertTrue(condition.getMaxTimeoutDeadlineMillis() <= System.currentTimeMillis());
+    }
+
+    @Test
+    public void timeoutCheckKeepsFullScanForGenericSessionManager() {
+        SessionManager sessionManager = mock(SessionManager.class);
+        List<SessionCondition> conditions = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            conditions.add(invocation.getArgument(0));
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            defaultCoordinator.timeoutCheck();
+        }
+
+        Assertions.assertEquals(1, conditions.size());
+        SessionCondition condition = conditions.get(0);
+        Assertions.assertNull(condition.getLimit());
+        Assertions.assertNull(condition.getMaxTimeoutDeadlineMillis());
+        Assertions.assertNull(condition.getTimeoutScanCursor());
+    }
+
+    @Test
+    public void timeoutCheckCarriesTimeoutScanCursorAcrossRounds() {
+        RocksDBSessionManager sessionManager = mock(RocksDBSessionManager.class);
+        byte[] nextCursor = new byte[] {4, 5, 6};
+        List<byte[]> cursors = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            cursors.add(condition.getTimeoutScanCursor());
+            if (cursors.size() == 1) {
+                condition.setNextTimeoutScanCursor(nextCursor);
+            }
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            defaultCoordinator.timeoutCheck();
+            defaultCoordinator.timeoutCheck();
+            defaultCoordinator.timeoutCheck();
+        }
+
+        Assertions.assertEquals(3, cursors.size());
+        Assertions.assertNull(cursors.get(0));
+        Assertions.assertArrayEquals(nextCursor, cursors.get(1));
+        Assertions.assertNull(cursors.get(2));
     }
 
     @Test

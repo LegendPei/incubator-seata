@@ -272,6 +272,71 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByTimeoutDeadlineUsesDeadlineOrderAndCursor() {
+        try (RocksDBStoreEngine engine = open("timeout-deadline-cursor")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            long deadline = 1_000_000L;
+            GlobalSession activeOld = globalSession("tx-timeout-active-old", GlobalStatus.Begin, 2_000_000);
+            activeOld.setBeginTime(100L);
+            GlobalSession firstExpired = globalSession("tx-timeout-first-expired", GlobalStatus.Begin, 100);
+            firstExpired.setBeginTime(deadline - 1_000L);
+            GlobalSession secondExpired = globalSession("tx-timeout-second-expired", GlobalStatus.Begin, 100);
+            secondExpired.setBeginTime(deadline - 500L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, activeOld);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, secondExpired);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, firstExpired);
+
+            SessionCondition firstPage = new SessionCondition(GlobalStatus.Begin);
+            firstPage.setLazyLoadBranch(true);
+            firstPage.setMaxTimeoutDeadlineMillis(deadline);
+            firstPage.setLimit(1);
+            List<GlobalSession> firstActual = storeManager.readSession(firstPage);
+
+            Assertions.assertEquals(1, firstActual.size());
+            Assertions.assertEquals(firstExpired.getXid(), firstActual.get(0).getXid());
+            Assertions.assertNotNull(firstPage.getNextTimeoutScanCursor());
+            Assertions.assertEquals(1, firstPage.getScanStats().getPointReads());
+
+            SessionCondition secondPage = new SessionCondition(GlobalStatus.Begin);
+            secondPage.setLazyLoadBranch(true);
+            secondPage.setMaxTimeoutDeadlineMillis(deadline);
+            secondPage.setLimit(1);
+            secondPage.setTimeoutScanCursor(firstPage.getNextTimeoutScanCursor());
+            List<GlobalSession> secondActual = storeManager.readSession(secondPage);
+
+            Assertions.assertEquals(1, secondActual.size());
+            Assertions.assertEquals(secondExpired.getXid(), secondActual.get(0).getXid());
+
+            SessionCondition thirdPage = new SessionCondition(GlobalStatus.Begin);
+            thirdPage.setLazyLoadBranch(true);
+            thirdPage.setMaxTimeoutDeadlineMillis(deadline);
+            thirdPage.setLimit(1);
+            thirdPage.setTimeoutScanCursor(secondPage.getNextTimeoutScanCursor());
+            List<GlobalSession> thirdActual = storeManager.readSession(thirdPage);
+
+            Assertions.assertTrue(thirdActual.isEmpty());
+            Assertions.assertNull(thirdPage.getNextTimeoutScanCursor());
+        }
+    }
+
+    @Test
+    void testGlobalUpdateRemovesTimeoutIndexForNonBeginStatus() {
+        try (RocksDBStoreEngine engine = open("timeout-index-status-update")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession globalSession = globalSession("tx-timeout-index-update", GlobalStatus.Begin, 100);
+            globalSession.setBeginTime(100L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession);
+            globalSession.setStatus(GlobalStatus.Committing);
+            storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession);
+
+            Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX, new byte[0])
+                    .isEmpty());
+        }
+    }
+
+    @Test
     void testLazyReadLoadsRetryBranchesOnDemand() throws Exception {
         try (RocksDBStoreEngine engine = open("lazy-retry-branches")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -685,7 +750,11 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     private GlobalSession globalSession(String name, GlobalStatus status) {
-        GlobalSession globalSession = new GlobalSession("app", "group", name, 60000);
+        return globalSession(name, status, 60000);
+    }
+
+    private GlobalSession globalSession(String name, GlobalStatus status, int timeout) {
+        GlobalSession globalSession = new GlobalSession("app", "group", name, timeout);
         globalSession.setStatus(status);
         return globalSession;
     }
