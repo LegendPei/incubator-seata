@@ -28,6 +28,8 @@ import org.apache.seata.rm.datasource.undo.UndoLogParser;
 public class Fastjson2UndoLogParser implements UndoLogParser, Initialize {
     public static final String NAME = "fastjson2";
 
+    private static final Object PARSE_LOCK = new Object();
+
     private JSONReader.Feature[] jsonReaderFeature;
     private JSONWriter.Feature[] jsonWriterFeature;
 
@@ -75,6 +77,8 @@ public class Fastjson2UndoLogParser implements UndoLogParser, Initialize {
 
     @Override
     public BranchUndoLog decode(byte[] bytes) {
-        return JSONB.parseObject(bytes, BranchUndoLog.class, jsonReaderFeature);
+        synchronized (PARSE_LOCK) {
+            return JSONB.parseObject(bytes, BranchUndoLog.class, jsonReaderFeature);
+        }
     }
 }

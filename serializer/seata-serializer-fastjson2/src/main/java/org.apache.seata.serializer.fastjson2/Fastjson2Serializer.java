@@ -23,6 +23,8 @@ import org.apache.seata.core.serializer.Serializer;
 @LoadLevel(name = "FASTJSON2")
 public class Fastjson2Serializer implements Serializer {
 
+    private static final Object PARSE_LOCK = new Object();
+
     @Override
     public <T> byte[] serialize(T t) {
         return JSONB.toBytes(t, Fastjson2SerializerFactory.getInstance().getJsonWriterFeatureList());
@@ -30,10 +32,12 @@ public class Fastjson2Serializer implements Serializer {
 
     @Override
     public <T> T deserialize(byte[] bytes) {
-        return (T) JSONB.parseObject(
-                bytes,
-                Object.class,
-                Fastjson2SerializerFactory.getInstance().getFilter(),
-                Fastjson2SerializerFactory.getInstance().getJsonReaderFeatureList());
+        synchronized (PARSE_LOCK) {
+            return (T) JSONB.parseObject(
+                    bytes,
+                    Object.class,
+                    Fastjson2SerializerFactory.getInstance().getFilter(),
+                    Fastjson2SerializerFactory.getInstance().getJsonReaderFeatureList());
+        }
     }
 }
