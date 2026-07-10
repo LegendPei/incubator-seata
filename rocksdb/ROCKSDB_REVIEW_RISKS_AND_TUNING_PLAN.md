@@ -6,7 +6,8 @@
 - 范围：Seata file mode 的 RocksDB 存储引擎设计、实现风险、benchmark 暴露的问题，以及后续调优路线。
 - 目标：把当前 review 结论沉淀为可以拆分 issue / PR / benchmark 任务的计划。
 - 非目标：不在本文替代 Phase1-4 的设计文档，也不直接给出所有参数的最终推荐值。RocksDB 参数需要结合机器、数据规模、事务模型和压测证据逐步收敛。
-- 最近同步：2026-07-02 已按性能优先口径再次同步。R7/R2/R1 的首批补强和 review 修复已完成；R2 的 bounded status 查询继续走 lower-bound/cursor/paged/k-way 路径，无 `limit` 且无 `overTimeAliveMills` 的 status 查询保留 single-iterator fast path，避免为了基础 scan stats 增加全量查询的分页循环开销；R7 已修正 bounded `query.status` 的 rows/pointReads 指标口径并拉远 expiredRatio active 样本窗口；R2 跨轮 cursor merge 已落地，后台 retry/end-state bounded scan 可跨轮推进并在扫到尾后回卷；`timeoutCheck` 已接入 `GLOBAL_TIMEOUT_INDEX` + deadline cursor bounded scan，只在 RocksDB session manager 下按 `beginTime + timeout < now` 查找候选，避免直接限制 beginTime 前 N 条导致短 timeout 事务漏扫；RocksDB 内部 stats/perf snapshot、告警等观测性深化暂后置。
+- 最近同步：2026-07-11 已继续按性能优先口径同步。R4 新增 opt-in `dbWriteBufferSize` 全局 memtable 预算和 global/branch/lock/index/metadata 五类 CF write-buffer profile，默认值均为 0，因此未配置时保持原行为；每个 CF 使用独立 `ColumnFamilyOptions` 并共享 block cache。R6 已把 verify 改成 streaming point-read 交叉校验，新增 sample/page/full、page cursor/limit、first N error samples、missing/stale index 计数，移除全量 HashMap/HashSet/List 物化。R3 已补 batched release 与整组 acquire 的并发语义回归。服务器当前不可连接，1M status/timeout、10K/100K fanout、内存预算 RSS/stall/p99 等 benchmark 仅标记为待验证，不写入推测结论；RocksDB 内部 stats/perf snapshot、告警等观测性深化继续后置。
+- 本轮最终本地验证：`RocksDBStoreConfigTest`、`RocksDBStoreEngineTest`、`RocksDBMaintenanceServiceTest`、`RocksDBLockManagerTest`、`RocksDBIndexManagerTest`、`RocksDBTransactionStoreManagerTest` 共 103 tests，0 failures / 0 errors / 0 skipped；`server test-compile` BUILD SUCCESS。
 
 ## 本次实现同步
 
@@ -127,7 +128,7 @@
 - 目标：证明 streaming/分批 lock release/update 在超大 fanout 和并发场景下不仅降低内存风险，也保持语义正确。
 - 主要任务：
   - 增加 release/update 指标：rowsScanned、rowsUpdated、batchCount、maxBatchSize、elapsedMs。
-  - 增加并发语义测试：release xid 时并发 acquire 相同 xid/不同 branch/相同 lockKey 的边界。
+  - 已完成：增加 batched release 与整组 acquire 相同 lockKey 集合的并发语义测试，覆盖 acquire 竞态失败后重试以及成功后不会被旧 release 误删。
   - 增加 10K/100K locks per xid benchmark，记录 p95/p99 和堆内存。
   - 评估是否需要 xid lock summary，用于大 fanout 告警和维护任务拆批。
 - 验收：
@@ -139,11 +140,12 @@
 
 - 目标：把 RocksDB 调参从单参数试错推进为“全局预算 + per-CF profile + 可控 verify”的运维模型。
 - 主要任务：
-  - 引入全局 memtable/write buffer 预算，明确与 block cache 预算的关系。
-  - 设计 per-CF profile：global、branch、lock、index、metadata 分别给出默认和调优方向。
+  - 已完成：新增 opt-in `dbWriteBufferSize`，通过 RocksDB DB options 约束同一 DB 的全局 memtable/write-buffer 预算；block cache 仍为所有 CF 共享对象。
+  - 已完成：global、branch、lock、index、metadata 五类 profile 可分别覆盖 `writeBufferSize`，未配置 profile 时回退到共享 `writeBufferSize`，全部为 0 时保持 RocksDB 默认。
   - 暴露 memtable、block cache、table reader、flush/compaction pending、stall 等指标。
-  - verify 增加 sample/page/full 三档模式，page 模式支持 cursor/limit，full 模式只允许显式 admin 触发。
-  - verify 输出 checked count、inconsistent count、orphan index/record count 和 first N samples。
+  - 已完成：verify 增加 sample/page/full 三档模式，page 模式支持 cursor/limit；现有无参入口明确映射为显式 full verify。
+  - 已完成：verify 输出 checked record/global/branch/lock/index count、inconsistent count、missing/stale/orphan count 和 first N samples。
+  - 已完成：verify 使用逐 CF streaming scan + 主记录/索引 point-read 交叉校验，不再构建数据库规模的 HashMap/HashSet/List。
 - 验收：
   - 小内存配置下不会因多 CF memtable 无感放大导致持续 write stall。
   - sample/page verify 可在大库运行，不一次性构建全量内存集合。
@@ -324,7 +326,8 @@ RocksDB 的优势在于有序 key 和顺序迭代。当前 key 设计已经给�
 - 已完成：`updateLockStatus(xid, lockStatus)` 改为按 `LOCK_BRANCH_INDEX` 分批扫描、分批更新。
 - 已完成：`releaseLock(xid)` / `releaseLock(xid, branchId)` 的内部 release-by-index 路径改为分批扫描并精确删除已扫描 index key。
 - 已完成：测试通过 package-private 小 batch size 构造 `batchSize=1`，覆盖多批次 release 和多批次 status update。
-- 待完成：生产级 fanout 指标、并发 release + acquire 语义测试和超大 fanout benchmark 仍需补齐。
+- 已完成：补充 20 轮并发 batched release + acquire 回归，验证 acquire 保持整组 all-or-nothing，成功后不会被旧 xid 的后续 release 批次误删。
+- 待完成：生产级 fanout 指标和 10K/100K 超大 fanout benchmark；服务器恢复后补 p95/p99、堆内存和 batch size 对比。
 
 ### 为什么
 
@@ -367,6 +370,14 @@ RocksDB 的优势在于有序 key 和顺序迭代。当前 key 设计已经给�
 - 对比一次性 batch、分页 batch、精确删除三种实现。
 
 ## R4 RocksDB options 缺少全局内存预算和 per-CF profile
+
+### 当前落地状态
+
+- 已完成：新增 `store.file.rocksdb.dbWriteBufferSize`，值大于 0 时调用 RocksDB `DBOptions.setDbWriteBufferSize`，限制同一 DB 所有 CF 的 memtable 总预算；0 表示保留 RocksDB 默认。
+- 已完成：新增 global/branch/lock/index/metadata 五类 write-buffer size override，并通过 `RocksDBColumnFamilyProfile` 固化 CF 到 profile 的映射。
+- 已完成：每个 CF 创建和独立关闭自己的 `ColumnFamilyOptions`；block cache 继续共享，避免按 CF 重复分配 cache 预算。
+- 已完成：示例配置和 tuning summary 输出新预算/profile 参数，默认全部关闭，不在无 benchmark 证据时改变生产默认值。
+- 待验证：服务器恢复后执行 baseline/memory-budget/lock-hot/index-scan 对比，补 RSS、memtable、table reader、flush/compaction stall、吞吐和 p99 数据。
 
 ### 问题
 
@@ -465,6 +476,14 @@ checkpoint 属于备份和恢复边界。调用方会根据 `flush=true/false` �
 - 集成测试在有未 flush 写入时创建 checkpoint，并验证恢复后的数据完整性。
 
 ## R6 维护校验全量构建内存集合
+
+### 当前落地状态
+
+- 已完成：`verifyCurrentState()` 保持兼容并映射为 full mode；新增 `RocksDBVerifyOptions.sample/page/full`。
+- 已完成：page mode 返回 defensive-copy cursor，并按跨 CF 的总 limit 续扫；sample mode 对每个业务 CF 单独应用 limit。
+- 已完成：global/branch/lock/status/timeout/transaction-id/lock-branch-index 全部改为 streaming scan + exact point read，不再全量物化主记录和有效锁集合。
+- 已完成：报告增加 checked/inconsistent、missing/stale/orphan 分类计数、完成状态和 first N error samples；错误总数不受 sample 上限影响。
+- 待验证：服务器恢复后测量 sample/page/full 对正常写入 p95/p99、RocksDB iterator/point-read 和 IO 的影响；当前未加入自动定时调度与 token-bucket 限速。
 
 ### 问题
 
@@ -760,8 +779,8 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 2. R1：orphan lock 清理已支持限量扫描、cleaned/scanned/batches/limitReached 结果、nextSeekKey 续扫入口和 bounded maintenance loop；启动路径已从全量清理改为 clean shutdown 跳过、非 clean shutdown 最多扫描 1024 条，启动 dirty marker 已 durable sync；下一步做异步任务调度、进度持久化、中断恢复、限速和告警。
 3. R8：periodic WAL sync 已落地为默认关闭的 best-effort 能力，shutdown final sync 已 strict failure observable，engine close 已补资源释放异常安全；下一步补 crash-injection、RPO 矩阵、backpressure/强可靠模式和生产告警策略。
 4. R7：benchmark 已增强 tuning/WAL sync 指标、repeat/order/query limit、rows 解释性列、bounded query.status scan stats、expiredRatio active window、benchmark 级 pointReads/iteratorNext/writeBatchBytes 估算、header-driven A/B 解析、跨 repeat summary CSV/JSON、statusDistribution、expiredRatio、lockWorkload、lockConflictRatio 和 xidFanoutDistribution；下一步补 RocksDB 内部 stats/perf snapshot 与 scenario 关联。
-5. R3：锁 release/update 已 streaming/分批化；下一步补 fanout 指标、并发语义测试和 10K/100K fanout benchmark。
-6. R4/R6：加入全局内存预算、per-CF profile、RocksDB 内存/flush/compaction/stall 指标，并把 verify 拆成 sample/page/full 三档。
+5. R3：锁 release/update 已 streaming/分批化，并发 batched release + acquire 语义测试已补；下一步补 fanout 指标和 10K/100K fanout benchmark。
+6. R4/R6：全局 memtable 预算、per-CF write-buffer profile 和 sample/page/full streaming verify 已完成；下一步在服务器恢复后验证 RSS/stall/p99，并补 RocksDB 内部指标关联和 verify 限速调度。
 7. R5/R9：checkpoint `flush` 语义和 range delete 使用边界进入运维文档收口；range delete 默认继续关闭，不进入锁热路径。
 
 这个顺序的原则是：先让后台任务成本可控，再让异常恢复和 WAL 可靠性有证据；先让 benchmark 能自动给出结论，再推进 fanout、内存预算和 verify；最后收口 checkpoint/range delete 这类运维边界说明。
@@ -773,7 +792,7 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 - 已部分满足：`overTimeAliveMills` 场景不再无界扫描状态全集；retry/end-state 后台任务必须继续接入 batch limit。
 - 已满足首批目标：启动路径不再默认执行不可控的全量 orphan lock 清理，而是限量 1024 条并告警。
 - 已满足首批目标：大 fanout lock release/update 不再一次性物化全部索引项。
-- 待完成：orphan cleanup、verify、end-state 清理等维护任务都有分页、进度、限速、中断恢复和失败语义。
+- 已部分满足：verify 已有 sample/page/full、cursor/limit 和 bounded error samples；orphan cleanup 的后台进度持久化、统一限速、中断恢复和失败语义仍待完成。
 - 已完成：bounded 多状态 `readByStatuses` 已提供 store 层 k-way merge；后台任务基础 scan stats/耗时日志、跨轮 cursor merge 和 `timeoutCheck` deadline-aware bounded scan 已接入；待补专项 benchmark。
 
 ### 性能验收
@@ -785,7 +804,7 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 - 已完成：statusDistribution workload 参数可配置。
 - 已完成：lockWorkload、expiredRatio、lockConflictRatio、xidFanoutDistribution 等 workload 参数可配置。
 - 已部分满足：RocksDB stats/WAL sync stats 已增强，lock 场景已补 rows scanned/updated 解释口径，benchmark 级 pointReads/iteratorNext/writeBatchBytes 已输出；仍需继续补 RocksDB 内部 stats/perf snapshot 与每个 scenario 的关联。
-- 待完成：R4 的全局内存预算和 per-CF profile 有 RSS、memtable、block cache、table reader、flush/compaction/stall 指标支撑。
+- 已完成代码、待 benchmark 取证：R4 已有全局 memtable 预算和 per-CF write-buffer profile；RSS、memtable、block cache、table reader、flush/compaction/stall 对照需服务器恢复后补。
 
 ### 可靠性验收
 
@@ -794,7 +813,7 @@ Pika/PikiwiDB 的经验对 Seata 有参考价值，但不能照搬。Pika 的核
 - 待完成：periodic WAL sync 的生产告警阈值和强可靠/backpressure 策略有测试和文档说明。
 - 已满足：checkpoint 的 flush 语义和实现一致，`flush=true` 会显式调用 `storeEngine.flush()`。
 - 待文档收口：`flush=false` 只表示不做显式 flush，不承诺阻止 RocksDB JNI checkpoint 内部行为。
-- 待完成：索引一致性校验能在 sample/page/full 模式下发现主记录缺失、索引缺失、孤儿索引、孤儿锁记录。
+- 已完成本地能力：索引一致性校验支持 sample/page/full，并覆盖索引缺失、孤儿/失效索引、孤儿 branch/lock；大库性能影响仍待服务器 benchmark。
 - 待文档收口：range delete 默认关闭，不进入 lock hot path；任何启用建议都必须绑定维护场景、compact 策略和回归 benchmark。
 
 ## 参考资料
