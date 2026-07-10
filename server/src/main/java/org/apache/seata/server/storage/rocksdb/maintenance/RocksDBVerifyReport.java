@@ -21,31 +21,68 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Immutable report produced by {@link RocksDBMaintenanceService#verifyCurrentState}.
- * Contains counts of checked entities and any inconsistencies found.
+ * Immutable report produced by RocksDB consistency verification.
  */
 public class RocksDBVerifyReport {
 
+    private final RocksDBVerifyMode mode;
+    private final boolean complete;
+    private final RocksDBVerifyCursor nextCursor;
+    private final int checkedRecordCount;
     private final int checkedGlobalCount;
     private final int checkedBranchCount;
     private final int checkedLockCount;
+    private final int checkedIndexCount;
     private final int staleStatusIndexCount;
+    private final int staleTimeoutIndexCount;
     private final int staleTransactionIdIndexCount;
+    private final int missingStatusIndexCount;
+    private final int missingTimeoutIndexCount;
+    private final int missingTransactionIdIndexCount;
     private final int orphanBranchCount;
     private final int orphanLockCount;
     private final int staleLockIndexCount;
+    private final int inconsistentCount;
+    private final int totalErrorCount;
     private final List<String> errorMessages;
 
     private RocksDBVerifyReport(Builder builder) {
+        this.mode = builder.mode;
+        this.complete = builder.complete;
+        this.nextCursor = builder.nextCursor;
+        this.checkedRecordCount = builder.checkedRecordCount;
         this.checkedGlobalCount = builder.checkedGlobalCount;
         this.checkedBranchCount = builder.checkedBranchCount;
         this.checkedLockCount = builder.checkedLockCount;
+        this.checkedIndexCount = builder.checkedIndexCount;
         this.staleStatusIndexCount = builder.staleStatusIndexCount;
+        this.staleTimeoutIndexCount = builder.staleTimeoutIndexCount;
         this.staleTransactionIdIndexCount = builder.staleTransactionIdIndexCount;
+        this.missingStatusIndexCount = builder.missingStatusIndexCount;
+        this.missingTimeoutIndexCount = builder.missingTimeoutIndexCount;
+        this.missingTransactionIdIndexCount = builder.missingTransactionIdIndexCount;
         this.orphanBranchCount = builder.orphanBranchCount;
         this.orphanLockCount = builder.orphanLockCount;
         this.staleLockIndexCount = builder.staleLockIndexCount;
+        this.inconsistentCount = builder.inconsistentCount;
+        this.totalErrorCount = builder.totalErrorCount;
         this.errorMessages = Collections.unmodifiableList(new ArrayList<>(builder.errorMessages));
+    }
+
+    public RocksDBVerifyMode getMode() {
+        return mode;
+    }
+
+    public boolean isComplete() {
+        return complete;
+    }
+
+    public RocksDBVerifyCursor getNextCursor() {
+        return nextCursor;
+    }
+
+    public int getCheckedRecordCount() {
+        return checkedRecordCount;
     }
 
     public int getCheckedGlobalCount() {
@@ -60,12 +97,32 @@ public class RocksDBVerifyReport {
         return checkedLockCount;
     }
 
+    public int getCheckedIndexCount() {
+        return checkedIndexCount;
+    }
+
     public int getStaleStatusIndexCount() {
         return staleStatusIndexCount;
     }
 
+    public int getStaleTimeoutIndexCount() {
+        return staleTimeoutIndexCount;
+    }
+
     public int getStaleTransactionIdIndexCount() {
         return staleTransactionIdIndexCount;
+    }
+
+    public int getMissingStatusIndexCount() {
+        return missingStatusIndexCount;
+    }
+
+    public int getMissingTimeoutIndexCount() {
+        return missingTimeoutIndexCount;
+    }
+
+    public int getMissingTransactionIdIndexCount() {
+        return missingTransactionIdIndexCount;
     }
 
     public int getOrphanBranchCount() {
@@ -80,99 +137,144 @@ public class RocksDBVerifyReport {
         return staleLockIndexCount;
     }
 
+    public int getInconsistentCount() {
+        return inconsistentCount;
+    }
+
+    public int getTotalErrorCount() {
+        return totalErrorCount;
+    }
+
     public List<String> getErrorMessages() {
         return errorMessages;
     }
 
-    /**
-     * Returns true if the database state is consistent with no issues found.
-     */
     public boolean isClean() {
-        return staleStatusIndexCount == 0
-                && staleTransactionIdIndexCount == 0
-                && orphanBranchCount == 0
-                && orphanLockCount == 0
-                && staleLockIndexCount == 0
-                && errorMessages.isEmpty();
+        return inconsistentCount == 0;
     }
 
     @Override
     public String toString() {
-        StringBuilder sb = new StringBuilder("RocksDBVerifyReport{");
-        sb.append("globals=").append(checkedGlobalCount);
-        sb.append(", branches=").append(checkedBranchCount);
-        sb.append(", locks=").append(checkedLockCount);
-        sb.append(", staleStatusIndexes=").append(staleStatusIndexCount);
-        sb.append(", staleTxnIdIndexes=").append(staleTransactionIdIndexCount);
-        sb.append(", orphanBranches=").append(orphanBranchCount);
-        sb.append(", orphanLocks=").append(orphanLockCount);
-        sb.append(", staleLockIndexes=").append(staleLockIndexCount);
-        if (!errorMessages.isEmpty()) {
-            sb.append(", errors=").append(errorMessages.size());
-        }
-        sb.append(", clean=").append(isClean());
-        sb.append('}');
-        return sb.toString();
+        return "RocksDBVerifyReport{" + "mode=" + mode + ", complete=" + complete + ", checkedRecords="
+                + checkedRecordCount + ", globals=" + checkedGlobalCount + ", branches=" + checkedBranchCount
+                + ", locks=" + checkedLockCount + ", indexes=" + checkedIndexCount + ", inconsistencies="
+                + inconsistentCount + ", errorSamples=" + errorMessages.size() + ", clean=" + isClean() + '}';
     }
 
-    static Builder builder() {
-        return new Builder();
+    static Builder builder(RocksDBVerifyOptions options) {
+        return new Builder(options);
     }
 
-    static class Builder {
-        int checkedGlobalCount;
-        int checkedBranchCount;
-        int checkedLockCount;
-        int staleStatusIndexCount;
-        int staleTransactionIdIndexCount;
-        int orphanBranchCount;
-        int orphanLockCount;
-        int staleLockIndexCount;
-        List<String> errorMessages = new ArrayList<>();
+    static final class Builder {
+        private final RocksDBVerifyMode mode;
+        private final int maxErrorSamples;
+        private boolean complete;
+        private RocksDBVerifyCursor nextCursor;
+        private int checkedRecordCount;
+        private int checkedGlobalCount;
+        private int checkedBranchCount;
+        private int checkedLockCount;
+        private int checkedIndexCount;
+        private int staleStatusIndexCount;
+        private int staleTimeoutIndexCount;
+        private int staleTransactionIdIndexCount;
+        private int missingStatusIndexCount;
+        private int missingTimeoutIndexCount;
+        private int missingTransactionIdIndexCount;
+        private int orphanBranchCount;
+        private int orphanLockCount;
+        private int staleLockIndexCount;
+        private int inconsistentCount;
+        private int totalErrorCount;
+        private final List<String> errorMessages = new ArrayList<>();
 
-        Builder checkedGlobalCount(int count) {
-            this.checkedGlobalCount = count;
-            return this;
+        private Builder(RocksDBVerifyOptions options) {
+            this.mode = options.getMode();
+            this.maxErrorSamples = options.getMaxErrorSamples();
         }
 
-        Builder checkedBranchCount(int count) {
-            this.checkedBranchCount = count;
-            return this;
+        void checkedRecord(boolean index) {
+            checkedRecordCount++;
+            if (index) {
+                checkedIndexCount++;
+            }
         }
 
-        Builder checkedLockCount(int count) {
-            this.checkedLockCount = count;
-            return this;
+        void checkedGlobal() {
+            checkedGlobalCount++;
         }
 
-        Builder staleStatusIndexCount(int count) {
-            this.staleStatusIndexCount = count;
-            return this;
+        void checkedBranch() {
+            checkedBranchCount++;
         }
 
-        Builder staleTransactionIdIndexCount(int count) {
-            this.staleTransactionIdIndexCount = count;
-            return this;
+        void checkedLock() {
+            checkedLockCount++;
         }
 
-        Builder orphanBranchCount(int count) {
-            this.orphanBranchCount = count;
-            return this;
+        void staleStatusIndex(String message) {
+            staleStatusIndexCount++;
+            issue(message);
         }
 
-        Builder orphanLockCount(int count) {
-            this.orphanLockCount = count;
-            return this;
+        void staleTimeoutIndex(String message) {
+            staleTimeoutIndexCount++;
+            issue(message);
         }
 
-        Builder staleLockIndexCount(int count) {
-            this.staleLockIndexCount = count;
-            return this;
+        void staleTransactionIdIndex(String message) {
+            staleTransactionIdIndexCount++;
+            issue(message);
         }
 
-        Builder addError(String message) {
-            this.errorMessages.add(message);
-            return this;
+        void missingStatusIndex(String message) {
+            missingStatusIndexCount++;
+            issue(message);
+        }
+
+        void missingTimeoutIndex(String message) {
+            missingTimeoutIndexCount++;
+            issue(message);
+        }
+
+        void missingTransactionIdIndex(String message) {
+            missingTransactionIdIndexCount++;
+            issue(message);
+        }
+
+        void orphanBranch(String message) {
+            orphanBranchCount++;
+            issue(message);
+        }
+
+        void orphanLock(String message) {
+            orphanLockCount++;
+            issue(message);
+        }
+
+        void staleLockIndex(String message) {
+            staleLockIndexCount++;
+            issue(message);
+        }
+
+        void error(String message) {
+            issue(message);
+        }
+
+        private void issue(String message) {
+            inconsistentCount++;
+            totalErrorCount++;
+            if (errorMessages.size() < maxErrorSamples) {
+                errorMessages.add(message);
+            }
+        }
+
+        void complete(boolean complete) {
+            this.complete = complete;
+        }
+
+        void nextCursor(RocksDBVerifyCursor nextCursor) {
+            this.nextCursor = nextCursor;
         }
 
         RocksDBVerifyReport build() {

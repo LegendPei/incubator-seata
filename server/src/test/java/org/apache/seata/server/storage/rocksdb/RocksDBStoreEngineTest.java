@@ -1025,6 +1025,52 @@ class RocksDBStoreEngineTest {
         }
     }
 
+    @Test
+    void testAppliesDbBudgetAndColumnFamilyWriteBufferProfiles() {
+        RocksDBStoreConfig config = new RocksDBStoreConfig(
+                tempDir.resolve("cf-profiles").toString(),
+                true,
+                0L,
+                2L * 1024L * 1024L,
+                2,
+                1,
+                0,
+                0,
+                0L,
+                0,
+                0,
+                0,
+                false,
+                false,
+                null,
+                false,
+                false,
+                RocksDBWalSyncMode.NONE,
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_INTERVAL_MILLIS,
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_WRITE_THRESHOLD,
+                true,
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS,
+                32L * 1024L * 1024L,
+                8L * 1024L * 1024L,
+                4L * 1024L * 1024L,
+                1L * 1024L * 1024L,
+                512L * 1024L,
+                64L * 1024L);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            Assertions.assertEquals(32L * 1024L * 1024L, engine.getDbWriteBufferSize());
+            Assertions.assertEquals(
+                    8L * 1024L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.GLOBAL_SESSION));
+            Assertions.assertEquals(
+                    4L * 1024L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.BRANCH_SESSION));
+            Assertions.assertEquals(
+                    1L * 1024L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.LOCK));
+            Assertions.assertEquals(
+                    512L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX));
+            Assertions.assertEquals(64L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.METADATA));
+        }
+    }
+
     private RocksDBStoreEngine open(String name, boolean syncWrite) {
         return RocksDBStoreEngine.open(config(name, syncWrite));
     }

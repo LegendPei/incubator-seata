@@ -105,7 +105,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final RocksDBStoreConfig config;
     private final Map<RocksDBColumnFamily, ColumnFamilyHandle> handles = new EnumMap<>(RocksDBColumnFamily.class);
     private final DBOptions dbOptions;
-    private final ColumnFamilyOptions columnFamilyOptions;
+    private final Map<RocksDBColumnFamily, ColumnFamilyOptions> columnFamilyOptions;
     private final ReadOptions readOptions;
     private final WriteOptions writeOptions;
     private final Cache blockCache;
@@ -120,10 +120,10 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private RocksDBStoreEngine(RocksDBStoreConfig config) {
         this.config = config;
         DBOptions openedDbOptions = null;
-        ColumnFamilyOptions openedColumnFamilyOptions = null;
+        Map<RocksDBColumnFamily, ColumnFamilyOptions> openedColumnFamilyOptions =
+                new EnumMap<>(RocksDBColumnFamily.class);
         ReadOptions openedReadOptions = null;
         WriteOptions openedWriteOptions = null;
-        BlockBasedTableConfig openedTableConfig = null;
         Cache openedBlockCache = null;
         Statistics openedStatistics = null;
         RocksDBWalSyncController openedWalSyncController = RocksDBWalSyncController.disabled();
@@ -139,24 +139,29 @@ public class RocksDBStoreEngine implements AutoCloseable {
             if (config.getMaxOpenFiles() > 0) {
                 openedDbOptions.setMaxOpenFiles(config.getMaxOpenFiles());
             }
+            if (config.getDbWriteBufferSize() > 0) {
+                openedDbOptions.setDbWriteBufferSize(config.getDbWriteBufferSize());
+            }
             if (config.isEnableStatistics()) {
                 openedStatistics = new Statistics();
                 openedDbOptions.setStatistics(openedStatistics);
             }
 
-            openedColumnFamilyOptions = new ColumnFamilyOptions();
             if (config.getBlockCacheSize() > 0) {
                 openedBlockCache = new LRUCache(config.getBlockCacheSize());
-                openedTableConfig = new BlockBasedTableConfig().setBlockCache(openedBlockCache);
-                openedColumnFamilyOptions.setTableFormatConfig(openedTableConfig);
             }
-            applyColumnFamilyOptions(openedColumnFamilyOptions, config);
             openedReadOptions = new ReadOptions();
             openedWriteOptions = new WriteOptions().setDisableWAL(false).setSync(config.isSyncWrite());
 
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
             for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
-                descriptors.add(new ColumnFamilyDescriptor(columnFamily.getNameBytes(), openedColumnFamilyOptions));
+                ColumnFamilyOptions options = new ColumnFamilyOptions();
+                if (openedBlockCache != null) {
+                    options.setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(openedBlockCache));
+                }
+                applyColumnFamilyOptions(options, config, columnFamily);
+                openedColumnFamilyOptions.put(columnFamily, options);
+                descriptors.add(new ColumnFamilyDescriptor(columnFamily.getNameBytes(), options));
             }
 
             openedDb = RocksDB.open(openedDbOptions, config.getDbPath(), descriptors, openedHandles);
@@ -174,7 +179,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                 openedWalSyncController.afterWrite();
             }
             dbOptions = openedDbOptions;
-            columnFamilyOptions = openedColumnFamilyOptions;
+            columnFamilyOptions = Collections.unmodifiableMap(new EnumMap<>(openedColumnFamilyOptions));
             readOptions = openedReadOptions;
             writeOptions = openedWriteOptions;
             blockCache = openedBlockCache;
@@ -235,6 +240,18 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public boolean wasLastShutdownClean() {
         return lastShutdownClean;
+    }
+
+    public long getDbWriteBufferSize() {
+        return dbOptions.dbWriteBufferSize();
+    }
+
+    public long getColumnFamilyWriteBufferSize(RocksDBColumnFamily columnFamily) {
+        ColumnFamilyOptions options = columnFamilyOptions.get(columnFamily);
+        if (options == null) {
+            throw new StoreException("RocksDB column family options not found:" + columnFamily);
+        }
+        return options.writeBufferSize();
     }
 
     public boolean isSyncWrite() {
@@ -894,7 +911,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
             RocksDB db,
             WriteOptions writeOptions,
             ReadOptions readOptions,
-            ColumnFamilyOptions columnFamilyOptions,
+            Map<RocksDBColumnFamily, ColumnFamilyOptions> columnFamilyOptions,
             DBOptions dbOptions,
             Cache blockCache,
             Statistics statistics) {
@@ -911,7 +928,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
             readOptions.close();
         }
         if (columnFamilyOptions != null) {
-            columnFamilyOptions.close();
+            for (ColumnFamilyOptions options : columnFamilyOptions.values()) {
+                options.close();
+            }
         }
         if (dbOptions != null) {
             dbOptions.close();
@@ -920,9 +939,11 @@ public class RocksDBStoreEngine implements AutoCloseable {
         closeQuietly(statistics);
     }
 
-    private static void applyColumnFamilyOptions(ColumnFamilyOptions options, RocksDBStoreConfig config) {
-        if (config.getWriteBufferSize() > 0) {
-            options.setWriteBufferSize(config.getWriteBufferSize());
+    private static void applyColumnFamilyOptions(
+            ColumnFamilyOptions options, RocksDBStoreConfig config, RocksDBColumnFamily columnFamily) {
+        long writeBufferSize = config.getWriteBufferSize(columnFamily);
+        if (writeBufferSize > 0) {
+            options.setWriteBufferSize(writeBufferSize);
         }
         if (config.getMaxWriteBufferNumber() > 0) {
             options.setMaxWriteBufferNumber(config.getMaxWriteBufferNumber());

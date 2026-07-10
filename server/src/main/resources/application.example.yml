@@ -199,6 +199,14 @@ seata:
       flush-disk-mode: async
       rocksdb:
         dir: sessionStore/rocksdb
+        # Optional global memtable budget across all column families. 0 keeps the RocksDB default.
+        db-write-buffer-size: 0
+        # Optional per-profile memtable sizes. 0 falls back to write-buffer-size / RocksDB default.
+        global-write-buffer-size: 0
+        branch-write-buffer-size: 0
+        lock-write-buffer-size: 0
+        index-write-buffer-size: 0
+        metadata-write-buffer-size: 0
         # periodic WAL sync is disabled by default; only works when flush-disk-mode is async.
         wal-sync-mode: none
         wal-sync-interval-millis: 2000
