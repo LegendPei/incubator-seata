@@ -46,6 +46,10 @@ class RocksDBStoreConfigTest {
         Assertions.assertFalse(config.isSyncWrite());
         Assertions.assertEquals(0L, config.getBlockCacheSize());
         Assertions.assertEquals(0L, config.getWriteBufferSize());
+        Assertions.assertEquals(0L, config.getDbWriteBufferSize());
+        for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
+            Assertions.assertEquals(0L, config.getWriteBufferSize(columnFamily));
+        }
         Assertions.assertEquals(0, config.getMaxWriteBufferNumber());
         Assertions.assertEquals(0, config.getMinWriteBufferNumberToMerge());
         Assertions.assertEquals(0, config.getMaxBackgroundJobs());
@@ -76,6 +80,12 @@ class RocksDBStoreConfigTest {
                 tempDir.resolve("configured").toString());
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE, "64KB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE, "2MB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_DB_WRITE_BUFFER_SIZE, "32MB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE, "8MB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_BRANCH_WRITE_BUFFER_SIZE, "4MB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_LOCK_WRITE_BUFFER_SIZE, "1MB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_INDEX_WRITE_BUFFER_SIZE, "512KB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_METADATA_WRITE_BUFFER_SIZE, "64KB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_WRITE_BUFFER_NUMBER, "3");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_MIN_WRITE_BUFFER_NUMBER_TO_MERGE, "2");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_BACKGROUND_JOBS, "4");
@@ -100,6 +110,13 @@ class RocksDBStoreConfigTest {
         Assertions.assertFalse(config.isSyncWrite());
         Assertions.assertEquals(64L * 1024L, config.getBlockCacheSize());
         Assertions.assertEquals(2L * 1024L * 1024L, config.getWriteBufferSize());
+        Assertions.assertEquals(32L * 1024L * 1024L, config.getDbWriteBufferSize());
+        Assertions.assertEquals(8L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.GLOBAL_SESSION));
+        Assertions.assertEquals(4L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.BRANCH_SESSION));
+        Assertions.assertEquals(1L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.LOCK));
+        Assertions.assertEquals(512L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.GLOBAL_STATUS_INDEX));
+        Assertions.assertEquals(512L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.LOCK_BRANCH_INDEX));
+        Assertions.assertEquals(64L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.METADATA));
         Assertions.assertEquals(3, config.getMaxWriteBufferNumber());
         Assertions.assertEquals(2, config.getMinWriteBufferNumberToMerge());
         Assertions.assertEquals(4, config.getMaxBackgroundJobs());
@@ -146,6 +163,28 @@ class RocksDBStoreConfigTest {
     void testRejectsInvalidSizeOption() {
         Map<String, String> values = new HashMap<>();
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE, "invalid");
+
+        Assertions.assertThrows(
+                StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+    }
+
+    @Test
+    void testColumnFamilyWriteBufferFallsBackToSharedSize() {
+        Map<String, String> values = new HashMap<>();
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE, "2MB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_LOCK_WRITE_BUFFER_SIZE, "256KB");
+
+        RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), false);
+
+        Assertions.assertEquals(2L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.GLOBAL_SESSION));
+        Assertions.assertEquals(256L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.LOCK));
+        Assertions.assertEquals(2L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.GLOBAL_STATUS_INDEX));
+    }
+
+    @Test
+    void testRejectsNegativeColumnFamilyWriteBufferSize() {
+        Map<String, String> values = new HashMap<>();
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_INDEX_WRITE_BUFFER_SIZE, "-1");
 
         Assertions.assertThrows(
                 StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
