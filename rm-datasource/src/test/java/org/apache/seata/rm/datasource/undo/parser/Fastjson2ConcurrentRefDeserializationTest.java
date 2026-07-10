@@ -26,7 +26,6 @@ import org.apache.seata.rm.datasource.undo.BranchUndoLog;
 import org.apache.seata.rm.datasource.undo.SQLUndoLog;
 import org.apache.seata.rm.datasource.undo.UndoLogParser;
 import org.apache.seata.sqlparser.SQLType;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 import java.sql.Types;
@@ -35,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -42,7 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 public class Fastjson2ConcurrentRefDeserializationTest {
 
-    private static final String ENABLE_STRESS_TEST_PROPERTY = "seata.fastjson2.concurrentRef";
+    private static final long CONCURRENT_TEST_TIMEOUT_SECONDS = 30;
 
     private final Fastjson2UndoLogParser parser =
             (Fastjson2UndoLogParser) EnhancedServiceLoader.load(UndoLogParser.class, Fastjson2UndoLogParser.NAME);
@@ -56,10 +56,6 @@ public class Fastjson2ConcurrentRefDeserializationTest {
 
     @Test
     public void concurrentDeserializeReferenceHeavyUndoLogDoesNotDropRefFields() throws Exception {
-        Assumptions.assumeTrue(
-                Boolean.getBoolean(ENABLE_STRESS_TEST_PROPERTY),
-                "set -D" + ENABLE_STRESS_TEST_PROPERTY + "=true to run the concurrent test");
-
         byte[] bytes = parser.encode(referenceHeavyUndoLog());
         assertThat(countNullRefFields(parser.decode(bytes))).isZero();
 
@@ -121,8 +117,8 @@ public class Fastjson2ConcurrentRefDeserializationTest {
     }
 
     private static int runConcurrentStress(NullCounter nullCounter) throws Exception {
-        int rounds = Integer.getInteger("seata.fastjson2.concurrentRef.rounds", 10);
-        int threadCount = Integer.getInteger("seata.fastjson2.concurrentRef.threads", 200);
+        int rounds = Integer.getInteger("seata.fastjson2.concurrentRef.rounds", 3);
+        int threadCount = Integer.getInteger("seata.fastjson2.concurrentRef.threads", 50);
         AtomicInteger totalNullTasks = new AtomicInteger();
         AtomicReference<Throwable> failure = new AtomicReference<>();
 
@@ -135,7 +131,7 @@ public class Fastjson2ConcurrentRefDeserializationTest {
                 Thread thread = new Thread(
                         () -> {
                             try {
-                                barrier.await();
+                                barrier.await(CONCURRENT_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
                                 if (nullCounter.countNulls() > 0) {
                                     roundNullTasks.incrementAndGet();
                                 }
@@ -148,7 +144,9 @@ public class Fastjson2ConcurrentRefDeserializationTest {
                         "fastjson2-undolog-ref-" + i);
                 thread.start();
             }
-            endLatch.await();
+            if (!endLatch.await(CONCURRENT_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new AssertionError("Timed out waiting for concurrent deserialization");
+            }
             if (failure.get() != null) {
                 throw new AssertionError("Concurrent deserialization failed", failure.get());
             }

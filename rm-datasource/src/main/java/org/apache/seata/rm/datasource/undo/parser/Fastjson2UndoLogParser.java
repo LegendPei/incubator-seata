@@ -17,6 +17,7 @@
 package org.apache.seata.rm.datasource.undo.parser;
 
 import com.alibaba.fastjson2.JSONB;
+import com.alibaba.fastjson2.JSONFactory;
 import com.alibaba.fastjson2.JSONReader;
 import com.alibaba.fastjson2.JSONWriter;
 import org.apache.seata.common.executor.Initialize;
@@ -27,8 +28,6 @@ import org.apache.seata.rm.datasource.undo.UndoLogParser;
 @LoadLevel(name = Fastjson2UndoLogParser.NAME)
 public class Fastjson2UndoLogParser implements UndoLogParser, Initialize {
     public static final String NAME = "fastjson2";
-
-    private static final Object PARSE_LOCK = new Object();
 
     private JSONReader.Feature[] jsonReaderFeature;
     private JSONWriter.Feature[] jsonWriterFeature;
@@ -77,7 +76,9 @@ public class Fastjson2UndoLogParser implements UndoLogParser, Initialize {
 
     @Override
     public BranchUndoLog decode(byte[] bytes) {
-        synchronized (PARSE_LOCK) {
+        // JSONB initializes readers in the shared provider lazily. Synchronization prevents $ref fields from being lost
+        // when fastjson2 initializes readers concurrently.
+        synchronized (JSONFactory.class) {
             return JSONB.parseObject(bytes, BranchUndoLog.class, jsonReaderFeature);
         }
     }
