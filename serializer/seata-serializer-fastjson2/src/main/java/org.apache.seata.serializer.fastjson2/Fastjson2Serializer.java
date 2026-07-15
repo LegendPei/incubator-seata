@@ -17,12 +17,16 @@
 package org.apache.seata.serializer.fastjson2;
 
 import com.alibaba.fastjson2.JSONB;
-import com.alibaba.fastjson2.JSONFactory;
 import org.apache.seata.common.loader.LoadLevel;
 import org.apache.seata.core.serializer.Serializer;
 
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
 @LoadLevel(name = "FASTJSON2")
 public class Fastjson2Serializer implements Serializer {
+
+    private static final Lock PARSE_LOCK = new ReentrantLock();
 
     @Override
     public <T> byte[] serialize(T t) {
@@ -31,14 +35,17 @@ public class Fastjson2Serializer implements Serializer {
 
     @Override
     public <T> T deserialize(byte[] bytes) {
-        // JSONB initializes readers in the shared provider lazily. Synchronization prevents $ref fields from being lost
+        // JSONB initializes readers in the shared provider lazily. The lock prevents $ref fields from being lost
         // when fastjson2 initializes readers concurrently.
-        synchronized (JSONFactory.class) {
+        PARSE_LOCK.lock();
+        try {
             return (T) JSONB.parseObject(
                     bytes,
                     Object.class,
                     Fastjson2SerializerFactory.getInstance().getFilter(),
                     Fastjson2SerializerFactory.getInstance().getJsonReaderFeatureList());
+        } finally {
+            PARSE_LOCK.unlock();
         }
     }
 }
