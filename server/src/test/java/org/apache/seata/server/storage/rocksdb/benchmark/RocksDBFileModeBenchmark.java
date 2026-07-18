@@ -1223,7 +1223,14 @@ public final class RocksDBFileModeBenchmark {
                 options.walSyncIntervalMillis,
                 options.walSyncWriteThreshold,
                 options.walSyncOnShutdown,
-                options.walSyncWarnThresholdMillis);
+                options.walSyncWarnThresholdMillis,
+                options.dbWriteBufferSize,
+                options.globalWriteBufferSize,
+                options.branchWriteBufferSize,
+                options.lockWriteBufferSize,
+                options.indexWriteBufferSize,
+                options.metadataWriteBufferSize,
+                options.maxTotalWalSize);
         return RocksDBStoreEngine.open(config);
     }
 
@@ -1439,6 +1446,13 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("blockCacheSize=" + BenchmarkOptions.humanReadableSize(options.blockCacheSize));
         System.out.println("tuningProfile=" + options.tuningProfile);
         System.out.println("writeBufferSize=" + BenchmarkOptions.humanReadableSize(options.writeBufferSize));
+        System.out.println("dbWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.dbWriteBufferSize));
+        System.out.println("globalWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.globalWriteBufferSize));
+        System.out.println("branchWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.branchWriteBufferSize));
+        System.out.println("lockWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.lockWriteBufferSize));
+        System.out.println("indexWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.indexWriteBufferSize));
+        System.out.println("metadataWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.metadataWriteBufferSize));
+        System.out.println("maxTotalWalSize=" + BenchmarkOptions.humanReadableSize(options.maxTotalWalSize));
         System.out.println("maxWriteBufferNumber=" + options.maxWriteBufferNumber);
         System.out.println("minWriteBufferNumberToMerge=" + options.minWriteBufferNumberToMerge);
         System.out.println("maxBackgroundJobs=" + options.maxBackgroundJobs);
@@ -1518,6 +1532,13 @@ public final class RocksDBFileModeBenchmark {
                 + ",enableRangeDelete=" + options.enableRangeDelete
                 + ",blockCacheSize=" + options.blockCacheSize
                 + ",writeBufferSize=" + options.writeBufferSize
+                + ",dbWriteBufferSize=" + options.dbWriteBufferSize
+                + ",globalWriteBufferSize=" + options.globalWriteBufferSize
+                + ",branchWriteBufferSize=" + options.branchWriteBufferSize
+                + ",lockWriteBufferSize=" + options.lockWriteBufferSize
+                + ",indexWriteBufferSize=" + options.indexWriteBufferSize
+                + ",metadataWriteBufferSize=" + options.metadataWriteBufferSize
+                + ",maxTotalWalSize=" + options.maxTotalWalSize
                 + ",maxWriteBufferNumber=" + options.maxWriteBufferNumber
                 + ",minWriteBufferNumberToMerge=" + options.minWriteBufferNumberToMerge
                 + ",maxBackgroundJobs=" + options.maxBackgroundJobs
@@ -2309,6 +2330,13 @@ public final class RocksDBFileModeBenchmark {
         private final boolean enableRangeDelete;
         private final long blockCacheSize;
         private final long writeBufferSize;
+        private final long dbWriteBufferSize;
+        private final long globalWriteBufferSize;
+        private final long branchWriteBufferSize;
+        private final long lockWriteBufferSize;
+        private final long indexWriteBufferSize;
+        private final long metadataWriteBufferSize;
+        private final long maxTotalWalSize;
         private final int maxWriteBufferNumber;
         private final int minWriteBufferNumberToMerge;
         private final int maxBackgroundJobs;
@@ -2410,7 +2438,14 @@ public final class RocksDBFileModeBenchmark {
                     0D,
                     "full",
                     1D,
-                    null);
+                    null,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L);
         }
 
         private BenchmarkOptions(
@@ -2457,7 +2492,14 @@ public final class RocksDBFileModeBenchmark {
                 double expiredRatio,
                 String lockWorkload,
                 double lockConflictRatio,
-                String xidFanoutDistribution) {
+                String xidFanoutDistribution,
+                long dbWriteBufferSize,
+                long globalWriteBufferSize,
+                long branchWriteBufferSize,
+                long lockWriteBufferSize,
+                long indexWriteBufferSize,
+                long metadataWriteBufferSize,
+                long maxTotalWalSize) {
             this.globalCount = positive(globalCount, "globalCount");
             this.branchPerGlobal = nonNegative(branchPerGlobal, "branchPerGlobal");
             this.lockPerBranch = nonNegative(lockPerBranch, "lockPerBranch");
@@ -2465,6 +2507,13 @@ public final class RocksDBFileModeBenchmark {
             this.enableRangeDelete = enableRangeDelete;
             this.blockCacheSize = nonNegative(blockCacheSize, "blockCacheSize");
             this.writeBufferSize = nonNegative(writeBufferSize, "writeBufferSize");
+            this.dbWriteBufferSize = nonNegative(dbWriteBufferSize, "dbWriteBufferSize");
+            this.globalWriteBufferSize = nonNegative(globalWriteBufferSize, "globalWriteBufferSize");
+            this.branchWriteBufferSize = nonNegative(branchWriteBufferSize, "branchWriteBufferSize");
+            this.lockWriteBufferSize = nonNegative(lockWriteBufferSize, "lockWriteBufferSize");
+            this.indexWriteBufferSize = nonNegative(indexWriteBufferSize, "indexWriteBufferSize");
+            this.metadataWriteBufferSize = nonNegative(metadataWriteBufferSize, "metadataWriteBufferSize");
+            this.maxTotalWalSize = nonNegative(maxTotalWalSize, "maxTotalWalSize");
             this.maxWriteBufferNumber = nonNegative(maxWriteBufferNumber, "maxWriteBufferNumber");
             this.minWriteBufferNumberToMerge = nonNegative(minWriteBufferNumberToMerge, "minWriteBufferNumberToMerge");
             this.maxBackgroundJobs = nonNegative(maxBackgroundJobs, "maxBackgroundJobs");
@@ -2562,9 +2611,16 @@ public final class RocksDBFileModeBenchmark {
                     ratioValue(values, "expiredRatio", 0D),
                     stringValue(values, "lockWorkload", "full"),
                     ratioValue(values, "lockConflictRatio", 1D),
-                    stringValue(values, "xidFanoutDistribution", null));
+                    stringValue(values, "xidFanoutDistribution", null),
+                    parseSizeOption(values, "dbWriteBufferSize", 0L),
+                    parseSizeOption(values, "globalWriteBufferSize", 0L),
+                    parseSizeOption(values, "branchWriteBufferSize", 0L),
+                    parseSizeOption(values, "lockWriteBufferSize", 0L),
+                    parseSizeOption(values, "indexWriteBufferSize", 0L),
+                    parseSizeOption(values, "metadataWriteBufferSize", 0L),
+                    parseSizeOption(values, "maxTotalWalSize", 0L));
             if (options.compare == null) {
-                return options.withTuningProfile(options.tuningProfile);
+                return options.withTuningProfile(options.tuningProfile).withExplicitR4Overrides(values);
             }
             return options;
         }
@@ -2682,7 +2738,14 @@ public final class RocksDBFileModeBenchmark {
                     expiredRatio,
                     lockWorkload,
                     lockConflictRatio,
-                    xidFanoutDistribution);
+                    xidFanoutDistribution,
+                    dbWriteBufferSize,
+                    globalWriteBufferSize,
+                    branchWriteBufferSize,
+                    lockWriteBufferSize,
+                    indexWriteBufferSize,
+                    metadataWriteBufferSize,
+                    maxTotalWalSize);
         }
 
         private BenchmarkOptions flipCompareOption() {
@@ -2735,7 +2798,14 @@ public final class RocksDBFileModeBenchmark {
                             expiredRatio,
                             lockWorkload,
                             lockConflictRatio,
-                            xidFanoutDistribution);
+                            xidFanoutDistribution,
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize);
                 case "enableRangeDelete":
                     return new BenchmarkOptions(
                             globalCount,
@@ -2781,7 +2851,14 @@ public final class RocksDBFileModeBenchmark {
                             expiredRatio,
                             lockWorkload,
                             lockConflictRatio,
-                            xidFanoutDistribution);
+                            xidFanoutDistribution,
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize);
                 case "blockCacheSize":
                     long flipped = blockCacheSize > 0 ? 0L : 128L * 1024 * 1024;
                     return new BenchmarkOptions(
@@ -2828,7 +2905,14 @@ public final class RocksDBFileModeBenchmark {
                             expiredRatio,
                             lockWorkload,
                             lockConflictRatio,
-                            xidFanoutDistribution);
+                            xidFanoutDistribution,
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize);
                 case "tuningProfile":
                     return withTuningProfile(tuningProfile);
                 case "walSyncMode":
@@ -2891,6 +2975,29 @@ public final class RocksDBFileModeBenchmark {
                 case "balanced":
                     return withTuning(
                             normalized, 64L * 1024 * 1024, 3, 1, 4, 0, 64L * 1024 * 1024, 8, 20, 36, true, false, null);
+                case "memory-balanced":
+                    return withTuning(
+                                    normalized,
+                                    64L * 1024 * 1024,
+                                    3,
+                                    1,
+                                    4,
+                                    0,
+                                    64L * 1024 * 1024,
+                                    8,
+                                    20,
+                                    36,
+                                    true,
+                                    false,
+                                    null)
+                            .withR4Budgets(
+                                    dbWriteBufferSize > 0 ? dbWriteBufferSize : 512L * 1024 * 1024,
+                                    globalWriteBufferSize > 0 ? globalWriteBufferSize : 64L * 1024 * 1024,
+                                    branchWriteBufferSize > 0 ? branchWriteBufferSize : 128L * 1024 * 1024,
+                                    lockWriteBufferSize > 0 ? lockWriteBufferSize : 128L * 1024 * 1024,
+                                    indexWriteBufferSize > 0 ? indexWriteBufferSize : 64L * 1024 * 1024,
+                                    metadataWriteBufferSize > 0 ? metadataWriteBufferSize : 16L * 1024 * 1024,
+                                    maxTotalWalSize > 0 ? maxTotalWalSize : 1024L * 1024 * 1024);
                 default:
                     throw new IllegalArgumentException("Unsupported tuningProfile:" + profile);
             }
@@ -2954,7 +3061,101 @@ public final class RocksDBFileModeBenchmark {
                     expiredRatio,
                     lockWorkload,
                     lockConflictRatio,
-                    xidFanoutDistribution);
+                    xidFanoutDistribution,
+                    dbWriteBufferSize,
+                    globalWriteBufferSize,
+                    branchWriteBufferSize,
+                    lockWriteBufferSize,
+                    indexWriteBufferSize,
+                    metadataWriteBufferSize,
+                    maxTotalWalSize);
+        }
+
+        private BenchmarkOptions withExplicitR4Overrides(Map<String, String> values) {
+            return withR4Budgets(
+                    values.containsKey("dbWriteBufferSize")
+                            ? parseSizeOption(values, "dbWriteBufferSize", dbWriteBufferSize)
+                            : dbWriteBufferSize,
+                    values.containsKey("globalWriteBufferSize")
+                            ? parseSizeOption(values, "globalWriteBufferSize", globalWriteBufferSize)
+                            : globalWriteBufferSize,
+                    values.containsKey("branchWriteBufferSize")
+                            ? parseSizeOption(values, "branchWriteBufferSize", branchWriteBufferSize)
+                            : branchWriteBufferSize,
+                    values.containsKey("lockWriteBufferSize")
+                            ? parseSizeOption(values, "lockWriteBufferSize", lockWriteBufferSize)
+                            : lockWriteBufferSize,
+                    values.containsKey("indexWriteBufferSize")
+                            ? parseSizeOption(values, "indexWriteBufferSize", indexWriteBufferSize)
+                            : indexWriteBufferSize,
+                    values.containsKey("metadataWriteBufferSize")
+                            ? parseSizeOption(values, "metadataWriteBufferSize", metadataWriteBufferSize)
+                            : metadataWriteBufferSize,
+                    values.containsKey("maxTotalWalSize")
+                            ? parseSizeOption(values, "maxTotalWalSize", maxTotalWalSize)
+                            : maxTotalWalSize);
+        }
+
+        private BenchmarkOptions withR4Budgets(
+                long newDbWriteBufferSize,
+                long newGlobalWriteBufferSize,
+                long newBranchWriteBufferSize,
+                long newLockWriteBufferSize,
+                long newIndexWriteBufferSize,
+                long newMetadataWriteBufferSize,
+                long newMaxTotalWalSize) {
+            return new BenchmarkOptions(
+                    globalCount,
+                    branchPerGlobal,
+                    lockPerBranch,
+                    syncWrite,
+                    enableRangeDelete,
+                    blockCacheSize,
+                    writeBufferSize,
+                    maxWriteBufferNumber,
+                    minWriteBufferNumberToMerge,
+                    maxBackgroundJobs,
+                    maxOpenFiles,
+                    targetFileSizeBase,
+                    level0FileNumCompactionTrigger,
+                    level0SlowdownWritesTrigger,
+                    level0StopWritesTrigger,
+                    enableStatistics,
+                    optimizeFiltersForHits,
+                    compressionType,
+                    walSyncMode,
+                    walSyncIntervalMillis,
+                    walSyncWriteThreshold,
+                    walSyncOnShutdown,
+                    walSyncWarnThresholdMillis,
+                    walSyncCompareMode,
+                    cleanup,
+                    warmupRounds,
+                    measureRounds,
+                    batchSize,
+                    queryIterationsPerRound,
+                    queryLimit,
+                    repeatRuns,
+                    compareOrder,
+                    runLabel,
+                    sampleEvery,
+                    seed,
+                    dbPath,
+                    benchmarks,
+                    compare,
+                    tuningProfile,
+                    statusDistribution,
+                    expiredRatio,
+                    lockWorkload,
+                    lockConflictRatio,
+                    xidFanoutDistribution,
+                    newDbWriteBufferSize,
+                    newGlobalWriteBufferSize,
+                    newBranchWriteBufferSize,
+                    newLockWriteBufferSize,
+                    newIndexWriteBufferSize,
+                    newMetadataWriteBufferSize,
+                    newMaxTotalWalSize);
         }
 
         private BenchmarkOptions withWalSyncMode(RocksDBWalSyncMode newWalSyncMode) {
@@ -3002,7 +3203,14 @@ public final class RocksDBFileModeBenchmark {
                     expiredRatio,
                     lockWorkload,
                     lockConflictRatio,
-                    xidFanoutDistribution);
+                    xidFanoutDistribution,
+                    dbWriteBufferSize,
+                    globalWriteBufferSize,
+                    branchWriteBufferSize,
+                    lockWriteBufferSize,
+                    indexWriteBufferSize,
+                    metadataWriteBufferSize,
+                    maxTotalWalSize);
         }
 
         private BenchmarkOptions withRunLabel(String newRunLabel) {
@@ -3050,7 +3258,14 @@ public final class RocksDBFileModeBenchmark {
                     expiredRatio,
                     lockWorkload,
                     lockConflictRatio,
-                    xidFanoutDistribution);
+                    xidFanoutDistribution,
+                    dbWriteBufferSize,
+                    globalWriteBufferSize,
+                    branchWriteBufferSize,
+                    lockWriteBufferSize,
+                    indexWriteBufferSize,
+                    metadataWriteBufferSize,
+                    maxTotalWalSize);
         }
 
         private List<String> comparisonRunLabels() {
@@ -3066,6 +3281,20 @@ public final class RocksDBFileModeBenchmark {
         private String tuningSummary() {
             return "writeBufferSize="
                     + humanReadableSize(writeBufferSize)
+                    + ",dbWriteBufferSize="
+                    + humanReadableSize(dbWriteBufferSize)
+                    + ",globalWriteBufferSize="
+                    + humanReadableSize(globalWriteBufferSize)
+                    + ",branchWriteBufferSize="
+                    + humanReadableSize(branchWriteBufferSize)
+                    + ",lockWriteBufferSize="
+                    + humanReadableSize(lockWriteBufferSize)
+                    + ",indexWriteBufferSize="
+                    + humanReadableSize(indexWriteBufferSize)
+                    + ",metadataWriteBufferSize="
+                    + humanReadableSize(metadataWriteBufferSize)
+                    + ",maxTotalWalSize="
+                    + humanReadableSize(maxTotalWalSize)
                     + ",maxWriteBufferNumber="
                     + maxWriteBufferNumber
                     + ",minWriteBufferNumberToMerge="

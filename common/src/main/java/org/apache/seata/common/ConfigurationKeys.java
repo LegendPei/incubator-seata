@@ -169,6 +169,11 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_DB_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "dbWriteBufferSize";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE = STORE_FILE_ROCKSDB_PREFIX + "maxTotalWalSize";
+
+    /**
      * The constant STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE.
      */
     String STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "globalWriteBufferSize";

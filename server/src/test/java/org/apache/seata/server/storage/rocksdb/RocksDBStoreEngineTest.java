@@ -540,10 +540,12 @@ class RocksDBStoreEngineTest {
                 4L * 1024L * 1024L,
                 1L * 1024L * 1024L,
                 512L * 1024L,
-                64L * 1024L);
+                64L * 1024L,
+                1024L * 1024L * 1024L);
 
         try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
             Assertions.assertEquals(32L * 1024L * 1024L, engine.getDbWriteBufferSize());
+            Assertions.assertEquals(1024L * 1024L * 1024L, engine.getMaxTotalWalSize());
             Assertions.assertEquals(
                     8L * 1024L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.GLOBAL_SESSION));
             Assertions.assertEquals(
