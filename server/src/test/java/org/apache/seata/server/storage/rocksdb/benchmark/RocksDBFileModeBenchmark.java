@@ -2975,6 +2975,27 @@ public final class RocksDBFileModeBenchmark {
                 case "balanced":
                     return withTuning(
                             normalized, 64L * 1024 * 1024, 3, 1, 4, 0, 64L * 1024 * 1024, 8, 20, 36, true, false, null);
+                case "balanced-no-r4":
+                    return withTuning(
+                            normalized, 64L * 1024 * 1024, 3, 1, 4, 0, 64L * 1024 * 1024, 8, 20, 36, true, false, null);
+                case "wal-only":
+                    return withR4Budgets(
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize > 0 ? maxTotalWalSize : 1024L * 1024 * 1024);
+                case "r4-memory-only":
+                    return withR4Budgets(
+                            dbWriteBufferSize > 0 ? dbWriteBufferSize : 512L * 1024 * 1024,
+                            globalWriteBufferSize > 0 ? globalWriteBufferSize : 64L * 1024 * 1024,
+                            branchWriteBufferSize > 0 ? branchWriteBufferSize : 128L * 1024 * 1024,
+                            lockWriteBufferSize > 0 ? lockWriteBufferSize : 128L * 1024 * 1024,
+                            indexWriteBufferSize > 0 ? indexWriteBufferSize : 64L * 1024 * 1024,
+                            metadataWriteBufferSize > 0 ? metadataWriteBufferSize : 16L * 1024 * 1024,
+                            maxTotalWalSize);
                 case "memory-balanced":
                     return withTuning(
                                     normalized,

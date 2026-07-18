@@ -74,6 +74,49 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testSplitTuningProfilesApplyOnlyTheirOwnedSettings() throws Exception {
+        Object balancedNoR4 = parseOptions("--tuningProfile=balanced-no-r4");
+        Object walOnly = parseOptions("--tuningProfile=wal-only");
+        Object memoryOnly = parseOptions("--tuningProfile=r4-memory-only");
+
+        Assertions.assertEquals(64L * 1024L * 1024L, longField(balancedNoR4, "writeBufferSize"));
+        Assertions.assertEquals(0L, longField(balancedNoR4, "maxTotalWalSize"));
+        Assertions.assertEquals(0L, longField(balancedNoR4, "dbWriteBufferSize"));
+
+        Assertions.assertEquals(1024L * 1024L * 1024L, longField(walOnly, "maxTotalWalSize"));
+        Assertions.assertEquals(0L, longField(walOnly, "writeBufferSize"));
+        Assertions.assertEquals(0L, longField(walOnly, "dbWriteBufferSize"));
+
+        Assertions.assertEquals(512L * 1024L * 1024L, longField(memoryOnly, "dbWriteBufferSize"));
+        Assertions.assertEquals(128L * 1024L * 1024L, longField(memoryOnly, "lockWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(memoryOnly, "maxTotalWalSize"));
+        Assertions.assertEquals(0L, longField(memoryOnly, "writeBufferSize"));
+    }
+
+    @Test
+    void testWalOnlyProfileHonorsExplicitOverrideDuringComparison() throws Exception {
+        Object options = parseOptions(
+                "--compare=tuningProfile", "--tuningProfile=wal-only", "--maxTotalWalSize=2GB");
+        Method method = options.getClass().getDeclaredMethod("flipCompareOption");
+        method.setAccessible(true);
+
+        Object profiled = method.invoke(options);
+
+        Assertions.assertEquals(2L * 1024L * 1024L * 1024L, longField(profiled, "maxTotalWalSize"));
+        Assertions.assertEquals(0L, longField(profiled, "dbWriteBufferSize"));
+    }
+
+    @Test
+    void testSplitProfileConfigDigestsDiffer() throws Exception {
+        Object walOnly = parseOptions("--tuningProfile=wal-only");
+        Object memoryOnly = parseOptions("--tuningProfile=r4-memory-only");
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("configDigest", walOnly.getClass());
+        method.setAccessible(true);
+
+        Assertions.assertNotEquals(method.invoke(null, walOnly), method.invoke(null, memoryOnly));
+    }
+
+    @Test
     void testExplicitR4OptionsOverrideMemoryBalancedProfile() throws Exception {
         Object options = parseOptions(
                 "--tuningProfile=memory-balanced",
