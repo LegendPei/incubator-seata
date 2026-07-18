@@ -44,7 +44,13 @@ public class RocksDBLockManager extends AbstractLockManager {
         this(storeEngine, RocksDBLocker.DEFAULT_LOCK_INDEX_SCAN_BATCH_SIZE);
     }
 
-    RocksDBLockManager(RocksDBStoreEngine storeEngine, int lockIndexScanBatchSize) {
+    /**
+     * Creates a lock manager with a bounded lock-index streaming batch size.
+     *
+     * <p>This is primarily useful for controlled performance experiments. Production callers should use the
+     * default constructor unless they have independently validated a different value for their workload.
+     */
+    public RocksDBLockManager(RocksDBStoreEngine storeEngine, int lockIndexScanBatchSize) {
         this.locker = new RocksDBLocker(storeEngine, new RocksDBLocalLocks(), lockIndexScanBatchSize);
     }
 

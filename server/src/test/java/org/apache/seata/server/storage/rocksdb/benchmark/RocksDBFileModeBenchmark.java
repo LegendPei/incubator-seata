@@ -80,7 +80,8 @@ public final class RocksDBFileModeBenchmark {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String CSV_HEADER =
             "scenario,globalCount,branchPerGlobal,lockPerBranch,syncWrite,enableRangeDelete,warmupRounds,"
-                    + "measureRounds,batchSize,queryIterationsPerRound,queryLimit,repeatRun,compareOrder,ops,totalMs,"
+                    + "measureRounds,batchSize,lockIndexScanBatchSize,queryIterationsPerRound,queryLimit,repeatRun,"
+                    + "compareOrder,ops,totalMs,"
                     + "opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles,"
                     + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
                     + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys,rowsScanned,rowsReturned,rowsUpdated,"
@@ -788,7 +789,8 @@ public final class RocksDBFileModeBenchmark {
                 Path dbPath = scenarioPath(runPath, "lock-round-" + round);
                 lastDbPath = dbPath;
                 try (RocksDBStoreEngine engine = open(dbPath, options)) {
-                    RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+                    RocksDBLockManager lockManager =
+                            new RocksDBLockManager(engine, options.lockIndexScanBatchSize);
                     for (BranchSession branchSession : dataSet.allBranches()) {
                         if (options.lockWorkloadIncludes(LOCK_OP_ACQUIRE)) {
                             RowMetrics acquireMetrics = RowMetrics.written(
@@ -892,7 +894,8 @@ public final class RocksDBFileModeBenchmark {
                 Path orphanDbPath = scenarioPath(runPath, "lock-clean-orphan-round-" + round);
                 lastOrphanDbPath = orphanDbPath;
                 try (RocksDBStoreEngine engine = open(orphanDbPath, options)) {
-                    RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+                    RocksDBLockManager lockManager =
+                            new RocksDBLockManager(engine, options.lockIndexScanBatchSize);
                     BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
                     List<BranchSession> allBranches = dataSet.allBranches();
                     int orphanRows = lockRows(allBranches);
@@ -1374,6 +1377,8 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + options.batchSize
                 + ","
+                + options.lockIndexScanBatchSize
+                + ","
                 + options.queryIterationsPerRound
                 + ","
                 + options.queryLimit
@@ -1508,6 +1513,7 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("warmupRounds=" + options.warmupRounds);
         System.out.println("measureRounds=" + options.measureRounds);
         System.out.println("batchSize=" + options.batchSize);
+        System.out.println("lockIndexScanBatchSize=" + options.lockIndexScanBatchSize);
         System.out.println("queryIterationsPerRound=" + options.queryIterationsPerRound);
         System.out.println("queryLimit=" + options.queryLimit);
         System.out.println("repeatRuns=" + options.repeatRuns);
@@ -2391,6 +2397,7 @@ public final class RocksDBFileModeBenchmark {
         private final int warmupRounds;
         private final int measureRounds;
         private final int batchSize;
+        private final int lockIndexScanBatchSize;
         private final int queryIterationsPerRound;
         private final int queryLimit;
         private final int repeatRuns;
@@ -2456,6 +2463,7 @@ public final class RocksDBFileModeBenchmark {
                     warmupRounds,
                     measureRounds,
                     batchSize,
+                    1024,
                     batchSize,
                     0,
                     1,
@@ -2510,6 +2518,7 @@ public final class RocksDBFileModeBenchmark {
                 int warmupRounds,
                 int measureRounds,
                 int batchSize,
+                int lockIndexScanBatchSize,
                 int queryIterationsPerRound,
                 int queryLimit,
                 int repeatRuns,
@@ -2569,6 +2578,7 @@ public final class RocksDBFileModeBenchmark {
             this.warmupRounds = nonNegative(warmupRounds, "warmupRounds");
             this.measureRounds = positive(measureRounds, "measureRounds");
             this.batchSize = positive(batchSize, "batchSize");
+            this.lockIndexScanBatchSize = positive(lockIndexScanBatchSize, "lockIndexScanBatchSize");
             this.queryIterationsPerRound = positive(queryIterationsPerRound, "queryIterationsPerRound");
             this.queryLimit = nonNegative(queryLimit, "queryLimit");
             this.repeatRuns = positive(repeatRuns, "repeatRuns");
@@ -2629,6 +2639,7 @@ public final class RocksDBFileModeBenchmark {
                     intValue(values, "warmupRounds", 1),
                     intValue(values, "measureRounds", 3),
                     batchSize,
+                    intValue(values, "lockIndexScanBatchSize", 1024),
                     intValue(values, "queryIterationsPerRound", batchSize),
                     intValue(values, "queryLimit", 0),
                     intValue(values, "repeatRuns", 1),
@@ -2756,6 +2767,7 @@ public final class RocksDBFileModeBenchmark {
                     warmupRounds,
                     measureRounds,
                     batchSize,
+                    lockIndexScanBatchSize,
                     queryIterationsPerRound,
                     queryLimit,
                     repeatRuns,
@@ -2823,6 +2835,7 @@ public final class RocksDBFileModeBenchmark {
                             warmupRounds,
                             measureRounds,
                             batchSize,
+                            lockIndexScanBatchSize,
                             queryIterationsPerRound,
                             queryLimit,
                             repeatRuns,
@@ -2876,6 +2889,7 @@ public final class RocksDBFileModeBenchmark {
                             warmupRounds,
                             measureRounds,
                             batchSize,
+                            lockIndexScanBatchSize,
                             queryIterationsPerRound,
                             queryLimit,
                             repeatRuns,
@@ -2930,6 +2944,7 @@ public final class RocksDBFileModeBenchmark {
                             warmupRounds,
                             measureRounds,
                             batchSize,
+                            lockIndexScanBatchSize,
                             queryIterationsPerRound,
                             queryLimit,
                             repeatRuns,
@@ -3109,6 +3124,7 @@ public final class RocksDBFileModeBenchmark {
                     warmupRounds,
                     measureRounds,
                     batchSize,
+                    lockIndexScanBatchSize,
                     queryIterationsPerRound,
                     queryLimit,
                     repeatRuns,
@@ -3196,6 +3212,7 @@ public final class RocksDBFileModeBenchmark {
                     warmupRounds,
                     measureRounds,
                     batchSize,
+                    lockIndexScanBatchSize,
                     queryIterationsPerRound,
                     queryLimit,
                     repeatRuns,
@@ -3251,6 +3268,7 @@ public final class RocksDBFileModeBenchmark {
                     warmupRounds,
                     measureRounds,
                     batchSize,
+                    lockIndexScanBatchSize,
                     queryIterationsPerRound,
                     queryLimit,
                     repeatRuns,
@@ -3306,6 +3324,7 @@ public final class RocksDBFileModeBenchmark {
                     warmupRounds,
                     measureRounds,
                     batchSize,
+                    lockIndexScanBatchSize,
                     queryIterationsPerRound,
                     queryLimit,
                     repeatRuns,
@@ -3358,6 +3377,8 @@ public final class RocksDBFileModeBenchmark {
                     + humanReadableSize(metadataWriteBufferSize)
                     + ",maxTotalWalSize="
                     + humanReadableSize(maxTotalWalSize)
+                    + ",lockIndexScanBatchSize="
+                    + lockIndexScanBatchSize
                     + ",maxWriteBufferNumber="
                     + maxWriteBufferNumber
                     + ",minWriteBufferNumberToMerge="

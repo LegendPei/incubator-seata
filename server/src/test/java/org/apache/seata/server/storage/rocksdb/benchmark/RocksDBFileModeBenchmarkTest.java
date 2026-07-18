@@ -47,6 +47,7 @@ class RocksDBFileModeBenchmarkTest {
     void testOptionsParseQueryAndCompareControls() throws Exception {
         Object options = parseOptions(
                 "--batchSize=5",
+                "--lockIndexScanBatchSize=256",
                 "--queryIterationsPerRound=7",
                 "--queryLimit=3",
                 "--repeatRuns=2",
@@ -54,6 +55,7 @@ class RocksDBFileModeBenchmarkTest {
                 "--compareOrder=BA");
 
         Assertions.assertEquals(5, intField(options, "batchSize"));
+        Assertions.assertEquals(256, intField(options, "lockIndexScanBatchSize"));
         Assertions.assertEquals(7, intField(options, "queryIterationsPerRound"));
         Assertions.assertEquals(3, intField(options, "queryLimit"));
         Assertions.assertEquals(2, intField(options, "repeatRuns"));
@@ -341,6 +343,7 @@ class RocksDBFileModeBenchmarkTest {
 
         Assertions.assertTrue(header.contains("queryIterationsPerRound"));
         Assertions.assertTrue(header.contains("queryLimit"));
+        Assertions.assertTrue(header.contains("lockIndexScanBatchSize"));
         Assertions.assertTrue(header.contains("repeatRun"));
         Assertions.assertTrue(header.contains("compareOrder"));
         Assertions.assertTrue(header.contains("rowsScanned"));
