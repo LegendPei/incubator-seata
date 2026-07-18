@@ -61,6 +61,56 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testMemoryBalancedProfileAppliesWalAndWriteBufferBudgets() throws Exception {
+        Object options = parseOptions("--tuningProfile=memory-balanced");
+
+        Assertions.assertEquals(1024L * 1024L * 1024L, longField(options, "maxTotalWalSize"));
+        Assertions.assertEquals(512L * 1024L * 1024L, longField(options, "dbWriteBufferSize"));
+        Assertions.assertEquals(64L * 1024L * 1024L, longField(options, "globalWriteBufferSize"));
+        Assertions.assertEquals(128L * 1024L * 1024L, longField(options, "branchWriteBufferSize"));
+        Assertions.assertEquals(128L * 1024L * 1024L, longField(options, "lockWriteBufferSize"));
+        Assertions.assertEquals(64L * 1024L * 1024L, longField(options, "indexWriteBufferSize"));
+        Assertions.assertEquals(16L * 1024L * 1024L, longField(options, "metadataWriteBufferSize"));
+    }
+
+    @Test
+    void testExplicitR4OptionsOverrideMemoryBalancedProfile() throws Exception {
+        Object options = parseOptions(
+                "--tuningProfile=memory-balanced",
+                "--maxTotalWalSize=2GB",
+                "--dbWriteBufferSize=768MB",
+                "--lockWriteBufferSize=256MB");
+
+        Assertions.assertEquals(2L * 1024L * 1024L * 1024L, longField(options, "maxTotalWalSize"));
+        Assertions.assertEquals(768L * 1024L * 1024L, longField(options, "dbWriteBufferSize"));
+        Assertions.assertEquals(256L * 1024L * 1024L, longField(options, "lockWriteBufferSize"));
+    }
+
+    @Test
+    void testExplicitR4OptionsOverrideProfileDuringProfileComparison() throws Exception {
+        Object options = parseOptions(
+                "--compare=tuningProfile",
+                "--tuningProfile=memory-balanced",
+                "--maxTotalWalSize=2GB");
+        Method method = options.getClass().getDeclaredMethod("flipCompareOption");
+        method.setAccessible(true);
+
+        Object profiled = method.invoke(options);
+
+        Assertions.assertEquals(2L * 1024L * 1024L * 1024L, longField(profiled, "maxTotalWalSize"));
+    }
+
+    @Test
+    void testConfigDigestIncludesWalAndR4Budgets() throws Exception {
+        Object smallBudget = parseOptions("--maxTotalWalSize=1GB", "--dbWriteBufferSize=512MB");
+        Object largeBudget = parseOptions("--maxTotalWalSize=2GB", "--dbWriteBufferSize=512MB");
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("configDigest", smallBudget.getClass());
+        method.setAccessible(true);
+
+        Assertions.assertNotEquals(method.invoke(null, smallBudget), method.invoke(null, largeBudget));
+    }
+
+    @Test
     void testComparePlanHonorsOrderAndRepeatRuns() throws Exception {
         Object options = parseOptions("--compare=syncWrite", "--compareOrder=BA", "--repeatRuns=2");
         Method method = options.getClass().getDeclaredMethod("comparisonRunLabels");
@@ -463,6 +513,12 @@ class RocksDBFileModeBenchmarkTest {
         Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         return (String) field.get(target);
+    }
+
+    private long longField(Object target, String name) throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.getLong(target);
     }
 
     private long staticLongField(Class<?> target, String name) throws Exception {

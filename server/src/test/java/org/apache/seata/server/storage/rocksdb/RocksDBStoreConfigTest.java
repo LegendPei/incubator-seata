@@ -81,6 +81,7 @@ class RocksDBStoreConfigTest {
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE, "64KB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE, "2MB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_DB_WRITE_BUFFER_SIZE, "32MB");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE, "1GB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE, "8MB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_BRANCH_WRITE_BUFFER_SIZE, "4MB");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_LOCK_WRITE_BUFFER_SIZE, "1MB");
@@ -111,6 +112,7 @@ class RocksDBStoreConfigTest {
         Assertions.assertEquals(64L * 1024L, config.getBlockCacheSize());
         Assertions.assertEquals(2L * 1024L * 1024L, config.getWriteBufferSize());
         Assertions.assertEquals(32L * 1024L * 1024L, config.getDbWriteBufferSize());
+        Assertions.assertEquals(1024L * 1024L * 1024L, config.getMaxTotalWalSize());
         Assertions.assertEquals(8L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.GLOBAL_SESSION));
         Assertions.assertEquals(4L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.BRANCH_SESSION));
         Assertions.assertEquals(1L * 1024L * 1024L, config.getWriteBufferSize(RocksDBColumnFamily.LOCK));

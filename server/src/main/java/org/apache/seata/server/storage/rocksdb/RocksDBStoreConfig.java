@@ -49,6 +49,7 @@ public class RocksDBStoreConfig {
     private final long blockCacheSize;
     private final long writeBufferSize;
     private final long dbWriteBufferSize;
+    private final long maxTotalWalSize;
     private final long globalWriteBufferSize;
     private final long branchWriteBufferSize;
     private final long lockWriteBufferSize;
@@ -280,6 +281,7 @@ public class RocksDBStoreConfig {
                 DEFAULT_LONG_OPTION,
                 DEFAULT_LONG_OPTION,
                 DEFAULT_LONG_OPTION,
+                DEFAULT_LONG_OPTION,
                 DEFAULT_LONG_OPTION);
     }
 
@@ -312,12 +314,76 @@ public class RocksDBStoreConfig {
             long lockWriteBufferSize,
             long indexWriteBufferSize,
             long metadataWriteBufferSize) {
+        this(
+                dbPath,
+                syncWrite,
+                blockCacheSize,
+                writeBufferSize,
+                maxWriteBufferNumber,
+                minWriteBufferNumberToMerge,
+                maxBackgroundJobs,
+                maxOpenFiles,
+                targetFileSizeBase,
+                level0FileNumCompactionTrigger,
+                level0SlowdownWritesTrigger,
+                level0StopWritesTrigger,
+                enableStatistics,
+                optimizeFiltersForHits,
+                compressionType,
+                enableRangeDelete,
+                rangeDeleteCompactAfterDelete,
+                walSyncMode,
+                walSyncIntervalMillis,
+                walSyncWriteThreshold,
+                walSyncOnShutdown,
+                walSyncWarnThresholdMillis,
+                dbWriteBufferSize,
+                globalWriteBufferSize,
+                branchWriteBufferSize,
+                lockWriteBufferSize,
+                indexWriteBufferSize,
+                metadataWriteBufferSize,
+                DEFAULT_LONG_OPTION);
+    }
+
+    public RocksDBStoreConfig(
+            String dbPath,
+            boolean syncWrite,
+            long blockCacheSize,
+            long writeBufferSize,
+            int maxWriteBufferNumber,
+            int minWriteBufferNumberToMerge,
+            int maxBackgroundJobs,
+            int maxOpenFiles,
+            long targetFileSizeBase,
+            int level0FileNumCompactionTrigger,
+            int level0SlowdownWritesTrigger,
+            int level0StopWritesTrigger,
+            boolean enableStatistics,
+            boolean optimizeFiltersForHits,
+            String compressionType,
+            boolean enableRangeDelete,
+            boolean rangeDeleteCompactAfterDelete,
+            RocksDBWalSyncMode walSyncMode,
+            int walSyncIntervalMillis,
+            long walSyncWriteThreshold,
+            boolean walSyncOnShutdown,
+            int walSyncWarnThresholdMillis,
+            long dbWriteBufferSize,
+            long globalWriteBufferSize,
+            long branchWriteBufferSize,
+            long lockWriteBufferSize,
+            long indexWriteBufferSize,
+            long metadataWriteBufferSize,
+            long maxTotalWalSize) {
         this.dbPath = dbPath;
         this.syncWrite = syncWrite;
         this.blockCacheSize = nonNegative(blockCacheSize, ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE);
         this.writeBufferSize = nonNegative(writeBufferSize, ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE);
         this.dbWriteBufferSize =
                 nonNegative(dbWriteBufferSize, ConfigurationKeys.STORE_FILE_ROCKSDB_DB_WRITE_BUFFER_SIZE);
+        this.maxTotalWalSize =
+                nonNegative(maxTotalWalSize, ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE);
         this.globalWriteBufferSize =
                 nonNegative(globalWriteBufferSize, ConfigurationKeys.STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE);
         this.branchWriteBufferSize =
@@ -415,7 +481,8 @@ public class RocksDBStoreConfig {
                 sizeOption(config, ConfigurationKeys.STORE_FILE_ROCKSDB_BRANCH_WRITE_BUFFER_SIZE),
                 sizeOption(config, ConfigurationKeys.STORE_FILE_ROCKSDB_LOCK_WRITE_BUFFER_SIZE),
                 sizeOption(config, ConfigurationKeys.STORE_FILE_ROCKSDB_INDEX_WRITE_BUFFER_SIZE),
-                sizeOption(config, ConfigurationKeys.STORE_FILE_ROCKSDB_METADATA_WRITE_BUFFER_SIZE));
+                sizeOption(config, ConfigurationKeys.STORE_FILE_ROCKSDB_METADATA_WRITE_BUFFER_SIZE),
+                sizeOption(config, ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE));
     }
 
     public String getDbPath() {
@@ -436,6 +503,10 @@ public class RocksDBStoreConfig {
 
     public long getDbWriteBufferSize() {
         return dbWriteBufferSize;
+    }
+
+    public long getMaxTotalWalSize() {
+        return maxTotalWalSize;
     }
 
     public long getWriteBufferSize(RocksDBColumnFamily columnFamily) {
@@ -544,6 +615,8 @@ public class RocksDBStoreConfig {
                 + writeBufferSize
                 + ", dbWriteBufferSize="
                 + dbWriteBufferSize
+                + ", maxTotalWalSize="
+                + maxTotalWalSize
                 + ", globalWriteBufferSize="
                 + globalWriteBufferSize
                 + ", branchWriteBufferSize="
@@ -605,6 +678,7 @@ public class RocksDBStoreConfig {
                 && blockCacheSize == that.blockCacheSize
                 && writeBufferSize == that.writeBufferSize
                 && dbWriteBufferSize == that.dbWriteBufferSize
+                && maxTotalWalSize == that.maxTotalWalSize
                 && globalWriteBufferSize == that.globalWriteBufferSize
                 && branchWriteBufferSize == that.branchWriteBufferSize
                 && lockWriteBufferSize == that.lockWriteBufferSize
@@ -639,6 +713,7 @@ public class RocksDBStoreConfig {
                 blockCacheSize,
                 writeBufferSize,
                 dbWriteBufferSize,
+                maxTotalWalSize,
                 globalWriteBufferSize,
                 branchWriteBufferSize,
                 lockWriteBufferSize,

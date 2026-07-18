@@ -142,6 +142,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
             if (config.getDbWriteBufferSize() > 0) {
                 openedDbOptions.setDbWriteBufferSize(config.getDbWriteBufferSize());
             }
+            if (config.getMaxTotalWalSize() > 0) {
+                openedDbOptions.setMaxTotalWalSize(config.getMaxTotalWalSize());
+            }
             if (config.isEnableStatistics()) {
                 openedStatistics = new Statistics();
                 openedDbOptions.setStatistics(openedStatistics);
@@ -244,6 +247,10 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public long getDbWriteBufferSize() {
         return dbOptions.dbWriteBufferSize();
+    }
+
+    public long getMaxTotalWalSize() {
+        return dbOptions.maxTotalWalSize();
     }
 
     public long getColumnFamilyWriteBufferSize(RocksDBColumnFamily columnFamily) {
