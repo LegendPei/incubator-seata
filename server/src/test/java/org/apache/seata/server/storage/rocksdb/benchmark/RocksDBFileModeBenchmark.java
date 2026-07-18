@@ -471,7 +471,7 @@ public final class RocksDBFileModeBenchmark {
     }
 
     private void runWithComparison(BenchmarkOptions baseOptions) throws Exception {
-        BenchmarkOptions optionsA = baseOptions;
+        BenchmarkOptions optionsA = baseOptions.comparisonBaseOptions();
         BenchmarkOptions optionsB = baseOptions.flipCompareOption();
 
         log("=== A/B comparison mode: %s ===", baseOptions.compare);
@@ -2781,6 +2781,13 @@ public final class RocksDBFileModeBenchmark {
                     maxTotalWalSize);
         }
 
+        private BenchmarkOptions comparisonBaseOptions() {
+            if ("explicitR4".equals(compare)) {
+                return withR4Budgets(0L, 0L, 0L, 0L, 0L, 0L, 0L);
+            }
+            return this;
+        }
+
         private BenchmarkOptions flipCompareOption() {
             if (compare == null) {
                 return this;
@@ -2950,6 +2957,8 @@ public final class RocksDBFileModeBenchmark {
                     return withTuningProfile(tuningProfile);
                 case "walSyncMode":
                     return withWalSyncMode(walSyncCompareMode);
+                case "explicitR4":
+                    return this;
                 default:
                     throw new IllegalArgumentException("Unsupported compare option: " + compare);
             }

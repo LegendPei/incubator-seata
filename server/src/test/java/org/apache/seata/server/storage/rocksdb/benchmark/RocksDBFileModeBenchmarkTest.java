@@ -141,6 +141,35 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testExplicitR4ComparisonKeepsABaselineAndAppliesBudgetsToB() throws Exception {
+        Object options = parseOptions(
+                "--compare=explicitR4",
+                "--dbWriteBufferSize=256MB",
+                "--globalWriteBufferSize=32MB",
+                "--branchWriteBufferSize=64MB",
+                "--lockWriteBufferSize=64MB",
+                "--indexWriteBufferSize=32MB",
+                "--metadataWriteBufferSize=8MB");
+        Method baseMethod = options.getClass().getDeclaredMethod("comparisonBaseOptions");
+        Method candidateMethod = options.getClass().getDeclaredMethod("flipCompareOption");
+        baseMethod.setAccessible(true);
+        candidateMethod.setAccessible(true);
+
+        Object baseline = baseMethod.invoke(options);
+        Object candidate = candidateMethod.invoke(options);
+
+        Assertions.assertEquals(0L, longField(baseline, "dbWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "globalWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "maxTotalWalSize"));
+        Assertions.assertEquals(256L * 1024L * 1024L, longField(candidate, "dbWriteBufferSize"));
+        Assertions.assertEquals(32L * 1024L * 1024L, longField(candidate, "globalWriteBufferSize"));
+        Assertions.assertEquals(64L * 1024L * 1024L, longField(candidate, "branchWriteBufferSize"));
+        Assertions.assertEquals(64L * 1024L * 1024L, longField(candidate, "lockWriteBufferSize"));
+        Assertions.assertEquals(32L * 1024L * 1024L, longField(candidate, "indexWriteBufferSize"));
+        Assertions.assertEquals(8L * 1024L * 1024L, longField(candidate, "metadataWriteBufferSize"));
+    }
+
+    @Test
     void testConfigDigestIncludesWalAndR4Budgets() throws Exception {
         Object smallBudget = parseOptions("--maxTotalWalSize=1GB", "--dbWriteBufferSize=512MB");
         Object largeBudget = parseOptions("--maxTotalWalSize=2GB", "--dbWriteBufferSize=512MB");
