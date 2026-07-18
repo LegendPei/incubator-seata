@@ -201,6 +201,8 @@ seata:
         dir: sessionStore/rocksdb
         # Optional global memtable budget across all column families. 0 keeps the RocksDB default.
         db-write-buffer-size: 0
+        # Optional total WAL size before RocksDB forces flushes. 0 keeps the RocksDB default.
+        max-total-wal-size: 0
         # Optional per-profile memtable sizes. 0 falls back to write-buffer-size / RocksDB default.
         global-write-buffer-size: 0
         branch-write-buffer-size: 0
