@@ -266,6 +266,56 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testAppendWriteBenchmarkOnlyEmitsAddScenarios() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-append-write-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=write",
+                    "--writeWorkload=append",
+                    "--globalCount=4",
+                    "--branchPerGlobal=1",
+                    "--lockPerBranch=0",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--batchSize=1",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Assertions.assertEquals("append", stringField(options, "writeWorkload"));
+            Map<String, String> globalAdd = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("write.global_add,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("write.global_add row missing")));
+            Map<String, String> branchAdd = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("write.branch_add,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("write.branch_add row missing")));
+            Assertions.assertEquals("4", globalAdd.get("ops"));
+            Assertions.assertEquals("4", branchAdd.get("ops"));
+            Assertions.assertFalse(lines.stream().anyMatch(line -> line.startsWith("write.global_update,")));
+            Assertions.assertFalse(lines.stream().anyMatch(line -> line.startsWith("write.branch_update,")));
+            Assertions.assertFalse(lines.stream().anyMatch(line -> line.startsWith("write.branch_remove,")));
+            Assertions.assertFalse(lines.stream().anyMatch(line -> line.startsWith("write.global_remove,")));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
     void testQueryStatusBenchmarkUsesBoundedScanStats() throws Exception {
         Path dbPath = Files.createTempDirectory("rocksdb-benchmark-query-stats-");
         Object originalEnvironment =
