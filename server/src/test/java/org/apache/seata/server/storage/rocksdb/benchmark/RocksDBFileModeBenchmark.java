@@ -79,7 +79,7 @@ public final class RocksDBFileModeBenchmark {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String CSV_HEADER =
-            "scenario,globalCount,branchPerGlobal,lockPerBranch,syncWrite,enableRangeDelete,warmupRounds,"
+            "scenario,globalCount,branchPerGlobal,lockPerBranch,writeWorkload,syncWrite,enableRangeDelete,warmupRounds,"
                     + "measureRounds,batchSize,lockIndexScanBatchSize,queryIterationsPerRound,queryLimit,repeatRun,"
                     + "compareOrder,ops,totalMs,"
                     + "opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles,"
@@ -111,6 +111,8 @@ public final class RocksDBFileModeBenchmark {
     private static final String LOCK_OP_RELEASE_BRANCH = "release_branch";
     private static final String LOCK_OP_RELEASE_GLOBAL = "release_global";
     private static final String LOCK_OP_CLEAN_ORPHAN = "clean_orphan";
+    private static final String WRITE_WORKLOAD_FULL = "full";
+    private static final String WRITE_WORKLOAD_APPEND = "append";
     private static final List<String> ALL_LOCK_WORKLOADS = Arrays.asList(
             LOCK_OP_ACQUIRE,
             LOCK_OP_CONFLICT,
@@ -581,55 +583,57 @@ public final class RocksDBFileModeBenchmark {
                                 () -> storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession));
                     }
                 }
-                for (GlobalSession globalSession : dataSet.globalSessions) {
-                    globalSession.setStatus(nextStatus(globalSession.getStatus()));
-                    RowMetrics globalUpdateMetrics = RowMetrics.written(5, estimateGlobalUpdateBytes(globalSession));
-                    measure(
-                            globalUpdateStats,
-                            round,
-                            options,
-                            globalUpdateMetrics,
-                            () -> storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession));
-                    for (BranchSession branchSession : dataSet.branchesOf(globalSession)) {
-                        branchSession.setStatus(BranchStatus.PhaseOne_Done);
-                        RowMetrics branchUpdateMetrics = RowMetrics.written(1, estimateBranchPutBytes(branchSession));
-                        measure(
-                                branchUpdateStats,
-                                round,
-                                options,
-                                branchUpdateMetrics,
-                                () -> storeManager.writeSession(LogOperation.BRANCH_UPDATE, branchSession));
-                    }
-                }
-                if (dataSet.totalBranchCount() > 0) {
+                if (options.isFullWriteWorkload()) {
                     for (GlobalSession globalSession : dataSet.globalSessions) {
-                        List<BranchSession> branches = dataSet.branchesOf(globalSession);
-                        if (branches.isEmpty()) {
-                            continue;
-                        }
-                        BranchSession branchSession = branches.get(0);
-                        RowMetrics branchRemoveMetrics =
-                                RowMetrics.written(1, estimateBranchDeleteBytes(branchSession));
+                        globalSession.setStatus(nextStatus(globalSession.getStatus()));
+                        RowMetrics globalUpdateMetrics = RowMetrics.written(5, estimateGlobalUpdateBytes(globalSession));
                         measure(
-                                branchRemoveStats,
+                                globalUpdateStats,
                                 round,
                                 options,
-                                branchRemoveMetrics,
-                                () -> storeManager.writeSession(LogOperation.BRANCH_REMOVE, branchSession));
+                                globalUpdateMetrics,
+                                () -> storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession));
+                        for (BranchSession branchSession : dataSet.branchesOf(globalSession)) {
+                            branchSession.setStatus(BranchStatus.PhaseOne_Done);
+                            RowMetrics branchUpdateMetrics = RowMetrics.written(1, estimateBranchPutBytes(branchSession));
+                            measure(
+                                    branchUpdateStats,
+                                    round,
+                                    options,
+                                    branchUpdateMetrics,
+                                    () -> storeManager.writeSession(LogOperation.BRANCH_UPDATE, branchSession));
+                        }
                     }
+                    if (dataSet.totalBranchCount() > 0) {
+                        for (GlobalSession globalSession : dataSet.globalSessions) {
+                            List<BranchSession> branches = dataSet.branchesOf(globalSession);
+                            if (branches.isEmpty()) {
+                                continue;
+                            }
+                            BranchSession branchSession = branches.get(0);
+                            RowMetrics branchRemoveMetrics =
+                                    RowMetrics.written(1, estimateBranchDeleteBytes(branchSession));
+                            measure(
+                                    branchRemoveStats,
+                                    round,
+                                    options,
+                                    branchRemoveMetrics,
+                                    () -> storeManager.writeSession(LogOperation.BRANCH_REMOVE, branchSession));
+                        }
+                    }
+                    for (GlobalSession globalSession : dataSet.globalSessions) {
+                        int branchCount = dataSet.branchesOf(globalSession).size();
+                        RowMetrics globalRemoveMetrics =
+                                RowMetrics.written(3L + branchCount, estimateGlobalRemoveBytes(globalSession, branchCount));
+                        measure(
+                                globalRemoveStats,
+                                round,
+                                options,
+                                globalRemoveMetrics,
+                                () -> storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession));
+                    }
+                    verifyStoreEmpty(engine);
                 }
-                for (GlobalSession globalSession : dataSet.globalSessions) {
-                    int branchCount = dataSet.branchesOf(globalSession).size();
-                    RowMetrics globalRemoveMetrics =
-                            RowMetrics.written(3L + branchCount, estimateGlobalRemoveBytes(globalSession, branchCount));
-                    measure(
-                            globalRemoveStats,
-                            round,
-                            options,
-                            globalRemoveMetrics,
-                            () -> storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession));
-                }
-                verifyStoreEmpty(engine);
                 engine.flush();
                 lastWalSyncStats = engine.diagnostics().getWalSyncStats();
             }
@@ -637,11 +641,13 @@ public final class RocksDBFileModeBenchmark {
 
         DbFootprint footprint = DbFootprint.from(lastDbPath, lastWalSyncStats);
         emit("write.global_add", options, globalAddStats, footprint, csvLines);
-        emit("write.global_update", options, globalUpdateStats, footprint, csvLines);
-        emit("write.global_remove", options, globalRemoveStats, footprint, csvLines);
         emit("write.branch_add", options, branchAddStats, footprint, csvLines);
-        emit("write.branch_update", options, branchUpdateStats, footprint, csvLines);
-        emit("write.branch_remove", options, branchRemoveStats, footprint, csvLines);
+        if (options.isFullWriteWorkload()) {
+            emit("write.global_update", options, globalUpdateStats, footprint, csvLines);
+            emit("write.global_remove", options, globalRemoveStats, footprint, csvLines);
+            emit("write.branch_update", options, branchUpdateStats, footprint, csvLines);
+            emit("write.branch_remove", options, branchRemoveStats, footprint, csvLines);
+        }
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
@@ -1367,6 +1373,8 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + options.lockPerBranch
                 + ","
+                + options.writeWorkload
+                + ","
                 + options.syncWrite
                 + ","
                 + options.enableRangeDelete
@@ -1510,6 +1518,7 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("globalCount=" + options.globalCount);
         System.out.println("branchPerGlobal=" + options.branchPerGlobal);
         System.out.println("lockPerBranch=" + options.lockPerBranch);
+        System.out.println("writeWorkload=" + options.writeWorkload);
         System.out.println("warmupRounds=" + options.warmupRounds);
         System.out.println("measureRounds=" + options.measureRounds);
         System.out.println("batchSize=" + options.batchSize);
@@ -2365,6 +2374,7 @@ public final class RocksDBFileModeBenchmark {
         private final int globalCount;
         private final int branchPerGlobal;
         private final int lockPerBranch;
+        private final String writeWorkload;
         private final boolean syncWrite;
         private final boolean enableRangeDelete;
         private final long blockCacheSize;
@@ -2438,6 +2448,7 @@ public final class RocksDBFileModeBenchmark {
                     globalCount,
                     branchPerGlobal,
                     lockPerBranch,
+                    WRITE_WORKLOAD_FULL,
                     syncWrite,
                     enableRangeDelete,
                     blockCacheSize,
@@ -2493,6 +2504,7 @@ public final class RocksDBFileModeBenchmark {
                 int globalCount,
                 int branchPerGlobal,
                 int lockPerBranch,
+                String writeWorkload,
                 boolean syncWrite,
                 boolean enableRangeDelete,
                 long blockCacheSize,
@@ -2545,6 +2557,7 @@ public final class RocksDBFileModeBenchmark {
             this.globalCount = positive(globalCount, "globalCount");
             this.branchPerGlobal = nonNegative(branchPerGlobal, "branchPerGlobal");
             this.lockPerBranch = nonNegative(lockPerBranch, "lockPerBranch");
+            this.writeWorkload = normalizeWriteWorkload(writeWorkload);
             this.syncWrite = syncWrite;
             this.enableRangeDelete = enableRangeDelete;
             this.blockCacheSize = nonNegative(blockCacheSize, "blockCacheSize");
@@ -2614,6 +2627,7 @@ public final class RocksDBFileModeBenchmark {
                     intValue(values, "globalCount", 1000),
                     intValue(values, "branchPerGlobal", 2),
                     intValue(values, "lockPerBranch", 2),
+                    stringValue(values, "writeWorkload", WRITE_WORKLOAD_FULL),
                     booleanValue(values, "syncWrite", false),
                     booleanValue(values, "enableRangeDelete", false),
                     parseSizeOption(values, "blockCacheSize", 0L),
@@ -2707,6 +2721,10 @@ public final class RocksDBFileModeBenchmark {
             return lockWorkloadOperations.contains(normalizeLockOperation(operation));
         }
 
+        private boolean isFullWriteWorkload() {
+            return WRITE_WORKLOAD_FULL.equals(writeWorkload);
+        }
+
         private boolean includeByRatio(int index, double ratioValue) {
             if (ratioValue <= 0D) {
                 return false;
@@ -2742,6 +2760,7 @@ public final class RocksDBFileModeBenchmark {
                     globalCount,
                     Math.max(1, branchPerGlobal),
                     Math.max(1, lockPerBranch),
+                    writeWorkload,
                     syncWrite,
                     enableRangeDelete,
                     blockCacheSize,
@@ -2810,6 +2829,7 @@ public final class RocksDBFileModeBenchmark {
                             globalCount,
                             branchPerGlobal,
                             lockPerBranch,
+                            writeWorkload,
                             !syncWrite,
                             enableRangeDelete,
                             blockCacheSize,
@@ -2864,6 +2884,7 @@ public final class RocksDBFileModeBenchmark {
                             globalCount,
                             branchPerGlobal,
                             lockPerBranch,
+                            writeWorkload,
                             syncWrite,
                             !enableRangeDelete,
                             blockCacheSize,
@@ -2919,6 +2940,7 @@ public final class RocksDBFileModeBenchmark {
                             globalCount,
                             branchPerGlobal,
                             lockPerBranch,
+                            writeWorkload,
                             syncWrite,
                             enableRangeDelete,
                             flipped,
@@ -3099,6 +3121,7 @@ public final class RocksDBFileModeBenchmark {
                     globalCount,
                     branchPerGlobal,
                     lockPerBranch,
+                    writeWorkload,
                     syncWrite,
                     enableRangeDelete,
                     blockCacheSize,
@@ -3187,6 +3210,7 @@ public final class RocksDBFileModeBenchmark {
                     globalCount,
                     branchPerGlobal,
                     lockPerBranch,
+                    writeWorkload,
                     syncWrite,
                     enableRangeDelete,
                     blockCacheSize,
@@ -3243,6 +3267,7 @@ public final class RocksDBFileModeBenchmark {
                     globalCount,
                     branchPerGlobal,
                     lockPerBranch,
+                    writeWorkload,
                     syncWrite,
                     enableRangeDelete,
                     blockCacheSize,
@@ -3299,6 +3324,7 @@ public final class RocksDBFileModeBenchmark {
                     globalCount,
                     branchPerGlobal,
                     lockPerBranch,
+                    writeWorkload,
                     syncWrite,
                     enableRangeDelete,
                     blockCacheSize,
@@ -3525,6 +3551,14 @@ public final class RocksDBFileModeBenchmark {
                 return "full";
             }
             return value.trim().toLowerCase(Locale.ROOT).replace('-', '_');
+        }
+
+        private static String normalizeWriteWorkload(String value) {
+            String normalized = StringUtils.isBlank(value) ? WRITE_WORKLOAD_FULL : value.trim().toLowerCase(Locale.ROOT);
+            if (!WRITE_WORKLOAD_FULL.equals(normalized) && !WRITE_WORKLOAD_APPEND.equals(normalized)) {
+                throw new IllegalArgumentException("Unsupported writeWorkload: " + value);
+            }
+            return normalized;
         }
 
         private static Set<String> parseLockWorkload(String value) {
