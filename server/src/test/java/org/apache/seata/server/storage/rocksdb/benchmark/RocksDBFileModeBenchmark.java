@@ -563,29 +563,41 @@ public final class RocksDBFileModeBenchmark {
             try (RocksDBStoreEngine engine = open(dbPath, options)) {
                 RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
                 for (GlobalSession globalSession : dataSet.globalSessions) {
-                    measure(globalAddStats, round, options, () -> {
-                        storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession);
-                        return RowMetrics.written(3, estimateGlobalPutBytes(globalSession));
-                    });
+                    RowMetrics globalAddMetrics = RowMetrics.written(3, estimateGlobalPutBytes(globalSession));
+                    measure(
+                            globalAddStats,
+                            round,
+                            options,
+                            globalAddMetrics,
+                            () -> storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession));
                     for (BranchSession branchSession : dataSet.branchesOf(globalSession)) {
-                        measure(branchAddStats, round, options, () -> {
-                            storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession);
-                            return RowMetrics.written(1, estimateBranchPutBytes(branchSession));
-                        });
+                        RowMetrics branchAddMetrics = RowMetrics.written(1, estimateBranchPutBytes(branchSession));
+                        measure(
+                                branchAddStats,
+                                round,
+                                options,
+                                branchAddMetrics,
+                                () -> storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession));
                     }
                 }
                 for (GlobalSession globalSession : dataSet.globalSessions) {
                     globalSession.setStatus(nextStatus(globalSession.getStatus()));
-                    measure(globalUpdateStats, round, options, () -> {
-                        storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession);
-                        return RowMetrics.written(5, estimateGlobalUpdateBytes(globalSession));
-                    });
+                    RowMetrics globalUpdateMetrics = RowMetrics.written(5, estimateGlobalUpdateBytes(globalSession));
+                    measure(
+                            globalUpdateStats,
+                            round,
+                            options,
+                            globalUpdateMetrics,
+                            () -> storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession));
                     for (BranchSession branchSession : dataSet.branchesOf(globalSession)) {
                         branchSession.setStatus(BranchStatus.PhaseOne_Done);
-                        measure(branchUpdateStats, round, options, () -> {
-                            storeManager.writeSession(LogOperation.BRANCH_UPDATE, branchSession);
-                            return RowMetrics.written(1, estimateBranchPutBytes(branchSession));
-                        });
+                        RowMetrics branchUpdateMetrics = RowMetrics.written(1, estimateBranchPutBytes(branchSession));
+                        measure(
+                                branchUpdateStats,
+                                round,
+                                options,
+                                branchUpdateMetrics,
+                                () -> storeManager.writeSession(LogOperation.BRANCH_UPDATE, branchSession));
                     }
                 }
                 if (dataSet.totalBranchCount() > 0) {
@@ -595,19 +607,26 @@ public final class RocksDBFileModeBenchmark {
                             continue;
                         }
                         BranchSession branchSession = branches.get(0);
-                        measure(branchRemoveStats, round, options, () -> {
-                            storeManager.writeSession(LogOperation.BRANCH_REMOVE, branchSession);
-                            return RowMetrics.written(1, estimateBranchDeleteBytes(branchSession));
-                        });
+                        RowMetrics branchRemoveMetrics =
+                                RowMetrics.written(1, estimateBranchDeleteBytes(branchSession));
+                        measure(
+                                branchRemoveStats,
+                                round,
+                                options,
+                                branchRemoveMetrics,
+                                () -> storeManager.writeSession(LogOperation.BRANCH_REMOVE, branchSession));
                     }
                 }
                 for (GlobalSession globalSession : dataSet.globalSessions) {
                     int branchCount = dataSet.branchesOf(globalSession).size();
-                    measure(globalRemoveStats, round, options, () -> {
-                        storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession);
-                        return RowMetrics.written(
-                                3L + branchCount, estimateGlobalRemoveBytes(globalSession, branchCount));
-                    });
+                    RowMetrics globalRemoveMetrics =
+                            RowMetrics.written(3L + branchCount, estimateGlobalRemoveBytes(globalSession, branchCount));
+                    measure(
+                            globalRemoveStats,
+                            round,
+                            options,
+                            globalRemoveMetrics,
+                            () -> storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession));
                 }
                 verifyStoreEmpty(engine);
                 engine.flush();
@@ -772,11 +791,11 @@ public final class RocksDBFileModeBenchmark {
                     RocksDBLockManager lockManager = new RocksDBLockManager(engine);
                     for (BranchSession branchSession : dataSet.allBranches()) {
                         if (options.lockWorkloadIncludes(LOCK_OP_ACQUIRE)) {
-                            measure(acquireStats, round, options, () -> {
+                            RowMetrics acquireMetrics = RowMetrics.written(
+                                    lockRows(branchSession) * 2L, estimateLockAcquireBytes(branchSession));
+                            measure(acquireStats, round, options, acquireMetrics, () -> {
                                 boolean locked = lockManager.acquireLock(branchSession);
                                 assertTrue(locked, "lock acquire failed");
-                                return RowMetrics.written(
-                                        lockRows(branchSession) * 2L, estimateLockAcquireBytes(branchSession));
                             });
                         } else {
                             assertTrue(lockManager.acquireLock(branchSession), "lock setup acquire failed");
@@ -807,24 +826,24 @@ public final class RocksDBFileModeBenchmark {
                             });
                         }
                         if (options.lockWorkloadIncludes(LOCK_OP_UPDATE_STATUS)) {
-                            measure(updateStatusStats, round, options, () -> {
+                            RowMetrics updateStatusMetrics = RowMetrics.scannedPointReadAndUpdated(
+                                    globalLockRows,
+                                    globalLockRows,
+                                    globalLockRows,
+                                    estimateLockValueRewriteBytes(branches));
+                            measure(updateStatusStats, round, options, updateStatusMetrics, () -> {
                                 lockManager.updateLockStatus(globalSession.getXid(), LockStatus.Rollbacking);
-                                return RowMetrics.scannedPointReadAndUpdated(
-                                        globalLockRows,
-                                        globalLockRows,
-                                        globalLockRows,
-                                        estimateLockValueRewriteBytes(branches));
                             });
                         }
                         if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_BRANCH)) {
-                            measure(releaseBranchStats, round, options, () -> {
+                            RowMetrics releaseBranchMetrics = RowMetrics.scannedPointReadAndUpdated(
+                                    branchLockRows,
+                                    branchLockRows,
+                                    branchLockRows * 2L,
+                                    estimateLockDeleteBytes(branchSession));
+                            measure(releaseBranchStats, round, options, releaseBranchMetrics, () -> {
                                 boolean released = lockManager.releaseLock(branchSession);
                                 assertTrue(released, "branch release failed");
-                                return RowMetrics.scannedPointReadAndUpdated(
-                                        branchLockRows,
-                                        branchLockRows,
-                                        branchLockRows * 2L,
-                                        estimateLockDeleteBytes(branchSession));
                             });
                         }
                         if (options.lockWorkloadIncludes(LOCK_OP_RELEASE_GLOBAL)) {
@@ -839,14 +858,14 @@ public final class RocksDBFileModeBenchmark {
                                 }
                             }
                             final int releaseGlobalRows = remainingGlobalLockRows;
-                            measure(releaseGlobalStats, round, options, () -> {
+                            RowMetrics releaseGlobalMetrics = RowMetrics.scannedPointReadAndUpdated(
+                                    releaseGlobalRows,
+                                    releaseGlobalRows,
+                                    releaseGlobalRows * 2L,
+                                    estimateLockDeleteBytes(branches));
+                            measure(releaseGlobalStats, round, options, releaseGlobalMetrics, () -> {
                                 boolean released = lockManager.releaseGlobalSessionLock(globalSession);
                                 assertTrue(released, "global release failed");
-                                return RowMetrics.scannedPointReadAndUpdated(
-                                        releaseGlobalRows,
-                                        releaseGlobalRows,
-                                        releaseGlobalRows * 2L,
-                                        estimateLockDeleteBytes(branches));
                             });
                         }
                     }
@@ -880,11 +899,11 @@ public final class RocksDBFileModeBenchmark {
                     for (BranchSession branchSession : allBranches) {
                         assertTrue(lockManager.acquireLock(branchSession), "orphan lock prepare failed");
                     }
-                    measure(cleanOrphanStats, round, options, () -> {
+                    RowMetrics cleanOrphanMetrics = RowMetrics.scannedPointReadAndUpdated(
+                            orphanRows, orphanRows, orphanRows * 2L, estimateLockDeleteBytes(allBranches));
+                    measure(cleanOrphanStats, round, options, cleanOrphanMetrics, () -> {
                         int cleaned = lockManager.cleanOrphanLocks();
                         assertTrue(cleaned > 0 || orphanRows == 0, "cleanOrphanLocks should clean prepared locks");
-                        return RowMetrics.scannedPointReadAndUpdated(
-                                orphanRows, orphanRows, cleaned * 2L, estimateLockDeleteBytes(allBranches));
                     });
                     assertTrue(
                             engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0])
@@ -1278,6 +1297,17 @@ public final class RocksDBFileModeBenchmark {
         }
     }
 
+    private static void measure(
+            OperationStats stats, int round, BenchmarkOptions options, RowMetrics rows, BenchmarkTask task)
+            throws Exception {
+        long startedAt = System.nanoTime();
+        task.run();
+        long elapsed = System.nanoTime() - startedAt;
+        if (round >= options.warmupRounds) {
+            stats.record(elapsed, rows);
+        }
+    }
+
     private static void measure(OperationStats stats, int round, BenchmarkOptions options, MeasuredBenchmarkTask task)
             throws Exception {
         long startedAt = System.nanoTime();
@@ -1447,11 +1477,14 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("tuningProfile=" + options.tuningProfile);
         System.out.println("writeBufferSize=" + BenchmarkOptions.humanReadableSize(options.writeBufferSize));
         System.out.println("dbWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.dbWriteBufferSize));
-        System.out.println("globalWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.globalWriteBufferSize));
-        System.out.println("branchWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.branchWriteBufferSize));
+        System.out.println(
+                "globalWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.globalWriteBufferSize));
+        System.out.println(
+                "branchWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.branchWriteBufferSize));
         System.out.println("lockWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.lockWriteBufferSize));
         System.out.println("indexWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.indexWriteBufferSize));
-        System.out.println("metadataWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.metadataWriteBufferSize));
+        System.out.println(
+                "metadataWriteBufferSize=" + BenchmarkOptions.humanReadableSize(options.metadataWriteBufferSize));
         System.out.println("maxTotalWalSize=" + BenchmarkOptions.humanReadableSize(options.maxTotalWalSize));
         System.out.println("maxWriteBufferNumber=" + options.maxWriteBufferNumber);
         System.out.println("minWriteBufferNumberToMerge=" + options.minWriteBufferNumberToMerge);

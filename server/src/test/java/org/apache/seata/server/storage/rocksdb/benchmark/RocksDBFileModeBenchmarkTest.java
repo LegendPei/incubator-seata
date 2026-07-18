@@ -95,8 +95,7 @@ class RocksDBFileModeBenchmarkTest {
 
     @Test
     void testWalOnlyProfileHonorsExplicitOverrideDuringComparison() throws Exception {
-        Object options = parseOptions(
-                "--compare=tuningProfile", "--tuningProfile=wal-only", "--maxTotalWalSize=2GB");
+        Object options = parseOptions("--compare=tuningProfile", "--tuningProfile=wal-only", "--maxTotalWalSize=2GB");
         Method method = options.getClass().getDeclaredMethod("flipCompareOption");
         method.setAccessible(true);
 
@@ -131,10 +130,8 @@ class RocksDBFileModeBenchmarkTest {
 
     @Test
     void testExplicitR4OptionsOverrideProfileDuringProfileComparison() throws Exception {
-        Object options = parseOptions(
-                "--compare=tuningProfile",
-                "--tuningProfile=memory-balanced",
-                "--maxTotalWalSize=2GB");
+        Object options =
+                parseOptions("--compare=tuningProfile", "--tuningProfile=memory-balanced", "--maxTotalWalSize=2GB");
         Method method = options.getClass().getDeclaredMethod("flipCompareOption");
         method.setAccessible(true);
 
@@ -223,6 +220,13 @@ class RocksDBFileModeBenchmarkTest {
             List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
 
             Assertions.assertTrue(lines.stream().anyMatch(line -> line.startsWith("write.branch_remove,")));
+            Map<String, String> globalAdd = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("write.global_add,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("write.global_add row missing")));
+            Assertions.assertTrue(
+                    Long.parseLong(globalAdd.get("writeBatchBytes")) > 0L,
+                    "moving metric preparation outside the timed operation must preserve write byte metrics");
         } finally {
             ConfigurationCache.clear();
             restoreEnvironment(originalEnvironment);
