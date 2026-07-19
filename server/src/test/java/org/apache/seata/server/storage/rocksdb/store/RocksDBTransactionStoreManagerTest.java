@@ -168,6 +168,49 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testGlobalRemoveIsIdempotentAndPersistsAcrossReopenForBothDeleteStrategies() {
+        for (boolean enableRangeDelete : new boolean[] {false, true}) {
+            String databaseName = "global-remove-reopen-" + enableRangeDelete;
+            GlobalSession removed = globalSession("tx-remove-reopen-" + enableRangeDelete, GlobalStatus.Begin);
+            GlobalSession kept = globalSession("tx-keep-reopen-" + enableRangeDelete, GlobalStatus.Begin);
+
+            try (RocksDBStoreEngine engine = open(databaseName, enableRangeDelete)) {
+                RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, removed);
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 1L));
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 2L));
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 3L));
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, kept);
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(kept, 1L));
+
+                Assertions.assertTrue(storeManager.writeSession(LogOperation.GLOBAL_REMOVE, removed));
+                Assertions.assertTrue(storeManager.writeSession(LogOperation.GLOBAL_REMOVE, removed));
+            }
+
+            try (RocksDBStoreEngine engine = open(databaseName, enableRangeDelete)) {
+                RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+                Assertions.assertNull(storeManager.readSession(removed.getXid(), true));
+                Assertions.assertTrue(engine.prefixScan(
+                                RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(removed.getXid()))
+                        .isEmpty());
+                Assertions.assertTrue(storeManager.readSession(new GlobalStatus[] {GlobalStatus.Begin}, false).stream()
+                        .noneMatch(session -> removed.getXid().equals(session.getXid())));
+                SessionCondition transactionIdCondition = new SessionCondition();
+                transactionIdCondition.setTransactionId(removed.getTransactionId());
+                Assertions.assertTrue(storeManager.readSession(transactionIdCondition).isEmpty());
+                Assertions.assertNull(engine.get(
+                        RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                        RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                                removed.getBeginTime() + removed.getTimeout(), removed.getXid())));
+
+                GlobalSession actualKept = storeManager.readSession(kept.getXid(), true);
+                Assertions.assertNotNull(actualKept);
+                Assertions.assertEquals(1, actualKept.getBranchSessions().size());
+            }
+        }
+    }
+
+    @Test
     void testReadByStatus() {
         try (RocksDBStoreEngine engine = open("status")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);

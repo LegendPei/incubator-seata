@@ -266,6 +266,52 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testGlobalRemoveBenchmarkReportsActualDeleteStrategyMetrics() throws Exception {
+        Path scanDbPath = Files.createTempDirectory("rocksdb-benchmark-global-remove-scan-");
+        Path rangeDbPath = Files.createTempDirectory("rocksdb-benchmark-global-remove-range-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Map<String, String> scan = runGlobalRemoveBenchmark(scanDbPath, false, "write", "write.global_remove");
+            Map<String, String> range = runGlobalRemoveBenchmark(rangeDbPath, true, "write", "write.global_remove");
+
+            Assertions.assertEquals("8", scan.get("branchFanout"));
+            Assertions.assertEquals("8", scan.get("rowsScanned"));
+            Assertions.assertEquals("8", scan.get("iteratorNext"));
+            Assertions.assertEquals("20", scan.get("pointDeleteCount"));
+            Assertions.assertEquals("0", scan.get("rangeDeleteCount"));
+            Assertions.assertEquals("4", scan.get("deleteBatchCount"));
+
+            Assertions.assertEquals("8", range.get("branchFanout"));
+            Assertions.assertEquals("0", range.get("rowsScanned"));
+            Assertions.assertEquals("0", range.get("iteratorNext"));
+            Assertions.assertEquals("12", range.get("pointDeleteCount"));
+            Assertions.assertEquals("4", range.get("rangeDeleteCount"));
+            Assertions.assertEquals("4", range.get("deleteBatchCount"));
+
+            Map<String, String> cleanupScan =
+                    runGlobalRemoveBenchmark(scanDbPath, false, "cleanup", "cleanup.global_remove_with_branches");
+            Map<String, String> cleanupRange =
+                    runGlobalRemoveBenchmark(rangeDbPath, true, "cleanup", "cleanup.global_remove_with_branches");
+            Assertions.assertEquals("12", cleanupScan.get("branchFanout"));
+            Assertions.assertEquals("12", cleanupScan.get("rowsScanned"));
+            Assertions.assertEquals("25", cleanupScan.get("pointDeleteCount"));
+            Assertions.assertEquals("0", cleanupScan.get("rangeDeleteCount"));
+            Assertions.assertEquals("12", cleanupRange.get("branchFanout"));
+            Assertions.assertEquals("0", cleanupRange.get("rowsScanned"));
+            Assertions.assertEquals("13", cleanupRange.get("pointDeleteCount"));
+            Assertions.assertEquals("4", cleanupRange.get("rangeDeleteCount"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(scanDbPath);
+            deleteRecursively(rangeDbPath);
+        }
+    }
+
+    @Test
     void testAppendWriteBenchmarkOnlyEmitsAddScenarios() throws Exception {
         Path dbPath = Files.createTempDirectory("rocksdb-benchmark-append-write-");
         Object originalEnvironment =
@@ -466,7 +512,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "2",
                         "iteratorNext", "10",
                         "writeBatchBytes", "100",
-                        "innerOperations", "1")),
+                        "innerOperations", "1",
+                        "rangeDeleteCount", "0",
+                        "pointDeleteCount", "10",
+                        "deleteBatchCount", "1",
+                        "branchFanout", "4",
+                        "lockFanout", "0")),
                 csvLine(map(
                         "scenario", "query.status",
                         "repeatRun", "A2",
@@ -481,7 +532,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "6",
                         "iteratorNext", "30",
                         "writeBatchBytes", "300",
-                        "innerOperations", "3")));
+                        "innerOperations", "3",
+                        "rangeDeleteCount", "2",
+                        "pointDeleteCount", "30",
+                        "deleteBatchCount", "3",
+                        "branchFanout", "12",
+                        "lockFanout", "4")));
         Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("summarizeCsvLines", List.class);
         method.setAccessible(true);
 
@@ -505,6 +561,11 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals("20.000", summary.get("iteratorNextMean"));
         Assertions.assertEquals("200.000", summary.get("writeBatchBytesMean"));
         Assertions.assertEquals("2.000", summary.get("innerOperationsMean"));
+        Assertions.assertEquals("1.000", summary.get("rangeDeleteCountMean"));
+        Assertions.assertEquals("20.000", summary.get("pointDeleteCountMean"));
+        Assertions.assertEquals("2.000", summary.get("deleteBatchCountMean"));
+        Assertions.assertEquals("8.000", summary.get("branchFanoutMean"));
+        Assertions.assertEquals("2.000", summary.get("lockFanoutMean"));
     }
 
     @Test
@@ -524,7 +585,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "2",
                         "iteratorNext", "10",
                         "writeBatchBytes", "100",
-                        "innerOperations", "1")),
+                        "innerOperations", "1",
+                        "rangeDeleteCount", "0",
+                        "pointDeleteCount", "10",
+                        "deleteBatchCount", "1",
+                        "branchFanout", "4",
+                        "lockFanout", "0")),
                 csvLine(map(
                         "scenario", "query.status",
                         "repeatRun", "B2",
@@ -539,7 +605,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "6",
                         "iteratorNext", "30",
                         "writeBatchBytes", "300",
-                        "innerOperations", "3")));
+                        "innerOperations", "3",
+                        "rangeDeleteCount", "2",
+                        "pointDeleteCount", "30",
+                        "deleteBatchCount", "3",
+                        "branchFanout", "12",
+                        "lockFanout", "4")));
         Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("summarizeCsvLinesAsJson", List.class);
         method.setAccessible(true);
 
@@ -562,6 +633,11 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals(4.0D, ((Number) operations.get("pointReadsMean")).doubleValue());
         Assertions.assertEquals(20.0D, ((Number) operations.get("iteratorNextMean")).doubleValue());
         Assertions.assertEquals(200.0D, ((Number) operations.get("writeBatchBytesMean")).doubleValue());
+        Assertions.assertEquals(1.0D, ((Number) operations.get("rangeDeleteCountMean")).doubleValue());
+        Assertions.assertEquals(20.0D, ((Number) operations.get("pointDeleteCountMean")).doubleValue());
+        Assertions.assertEquals(2.0D, ((Number) operations.get("deleteBatchCountMean")).doubleValue());
+        Assertions.assertEquals(8.0D, ((Number) operations.get("branchFanoutMean")).doubleValue());
+        Assertions.assertEquals(2.0D, ((Number) operations.get("lockFanoutMean")).doubleValue());
         Assertions.assertEquals(Collections.singletonList("query.status:B"), root.get("summaryKeys"));
     }
 
@@ -654,6 +730,32 @@ class RocksDBFileModeBenchmarkTest {
         Field field = target.getDeclaredField(name);
         field.setAccessible(true);
         return ((Number) field.get(null)).longValue();
+    }
+
+    private Map<String, String> runGlobalRemoveBenchmark(
+            Path dbPath, boolean enableRangeDelete, String benchmark, String scenario) throws Exception {
+        Object options = parseOptions(
+                "--benchmark=" + benchmark,
+                "--globalCount=4",
+                "--branchPerGlobal=3",
+                "--lockPerBranch=0",
+                "--warmupRounds=0",
+                "--measureRounds=1",
+                "--batchSize=1",
+                "--enableRangeDelete=" + enableRangeDelete,
+                "--cleanup=true",
+                "--dbPath=" + dbPath);
+        Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+        return parseCsvLine(lines.stream()
+                .filter(line -> line.startsWith(scenario + ","))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(scenario + " row missing")));
     }
 
     private String csvLine(Map<String, String> valuesByColumn) throws Exception {

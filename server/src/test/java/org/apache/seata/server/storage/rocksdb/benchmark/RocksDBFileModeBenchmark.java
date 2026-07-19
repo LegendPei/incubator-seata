@@ -85,7 +85,8 @@ public final class RocksDBFileModeBenchmark {
                     + "opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles,"
                     + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
                     + "globalEstimateKeys,branchEstimateKeys,lockEstimateKeys,rowsScanned,rowsReturned,rowsUpdated,"
-                    + "pointReads,iteratorNext,writeBatchBytes,innerOperations,rocksdbConfigDigest,"
+                    + "pointReads,iteratorNext,writeBatchBytes,innerOperations,rangeDeleteCount,pointDeleteCount,"
+                    + "deleteBatchCount,branchFanout,lockFanout,rocksdbConfigDigest,"
                     + "walSyncMode,walSyncIntervalMillis,walSyncWriteThreshold,walSyncCount,walSyncFailureCount,"
                     + "walSyncAvgMs,walSyncMaxMs,walUnsyncedWrites,walMaxUnsyncedWrites,walUnsyncedMs,"
                     + "walMaxUnsyncedMs,walLatestSequenceNumber,walLastSyncedSequenceNumber";
@@ -93,7 +94,8 @@ public final class RocksDBFileModeBenchmark {
             "scenario,runGroup,runCount,opsPerSecondMean,opsPerSecondMedian,opsPerSecondP95,opsPerSecondP99,"
                     + "opsPerSecondMin,opsPerSecondMax,opsPerSecondStddev,totalMsMean,p50MsMedian,p95MsMedian,"
                     + "p99MsMedian,rowsScannedMean,rowsReturnedMean,rowsUpdatedMean,pointReadsMean,iteratorNextMean,"
-                    + "writeBatchBytesMean,innerOperationsMean";
+                    + "writeBatchBytesMean,innerOperationsMean,rangeDeleteCountMean,pointDeleteCountMean,"
+                    + "deleteBatchCountMean,branchFanoutMean,lockFanoutMean";
     private static final List<String> ALL_BENCHMARKS = Arrays.asList("write", "query", "lock", "cleanup", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
@@ -338,6 +340,11 @@ public final class RocksDBFileModeBenchmark {
         int iteratorNextIndex = csvColumnIndex("iteratorNext");
         int writeBatchBytesIndex = csvColumnIndex("writeBatchBytes");
         int innerOperationsIndex = csvColumnIndex("innerOperations");
+        int rangeDeleteCountIndex = csvColumnIndex("rangeDeleteCount");
+        int pointDeleteCountIndex = csvColumnIndex("pointDeleteCount");
+        int deleteBatchCountIndex = csvColumnIndex("deleteBatchCount");
+        int branchFanoutIndex = csvColumnIndex("branchFanout");
+        int lockFanoutIndex = csvColumnIndex("lockFanout");
         int minColumns = max(
                         scenarioIndex,
                         repeatRunIndex,
@@ -352,7 +359,12 @@ public final class RocksDBFileModeBenchmark {
                         pointReadsIndex,
                         iteratorNextIndex,
                         writeBatchBytesIndex,
-                        innerOperationsIndex)
+                        innerOperationsIndex,
+                        rangeDeleteCountIndex,
+                        pointDeleteCountIndex,
+                        deleteBatchCountIndex,
+                        branchFanoutIndex,
+                        lockFanoutIndex)
                 + 1;
         for (String line : csvLines) {
             if (line.isEmpty() || line.startsWith("#")) {
@@ -379,7 +391,12 @@ public final class RocksDBFileModeBenchmark {
                     doubleValue(parts[pointReadsIndex]),
                     doubleValue(parts[iteratorNextIndex]),
                     doubleValue(parts[writeBatchBytesIndex]),
-                    doubleValue(parts[innerOperationsIndex]));
+                    doubleValue(parts[innerOperationsIndex]),
+                    doubleValue(parts[rangeDeleteCountIndex]),
+                    doubleValue(parts[pointDeleteCountIndex]),
+                    doubleValue(parts[deleteBatchCountIndex]),
+                    doubleValue(parts[branchFanoutIndex]),
+                    doubleValue(parts[lockFanoutIndex]));
         }
         return new ArrayList<>(summaries.values());
     }
@@ -623,8 +640,9 @@ public final class RocksDBFileModeBenchmark {
                     }
                     for (GlobalSession globalSession : dataSet.globalSessions) {
                         int branchCount = dataSet.branchesOf(globalSession).size();
+                        int remainingBranchCount = branchCount == 0 ? 0 : branchCount - 1;
                         RowMetrics globalRemoveMetrics =
-                                RowMetrics.written(3L + branchCount, estimateGlobalRemoveBytes(globalSession, branchCount));
+                                globalRemoveMetrics(options, globalSession, remainingBranchCount);
                         measure(
                                 globalRemoveStats,
                                 round,
@@ -972,10 +990,12 @@ public final class RocksDBFileModeBenchmark {
                 writeDataSet(storeManager, dataSet);
                 engine.flush();
                 for (GlobalSession globalSession : dataSet.globalSessions) {
+                    int branchCount = dataSet.branchesOf(globalSession).size();
                     measure(
                             globalRemoveStats,
                             round,
                             options,
+                            globalRemoveMetrics(options, globalSession, branchCount),
                             () -> storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession));
                 }
                 verifyStoreEmpty(engine);
@@ -1104,11 +1124,35 @@ public final class RocksDBFileModeBenchmark {
         return estimateGlobalPutBytes(session) + estimateGlobalIndexDeleteBytes(session);
     }
 
-    private static long estimateGlobalRemoveBytes(GlobalSession session, int branchCount) {
+    private static RowMetrics globalRemoveMetrics(BenchmarkOptions options, GlobalSession session, int branchCount) {
+        byte[] prefix = RocksDBKeyCodec.encodeXidPrefix(session.getXid());
+        boolean rangeDelete = options.enableRangeDelete && RocksDBKeyCodec.prefixEnd(prefix) != null;
+        long pointDeleteCount = globalRemovePointDeleteCount(session) + (rangeDelete ? 0L : branchCount);
+        return RowMetrics.globalRemove(
+                rangeDelete,
+                branchCount,
+                globalRemovePointDeleteCount(session) + branchCount,
+                pointDeleteCount,
+                estimateGlobalRemoveBytes(session, branchCount, rangeDelete));
+    }
+
+    private static long estimateGlobalRemoveBytes(GlobalSession session, int branchCount, boolean rangeDelete) {
         long bytes = byteSize(RocksDBKeyCodec.encodeXid(session.getXid())) + estimateGlobalIndexDeleteBytes(session);
-        int xidPrefixSize = RocksDBKeyCodec.encodeXidPrefix(session.getXid()).length;
-        bytes += (long) branchCount * (xidPrefixSize + Long.BYTES);
+        if (session.getStatus() == GlobalStatus.Begin) {
+            bytes += byteSize(RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                    session.getBeginTime() + session.getTimeout(), session.getXid()));
+        }
+        byte[] prefix = RocksDBKeyCodec.encodeXidPrefix(session.getXid());
+        if (rangeDelete) {
+            bytes += byteSize(prefix, RocksDBKeyCodec.prefixEnd(prefix));
+        } else {
+            bytes += (long) branchCount * (prefix.length + Long.BYTES);
+        }
         return bytes;
+    }
+
+    private static long globalRemovePointDeleteCount(GlobalSession session) {
+        return session.getStatus() == GlobalStatus.Begin ? 4L : 3L;
     }
 
     private static long estimateGlobalIndexDeleteBytes(GlobalSession session) {
@@ -1441,6 +1485,16 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + stats.innerOperations()
                 + ","
+                + stats.rangeDeleteCount()
+                + ","
+                + stats.pointDeleteCount()
+                + ","
+                + stats.deleteBatchCount()
+                + ","
+                + stats.branchFanout()
+                + ","
+                + stats.lockFanout()
+                + ","
                 + configDigest(options)
                 + ","
                 + footprint.walSyncStats.getMode().configValue()
@@ -1709,6 +1763,11 @@ public final class RocksDBFileModeBenchmark {
         private final long iteratorNext;
         private final long writeBatchBytes;
         private final long innerOperations;
+        private final long rangeDeleteCount;
+        private final long pointDeleteCount;
+        private final long deleteBatchCount;
+        private final long branchFanout;
+        private final long lockFanout;
 
         private RowMetrics(
                 long rowsScanned,
@@ -1718,6 +1777,34 @@ public final class RocksDBFileModeBenchmark {
                 long iteratorNext,
                 long writeBatchBytes,
                 long innerOperations) {
+            this(
+                    rowsScanned,
+                    rowsReturned,
+                    rowsUpdated,
+                    pointReads,
+                    iteratorNext,
+                    writeBatchBytes,
+                    innerOperations,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L);
+        }
+
+        private RowMetrics(
+                long rowsScanned,
+                long rowsReturned,
+                long rowsUpdated,
+                long pointReads,
+                long iteratorNext,
+                long writeBatchBytes,
+                long innerOperations,
+                long rangeDeleteCount,
+                long pointDeleteCount,
+                long deleteBatchCount,
+                long branchFanout,
+                long lockFanout) {
             this.rowsScanned = rowsScanned;
             this.rowsReturned = rowsReturned;
             this.rowsUpdated = rowsUpdated;
@@ -1725,6 +1812,11 @@ public final class RocksDBFileModeBenchmark {
             this.iteratorNext = iteratorNext;
             this.writeBatchBytes = writeBatchBytes;
             this.innerOperations = innerOperations;
+            this.rangeDeleteCount = rangeDeleteCount;
+            this.pointDeleteCount = pointDeleteCount;
+            this.deleteBatchCount = deleteBatchCount;
+            this.branchFanout = branchFanout;
+            this.lockFanout = lockFanout;
         }
 
         private static RowMetrics returned(long rowsReturned) {
@@ -1777,6 +1869,24 @@ public final class RocksDBFileModeBenchmark {
                 long rowsScanned, long pointReads, long rowsUpdated, long writeBatchBytes) {
             return new RowMetrics(rowsScanned, 0L, rowsUpdated, pointReads, rowsScanned, writeBatchBytes, 1L);
         }
+
+        private static RowMetrics globalRemove(
+                boolean rangeDelete, long branchFanout, long rowsUpdated, long pointDeleteCount, long writeBatchBytes) {
+            long rowsScanned = rangeDelete ? 0L : branchFanout;
+            return new RowMetrics(
+                    rowsScanned,
+                    0L,
+                    rowsUpdated,
+                    0L,
+                    rowsScanned,
+                    writeBatchBytes,
+                    1L,
+                    rangeDelete ? 1L : 0L,
+                    pointDeleteCount,
+                    1L,
+                    branchFanout,
+                    0L);
+        }
     }
 
     private static final class BenchmarkSummary {
@@ -1794,6 +1904,11 @@ public final class RocksDBFileModeBenchmark {
         private final NumericSeries iteratorNext = new NumericSeries();
         private final NumericSeries writeBatchBytes = new NumericSeries();
         private final NumericSeries innerOperations = new NumericSeries();
+        private final NumericSeries rangeDeleteCount = new NumericSeries();
+        private final NumericSeries pointDeleteCount = new NumericSeries();
+        private final NumericSeries deleteBatchCount = new NumericSeries();
+        private final NumericSeries branchFanout = new NumericSeries();
+        private final NumericSeries lockFanout = new NumericSeries();
 
         private BenchmarkSummary(String scenario, String runGroup) {
             this.scenario = scenario;
@@ -1812,7 +1927,12 @@ public final class RocksDBFileModeBenchmark {
                 double pointReadsValue,
                 double iteratorNextValue,
                 double writeBatchBytesValue,
-                double innerOperationsValue) {
+                double innerOperationsValue,
+                double rangeDeleteCountValue,
+                double pointDeleteCountValue,
+                double deleteBatchCountValue,
+                double branchFanoutValue,
+                double lockFanoutValue) {
             opsPerSecond.add(opsPerSecondValue);
             totalMs.add(totalMsValue);
             p50Ms.add(p50MsValue);
@@ -1825,6 +1945,11 @@ public final class RocksDBFileModeBenchmark {
             iteratorNext.add(iteratorNextValue);
             writeBatchBytes.add(writeBatchBytesValue);
             innerOperations.add(innerOperationsValue);
+            rangeDeleteCount.add(rangeDeleteCountValue);
+            pointDeleteCount.add(pointDeleteCountValue);
+            deleteBatchCount.add(deleteBatchCountValue);
+            branchFanout.add(branchFanoutValue);
+            lockFanout.add(lockFanoutValue);
         }
 
         private String toCsvLine() {
@@ -1868,7 +1993,17 @@ public final class RocksDBFileModeBenchmark {
                     + ","
                     + format(writeBatchBytes.mean())
                     + ","
-                    + format(innerOperations.mean());
+                    + format(innerOperations.mean())
+                    + ","
+                    + format(rangeDeleteCount.mean())
+                    + ","
+                    + format(pointDeleteCount.mean())
+                    + ","
+                    + format(deleteBatchCount.mean())
+                    + ","
+                    + format(branchFanout.mean())
+                    + ","
+                    + format(lockFanout.mean());
         }
 
         private Map<String, Object> toMap() {
@@ -1891,6 +2026,11 @@ public final class RocksDBFileModeBenchmark {
             operations.put("pointReadsMean", pointReads.mean());
             operations.put("iteratorNextMean", iteratorNext.mean());
             operations.put("writeBatchBytesMean", writeBatchBytes.mean());
+            operations.put("rangeDeleteCountMean", rangeDeleteCount.mean());
+            operations.put("pointDeleteCountMean", pointDeleteCount.mean());
+            operations.put("deleteBatchCountMean", deleteBatchCount.mean());
+            operations.put("branchFanoutMean", branchFanout.mean());
+            operations.put("lockFanoutMean", lockFanout.mean());
             result.put("operations", operations);
             result.put("totalMsMean", totalMs.mean());
             result.put("innerOperationsMean", innerOperations.mean());
@@ -2151,6 +2291,11 @@ public final class RocksDBFileModeBenchmark {
         private long iteratorNext;
         private long writeBatchBytes;
         private long innerOperations;
+        private long rangeDeleteCount;
+        private long pointDeleteCount;
+        private long deleteBatchCount;
+        private long branchFanout;
+        private long lockFanout;
         private long[] samples = new long[128];
         private int sampleCount;
 
@@ -2173,6 +2318,11 @@ public final class RocksDBFileModeBenchmark {
             iteratorNext += actualRows.iteratorNext;
             writeBatchBytes += actualRows.writeBatchBytes;
             innerOperations += actualRows.innerOperations;
+            rangeDeleteCount += actualRows.rangeDeleteCount;
+            pointDeleteCount += actualRows.pointDeleteCount;
+            deleteBatchCount += actualRows.deleteBatchCount;
+            branchFanout += actualRows.branchFanout;
+            lockFanout += actualRows.lockFanout;
             if (ops % sampleEvery == 0) {
                 addSample(nanos);
             }
@@ -2212,6 +2362,26 @@ public final class RocksDBFileModeBenchmark {
 
         private long writeBatchBytes() {
             return writeBatchBytes;
+        }
+
+        private long rangeDeleteCount() {
+            return rangeDeleteCount;
+        }
+
+        private long pointDeleteCount() {
+            return pointDeleteCount;
+        }
+
+        private long deleteBatchCount() {
+            return deleteBatchCount;
+        }
+
+        private long branchFanout() {
+            return branchFanout;
+        }
+
+        private long lockFanout() {
+            return lockFanout;
         }
 
         private double opsPerSecond() {
