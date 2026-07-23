@@ -382,8 +382,7 @@ public class RocksDBStoreConfig {
         this.writeBufferSize = nonNegative(writeBufferSize, ConfigurationKeys.STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE);
         this.dbWriteBufferSize =
                 nonNegative(dbWriteBufferSize, ConfigurationKeys.STORE_FILE_ROCKSDB_DB_WRITE_BUFFER_SIZE);
-        this.maxTotalWalSize =
-                nonNegative(maxTotalWalSize, ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE);
+        this.maxTotalWalSize = nonNegative(maxTotalWalSize, ConfigurationKeys.STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE);
         this.globalWriteBufferSize =
                 nonNegative(globalWriteBufferSize, ConfigurationKeys.STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE);
         this.branchWriteBufferSize =
@@ -456,7 +455,7 @@ public class RocksDBStoreConfig {
                 config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_STATISTICS, false),
                 config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS, false),
                 config.getConfig(ConfigurationKeys.STORE_FILE_ROCKSDB_COMPRESSION_TYPE),
-                config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE, false),
+                config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE, true),
                 config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_RANGE_DELETE_COMPACT_AFTER_DELETE, false),
                 walSyncMode(config.getConfig(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_MODE)),
                 positive(

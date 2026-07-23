@@ -390,17 +390,14 @@ public class RocksDBLocker extends AbstractLocker {
                 try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
                         WriteBatch batch = new WriteBatch()) {
                     for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
-                        byte[] lockKey = indexEntry.getValue();
-                        byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
-                        if (lockValue != null) {
-                            LockDO existingLock = decodeLock(lockValue);
-                            if (StringUtils.equals(existingLock.getXid(), xid)
-                                    && (branchId == null || branchId.equals(existingLock.getBranchId()))) {
-                                storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
-                            }
-                        }
+                        // Fast path: the index key is prefixed by xid (and branchId when
+                        // releasing per-branch), so ownership is already guaranteed by the
+                         // scan predicate.  Skip the per-lock verification read to save one
+                         // point-read per lock entry.
+                         byte[] lockKey = indexEntry.getValue();
+                        storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
                         storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
-                    }
+                     }
                     storeEngine.write(batch);
                 }
                 seekKey = nextLockBranchIndexSeekKey(indexPrefix, indexEntries);

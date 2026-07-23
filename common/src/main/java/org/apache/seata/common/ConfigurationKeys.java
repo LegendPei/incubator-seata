@@ -293,6 +293,18 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS = STORE_FILE_ROCKSDB_PREFIX + "walSyncWarnThresholdMillis";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_FULL_SCAN_MAX_LIMIT.
+     * Safety limit for full table scans (scanGlobalSessions). 0 disables the limit.
+     */
+    String STORE_FILE_ROCKSDB_FULL_SCAN_MAX_LIMIT = STORE_FILE_ROCKSDB_PREFIX + "fullScanMaxLimit";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS.
+     * Maximum wall-clock time (ms) a single full scan may run before being interrupted. 0 disables the deadline.
+     */
+    String STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS = STORE_FILE_ROCKSDB_PREFIX + "fullScanDeadlineMillis";
+
+    /**
      * The constant SERVICE_GROUP_MAPPING_PREFIX.
      */
     String SERVICE_GROUP_MAPPING_PREFIX = SERVICE_PREFIX + "vgroupMapping.";

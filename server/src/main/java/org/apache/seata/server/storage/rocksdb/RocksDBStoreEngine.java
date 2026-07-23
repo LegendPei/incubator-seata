@@ -62,6 +62,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public static final int FORMAT_VERSION = 1;
 
     private static final int DELETE_BATCH_SIZE = 1024;
+    private static final int DEADLINE_CHECK_INTERVAL = 256;
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBStoreEngine.class);
     private static final byte[] FORMAT_VERSION_KEY = "format_version".getBytes(StandardCharsets.UTF_8);
     private static final byte[] CLEAN_SHUTDOWN_KEY = "clean_shutdown".getBytes(StandardCharsets.UTF_8);
@@ -386,6 +387,28 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
     }
 
+    /**
+     * Batch get multiple keys from the same column family.
+     * Returns a list of values in the same order as keys; null for missing keys.
+     * <p>
+     * Note: Current implementation uses individual gets. Future optimization
+     * could use RocksDB's native multiGet API when available.
+     *
+     * @param columnFamily target column family
+     * @param keys         list of keys to fetch
+     * @return list of values (null for missing keys)
+     */
+    public List<byte[]> multiGet(RocksDBColumnFamily columnFamily, List<byte[]> keys) {
+        if (keys == null || keys.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<byte[]> values = new ArrayList<>(keys.size());
+        for (byte[] key : keys) {
+            values.add(get(columnFamily, key));
+        }
+        return values;
+    }
+
     public void put(RocksDBColumnFamily columnFamily, byte[] key, byte[] value) {
         maintenanceLock.readLock().lock();
         try {
@@ -522,6 +545,29 @@ public class RocksDBStoreEngine implements AutoCloseable {
             int limit,
             RocksDBEntryFilter filter,
             RocksDBEntryConsumer consumer) {
+        return scanByPrefix(columnFamily, seekKey, prefix, limit, 0L, filter, consumer);
+    }
+
+    /**
+     * Bounded prefix scan with optional deadline protection.
+     *
+     * @param columnFamily target column family
+     * @param seekKey      initial seek position
+     * @param prefix       key prefix filter
+     * @param limit        max rows to return (0 or negative means unlimited)
+     * @param deadlineNanos absolute nanoTime deadline; 0 means no deadline
+     * @param filter       optional per-entry filter; returning false stops the scan
+     * @param consumer     entry consumer
+     * @return scan statistics including whether limit/deadline was hit
+     */
+    public ScanStats scanByPrefix(
+            RocksDBColumnFamily columnFamily,
+            byte[] seekKey,
+            byte[] prefix,
+            int limit,
+            long deadlineNanos,
+            RocksDBEntryFilter filter,
+            RocksDBEntryConsumer consumer) {
         Objects.requireNonNull(seekKey, "seekKey must not be null");
         Objects.requireNonNull(prefix, "prefix must not be null");
         Objects.requireNonNull(consumer, "consumer must not be null");
@@ -531,6 +577,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
             int rowsScanned = 0;
             int rowsReturned = 0;
             boolean limitReached = false;
+            boolean deadlineReached = false;
             try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
                 for (iterator.seek(seekKey); iterator.isValid(); iterator.next()) {
                     byte[] key = iterator.key();
@@ -539,6 +586,12 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     }
                     byte[] value = iterator.value();
                     rowsScanned++;
+                    if (deadlineNanos > 0
+                            && (rowsScanned & (DEADLINE_CHECK_INTERVAL - 1)) == 0
+                            && System.nanoTime() >= deadlineNanos) {
+                        deadlineReached = true;
+                        break;
+                    }
                     if (filter != null && !filter.shouldContinue(key, value)) {
                         break;
                     }
@@ -550,7 +603,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     }
                 }
                 iterator.status();
-                return new ScanStats(rowsScanned, rowsReturned, limitReached);
+                return new ScanStats(rowsScanned, rowsReturned, limitReached, deadlineReached);
             } catch (RocksDBException e) {
                 throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
             }
@@ -574,6 +627,62 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     consumer.accept(copy(key), copy(iterator.value()));
                 }
                 iterator.status();
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Prefix scan with limit and deadline protection. Returns scan statistics
+     * so the caller can detect truncation.
+     *
+     * @param columnFamily  target column family
+     * @param prefix        key prefix filter
+     * @param limit         max rows to return (0 or negative means unlimited)
+     * @param deadlineNanos absolute nanoTime deadline; 0 means no deadline
+     * @param consumer      entry consumer
+     * @return scan statistics
+     */
+    public ScanStats scanByPrefix(
+            RocksDBColumnFamily columnFamily,
+            byte[] prefix,
+            int limit,
+            long deadlineNanos,
+            RocksDBEntryConsumer consumer) {
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        Objects.requireNonNull(consumer, "consumer must not be null");
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            int rowsScanned = 0;
+            int rowsReturned = 0;
+            boolean limitReached = false;
+            boolean deadlineReached = false;
+            try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+                for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
+                    byte[] key = iterator.key();
+                    if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                        break;
+                    }
+                    rowsScanned++;
+                    if (deadlineNanos > 0
+                            && (rowsScanned & (DEADLINE_CHECK_INTERVAL - 1)) == 0
+                            && System.nanoTime() >= deadlineNanos) {
+                        deadlineReached = true;
+                        break;
+                    }
+                    consumer.accept(copy(key), copy(iterator.value()));
+                    rowsReturned++;
+                    if (limit > 0 && rowsReturned >= limit) {
+                        limitReached = true;
+                        break;
+                    }
+                }
+                iterator.status();
+                return new ScanStats(rowsScanned, rowsReturned, limitReached, deadlineReached);
             } catch (RocksDBException e) {
                 throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
             }
@@ -1161,11 +1270,17 @@ public class RocksDBStoreEngine implements AutoCloseable {
         private final int rowsScanned;
         private final int rowsReturned;
         private final boolean limitReached;
+        private final boolean deadlineReached;
 
         public ScanStats(int rowsScanned, int rowsReturned, boolean limitReached) {
+            this(rowsScanned, rowsReturned, limitReached, false);
+        }
+
+        public ScanStats(int rowsScanned, int rowsReturned, boolean limitReached, boolean deadlineReached) {
             this.rowsScanned = rowsScanned;
             this.rowsReturned = rowsReturned;
             this.limitReached = limitReached;
+            this.deadlineReached = deadlineReached;
         }
 
         public int getRowsScanned() {
@@ -1178,6 +1293,14 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
         public boolean isLimitReached() {
             return limitReached;
+        }
+
+        public boolean isDeadlineReached() {
+            return deadlineReached;
+        }
+
+        public boolean isTruncated() {
+            return limitReached || deadlineReached;
         }
     }
 

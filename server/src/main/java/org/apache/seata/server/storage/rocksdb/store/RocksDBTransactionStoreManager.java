@@ -16,9 +16,12 @@
  */
 package org.apache.seata.server.storage.rocksdb.store;
 
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.util.CollectionUtils;
 import org.apache.seata.common.util.StringUtils;
+import org.apache.seata.config.Configuration;
+import org.apache.seata.config.ConfigurationFactory;
 import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
@@ -57,11 +60,15 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBTransactionStoreManager.class);
     private static final String MIGRATION_STATUS_KEY = "migration_status";
     private static final int STATUS_SCAN_PAGE_SIZE = 1024;
+    private static final int DEFAULT_FULL_SCAN_MAX_LIMIT = 10000;
+    private static final long DEFAULT_FULL_SCAN_DEADLINE_MILLIS = 5000L;
 
     private final RocksDBStoreEngine storeEngine;
     private final RocksDBLocalLocks xidLocks;
     private final RocksDBIndexManager indexManager;
     private final boolean factoryManaged;
+    private final int fullScanMaxLimit;
+    private final long fullScanDeadlineMillis;
 
     public RocksDBTransactionStoreManager() {
         this(RocksDBStoreEngineFactory.getInstance(), new RocksDBLocalLocks(), true);
@@ -86,6 +93,11 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         this.indexManager = new RocksDBIndexManager(storeEngine);
         this.indexManager.ensureReady();
         this.factoryManaged = factoryManaged;
+        Configuration config = ConfigurationFactory.getInstance();
+        this.fullScanMaxLimit =
+                config.getInt(ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_MAX_LIMIT, DEFAULT_FULL_SCAN_MAX_LIMIT);
+        this.fullScanDeadlineMillis = config.getLong(
+                ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, DEFAULT_FULL_SCAN_DEADLINE_MILLIS);
         logStartupState();
     }
 
@@ -267,15 +279,30 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     private List<GlobalSession> scanGlobalSessions(SessionCondition sessionCondition) {
         List<GlobalSession> result = new ArrayList<>();
-        storeEngine.scanByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0], (key, value) -> {
-            GlobalSession globalSession = decodeGlobalSession(value, sessionCondition.isLazyLoadBranch());
-            if (matches(globalSession, sessionCondition)) {
-                if (!sessionCondition.isLazyLoadBranch()) {
-                    readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
-                }
-                result.add(globalSession);
-            }
-        });
+        long deadlineNanos = fullScanDeadlineMillis > 0
+                ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fullScanDeadlineMillis)
+                : 0L;
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
+                RocksDBColumnFamily.GLOBAL_SESSION, new byte[0], fullScanMaxLimit, deadlineNanos, (key, value) -> {
+                    GlobalSession globalSession = decodeGlobalSession(value, sessionCondition.isLazyLoadBranch());
+                    if (matches(globalSession, sessionCondition)) {
+                        if (!sessionCondition.isLazyLoadBranch()) {
+                            readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
+                        }
+                        result.add(globalSession);
+                    }
+                });
+        if (stats.isTruncated()) {
+            LOGGER.warn(
+                    "scanGlobalSessions truncated: scanned={}, returned={}, limitReached={}, deadlineReached={}, "
+                            + "fullScanMaxLimit={}, fullScanDeadlineMillis={}",
+                    stats.getRowsScanned(),
+                    stats.getRowsReturned(),
+                    stats.isLimitReached(),
+                    stats.isDeadlineReached(),
+                    fullScanMaxLimit,
+                    fullScanDeadlineMillis);
+        }
         return result;
     }
 
@@ -340,6 +367,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             sessionCondition.setScanStats(scanStats.toStats(result.size()));
             return result;
         }
+        long effectiveMaxBeginTime = maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime;
+        // Deadline protection: when no explicit limit is set, apply fullScanDeadlineMillis
+        long deadlineNanos = (limit == null || limit <= 0) && fullScanDeadlineMillis > 0
+                ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fullScanDeadlineMillis)
+                : 0L;
+        boolean deadlineReached = false;
         if (sessionCondition.getStatuses().length > 1) {
             List<GlobalSession> merged =
                     readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit, scanBudget, scanStats);
@@ -352,30 +385,29 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 if (scanBudget.isExhausted()) {
                     break;
                 }
+                if (deadlineNanos > 0 && System.nanoTime() >= deadlineNanos) {
+                    deadlineReached = true;
+                    break;
+                }
                 RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
                         status,
                         0L,
-                        maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime,
+                        effectiveMaxBeginTime,
                         cursor,
                         scanBudget.clamp(nextPageLimit(limit, result)));
                 scanBudget.record(scanResult.getRowsScanned());
                 scanStats.record(scanResult);
-                for (RocksDBIndexManager.StatusIndexEntry entry : scanResult.getEntries()) {
-                    if (appendMatchingSession(
-                                    sessionCondition,
-                                    seenXids,
-                                    result,
-                                    entry.getXid(),
-                                    entry.getStatus(),
-                                    entry.getBeginTime(),
-                                    scanStats)
-                            && isLimitReached(limit, result)) {
-                        break;
-                    }
-                }
+                appendMatchingSessionsBatch(sessionCondition, seenXids, result, scanResult.getEntries(), scanStats);
                 cursor = scanResult.getNextCursor();
             } while (cursor != null && !isLimitReached(limit, result) && !scanBudget.isExhausted());
             sessionCondition.setNextStatusScanCursor(cursor);
+        }
+        if (deadlineReached) {
+            LOGGER.warn(
+                    "readByStatuses deadline reached: statuses={}, returned={}, deadlineMillis={}",
+                    sessionCondition.getStatuses(),
+                    result.size(),
+                    fullScanDeadlineMillis);
         }
         sessionCondition.setScanStats(scanStats.toStats(result.size()));
         return result;
@@ -445,6 +477,62 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return false;
     }
 
+    /**
+     * Batch append matching sessions using multiGet for efficient bulk reads.
+     * Returns the number of sessions added to result.
+     */
+    private int appendMatchingSessionsBatch(
+            SessionCondition sessionCondition,
+            Set<String> seenXids,
+            List<GlobalSession> result,
+            List<RocksDBIndexManager.StatusIndexEntry> entries,
+            SessionScanStatsAccumulator scanStats) {
+        if (entries.isEmpty()) {
+            return 0;
+        }
+        // Collect unique xids that we haven't seen yet
+        List<String> newXids = new ArrayList<>();
+        List<RocksDBIndexManager.StatusIndexEntry> newEntries = new ArrayList<>();
+        for (RocksDBIndexManager.StatusIndexEntry entry : entries) {
+            if (!seenXids.contains(entry.getXid())) {
+                newXids.add(entry.getXid());
+                newEntries.add(entry);
+            }
+        }
+        if (newXids.isEmpty()) {
+            return 0;
+        }
+        // Batch read all sessions using multiGet
+        List<byte[]> keys = new ArrayList<>(newXids.size());
+        for (String xid : newXids) {
+            keys.add(RocksDBKeyCodec.encodeXid(xid));
+        }
+        scanStats.recordPointReads(newXids.size());
+        List<byte[]> values = storeEngine.multiGet(RocksDBColumnFamily.GLOBAL_SESSION, keys);
+        // Process results
+        int added = 0;
+        boolean withBranches = !sessionCondition.isLazyLoadBranch();
+        for (int i = 0; i < newEntries.size(); i++) {
+            RocksDBIndexManager.StatusIndexEntry entry = newEntries.get(i);
+            byte[] value = values.get(i);
+            if (value == null) {
+                continue;
+            }
+            GlobalSession globalSession = decodeGlobalSession(value, sessionCondition.isLazyLoadBranch());
+            if (globalSession.getStatus() == entry.getStatus()
+                    && globalSession.getBeginTime() == entry.getBeginTime()
+                    && matches(globalSession, sessionCondition)) {
+                if (withBranches) {
+                    readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
+                }
+                seenXids.add(entry.getXid());
+                result.add(globalSession);
+                added++;
+            }
+        }
+        return added;
+    }
+
     private boolean appendMatchingTimeoutSession(
             SessionCondition sessionCondition,
             Set<String> seenXids,
@@ -472,6 +560,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return maxBeginTime != null
                 || limit != null && limit > 0
                 || scanBudget.isBounded()
+                || fullScanDeadlineMillis > 0
                 || sessionCondition.getStatusScanCursor() != null;
     }
 
@@ -612,6 +701,10 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
         private void recordPointRead() {
             pointReads++;
+        }
+
+        private void recordPointReads(int count) {
+            pointReads += count;
         }
 
         private SessionScanStats toStats(int sessionsReturned) {
