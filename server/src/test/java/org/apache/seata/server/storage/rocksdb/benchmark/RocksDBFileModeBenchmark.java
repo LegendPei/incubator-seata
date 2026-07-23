@@ -603,7 +603,8 @@ public final class RocksDBFileModeBenchmark {
                 if (options.isFullWriteWorkload()) {
                     for (GlobalSession globalSession : dataSet.globalSessions) {
                         globalSession.setStatus(nextStatus(globalSession.getStatus()));
-                        RowMetrics globalUpdateMetrics = RowMetrics.written(5, estimateGlobalUpdateBytes(globalSession));
+                        RowMetrics globalUpdateMetrics =
+                                RowMetrics.written(5, estimateGlobalUpdateBytes(globalSession));
                         measure(
                                 globalUpdateStats,
                                 round,
@@ -612,7 +613,8 @@ public final class RocksDBFileModeBenchmark {
                                 () -> storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession));
                         for (BranchSession branchSession : dataSet.branchesOf(globalSession)) {
                             branchSession.setStatus(BranchStatus.PhaseOne_Done);
-                            RowMetrics branchUpdateMetrics = RowMetrics.written(1, estimateBranchPutBytes(branchSession));
+                            RowMetrics branchUpdateMetrics =
+                                    RowMetrics.written(1, estimateBranchPutBytes(branchSession));
                             measure(
                                     branchUpdateStats,
                                     round,
@@ -813,8 +815,7 @@ public final class RocksDBFileModeBenchmark {
                 Path dbPath = scenarioPath(runPath, "lock-round-" + round);
                 lastDbPath = dbPath;
                 try (RocksDBStoreEngine engine = open(dbPath, options)) {
-                    RocksDBLockManager lockManager =
-                            new RocksDBLockManager(engine, options.lockIndexScanBatchSize);
+                    RocksDBLockManager lockManager = new RocksDBLockManager(engine, options.lockIndexScanBatchSize);
                     for (BranchSession branchSession : dataSet.allBranches()) {
                         if (options.lockWorkloadIncludes(LOCK_OP_ACQUIRE)) {
                             RowMetrics acquireMetrics = RowMetrics.written(
@@ -918,8 +919,7 @@ public final class RocksDBFileModeBenchmark {
                 Path orphanDbPath = scenarioPath(runPath, "lock-clean-orphan-round-" + round);
                 lastOrphanDbPath = orphanDbPath;
                 try (RocksDBStoreEngine engine = open(orphanDbPath, options)) {
-                    RocksDBLockManager lockManager =
-                            new RocksDBLockManager(engine, options.lockIndexScanBatchSize);
+                    RocksDBLockManager lockManager = new RocksDBLockManager(engine, options.lockIndexScanBatchSize);
                     BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
                     List<BranchSession> allBranches = dataSet.allBranches();
                     int orphanRows = lockRows(allBranches);
@@ -2799,7 +2799,7 @@ public final class RocksDBFileModeBenchmark {
                     intValue(values, "lockPerBranch", 2),
                     stringValue(values, "writeWorkload", WRITE_WORKLOAD_FULL),
                     booleanValue(values, "syncWrite", false),
-                    booleanValue(values, "enableRangeDelete", false),
+                    booleanValue(values, "enableRangeDelete", true),
                     parseSizeOption(values, "blockCacheSize", 0L),
                     parseSizeOption(values, "writeBufferSize", 0L),
                     intValue(values, "maxWriteBufferNumber", 0),
@@ -3724,7 +3724,9 @@ public final class RocksDBFileModeBenchmark {
         }
 
         private static String normalizeWriteWorkload(String value) {
-            String normalized = StringUtils.isBlank(value) ? WRITE_WORKLOAD_FULL : value.trim().toLowerCase(Locale.ROOT);
+            String normalized = StringUtils.isBlank(value)
+                    ? WRITE_WORKLOAD_FULL
+                    : value.trim().toLowerCase(Locale.ROOT);
             if (!WRITE_WORKLOAD_FULL.equals(normalized) && !WRITE_WORKLOAD_APPEND.equals(normalized)) {
                 throw new IllegalArgumentException("Unsupported writeWorkload: " + value);
             }

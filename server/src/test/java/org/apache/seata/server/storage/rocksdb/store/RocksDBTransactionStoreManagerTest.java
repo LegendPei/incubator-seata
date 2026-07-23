@@ -197,7 +197,8 @@ class RocksDBTransactionStoreManagerTest {
                         .noneMatch(session -> removed.getXid().equals(session.getXid())));
                 SessionCondition transactionIdCondition = new SessionCondition();
                 transactionIdCondition.setTransactionId(removed.getTransactionId());
-                Assertions.assertTrue(storeManager.readSession(transactionIdCondition).isEmpty());
+                Assertions.assertTrue(
+                        storeManager.readSession(transactionIdCondition).isEmpty());
                 Assertions.assertNull(engine.get(
                         RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
                         RocksDBKeyCodec.encodeGlobalTimeoutIndex(
@@ -530,7 +531,7 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
-    void testReadByStatusWithoutLimitUsesSingleIteratorScan() throws Exception {
+    void testReadByStatusWithoutLimitUsesPagedScan() throws Exception {
         try (RocksDBStoreEngine engine = open("condition-status-unlimited-fast")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             CountingIndexManager indexManager = new CountingIndexManager(engine);
@@ -546,8 +547,9 @@ class RocksDBTransactionStoreManagerTest {
             List<GlobalSession> actual = storeManager.readSession(condition);
 
             Assertions.assertEquals(2, actual.size());
-            Assertions.assertEquals(1, indexManager.fullStatusScanCalls);
-            Assertions.assertEquals(0, indexManager.pagedStatusScanCalls);
+            // After Direction A optimization: always use paged scan (no unbounded full scan)
+            Assertions.assertEquals(0, indexManager.fullStatusScanCalls);
+            Assertions.assertTrue(indexManager.pagedStatusScanCalls >= 1);
         }
     }
 
@@ -620,7 +622,7 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
-    void testReadByMultipleStatusesWithoutLimitUsesSingleIteratorScan() throws Exception {
+    void testReadByMultipleStatusesWithoutLimitUsesPagedScan() throws Exception {
         try (RocksDBStoreEngine engine = open("condition-multi-status-unlimited-fast")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             CountingIndexManager indexManager = new CountingIndexManager(engine);
@@ -636,8 +638,9 @@ class RocksDBTransactionStoreManagerTest {
             List<GlobalSession> actual = storeManager.readSession(condition);
 
             Assertions.assertEquals(2, actual.size());
-            Assertions.assertEquals(2, indexManager.fullStatusScanCalls);
-            Assertions.assertEquals(0, indexManager.pagedStatusScanCalls);
+            // After Direction A optimization: always use paged scan (no unbounded full scan)
+            Assertions.assertEquals(0, indexManager.fullStatusScanCalls);
+            Assertions.assertTrue(indexManager.pagedStatusScanCalls >= 1);
         }
     }
 
