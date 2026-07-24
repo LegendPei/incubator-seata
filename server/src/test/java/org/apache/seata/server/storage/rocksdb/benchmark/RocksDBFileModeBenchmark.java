@@ -743,13 +743,28 @@ public final class RocksDBFileModeBenchmark {
                         condition.setLimit(options.queryLimit);
                     }
                     List<GlobalSession> actual = storeManager.readSession(condition);
-                    assertEquals(expectedLimitedStatusCount, actual.size(), "status query size");
+                    // Since Direction A an unlimited status scan is bounded by
+                    // fullScanDeadlineMillis and may return a truncated prefix.
+                    assertTrue(
+                            actual.size() <= expectedLimitedStatusCount, "status query size must not exceed expected");
+                    if (actual.size() < expectedLimitedStatusCount) {
+                        log(
+                                "  [query.status] truncated by scan deadline: returned %d of %d expected",
+                                actual.size(), expectedLimitedStatusCount);
+                    }
                     sinkCount = actual.size();
                     return statusQueryMetrics(condition, actual.size());
                 });
                 measure(beginSortedStats, round, options, () -> {
                     List<GlobalSession> actual = storeManager.readSortByTimeoutBeginSessions(false);
-                    assertEquals(expectedBeginCount, actual.size(), "begin sorted query size");
+                    // Since Direction A an unlimited scan is bounded by fullScanDeadlineMillis
+                    // and may return a truncated prefix.
+                    assertTrue(actual.size() <= expectedBeginCount, "begin sorted query size must not exceed expected");
+                    if (actual.size() < expectedBeginCount) {
+                        log(
+                                "  [query.begin_sorted] truncated by scan deadline: returned %d of %d expected",
+                                actual.size(), expectedBeginCount);
+                    }
                     sinkCount = actual.size();
                     return RowMetrics.scannedAndReturned(actual.size(), actual.size());
                 });
@@ -762,7 +777,15 @@ public final class RocksDBFileModeBenchmark {
                             count++;
                         }
                     }
-                    assertEquals(expectedStatusCount, count, "full scan status count");
+                    // Since Direction A an unconditional full scan is deliberately bounded
+                    // (store.file.rocksdb.fullScanMaxLimit / fullScanDeadlineMillis), so the
+                    // result may be a truncated prefix instead of the full match set.
+                    assertTrue(count <= expectedStatusCount, "full scan status count must not exceed expected");
+                    if (count < expectedStatusCount) {
+                        log(
+                                "  [query.full_scan_filter] truncated by scan protection: matched %d of %d expected",
+                                count, expectedStatusCount);
+                    }
                     sinkCount = count;
                     return RowMetrics.scannedAndReturned(options.globalCount, count);
                 });
@@ -1213,13 +1236,13 @@ public final class RocksDBFileModeBenchmark {
                 }
             });
             try (RocksDBStoreEngine engine = open(dbPath, options)) {
-                RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
-                SessionCondition condition = new SessionCondition();
-                condition.setLazyLoadBranch(true);
-                assertEquals(
-                        options.globalCount,
-                        storeManager.readSession(condition).size(),
-                        scenarioName + " restart global count");
+                // Count directly on the GLOBAL_SESSION column family: since Direction A the
+                // store-manager full scan is bounded (fullScanMaxLimit) and would truncate
+                // this post-restart verification at large scale.
+                int[] restoredCount = {0};
+                engine.scanByPrefix(
+                        RocksDBColumnFamily.GLOBAL_SESSION, new byte[0], 0, 0L, (key, value) -> restoredCount[0]++);
+                assertEquals(options.globalCount, restoredCount[0], scenarioName + " restart global count");
             }
         }
 
