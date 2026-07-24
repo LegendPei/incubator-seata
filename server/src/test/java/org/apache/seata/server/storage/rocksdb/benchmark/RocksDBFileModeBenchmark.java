@@ -708,6 +708,11 @@ public final class RocksDBFileModeBenchmark {
             int expectedLimitedStatusCount = options.queryLimit > 0
                     ? Math.min(expectedStatusQueryCount, options.queryLimit)
                     : expectedStatusQueryCount;
+            // Superset bound for the overtime query: over-time eligibility is evaluated against
+            // wall-clock time at query execution; minutes may pass between dataset creation and
+            // the query loop, so every session (not just the back-dated ones) can become eligible.
+            int statusQueryMaxCount =
+                    options.queryLimit > 0 ? Math.min(expectedStatusCount, options.queryLimit) : expectedStatusCount;
             int expectedBeginCount = dataSet.countByStatus(GlobalStatus.Begin);
             for (int i = 0; i < iterations; i++) {
                 final int iteration = i;
@@ -745,8 +750,7 @@ public final class RocksDBFileModeBenchmark {
                     List<GlobalSession> actual = storeManager.readSession(condition);
                     // Since Direction A an unlimited status scan is bounded by
                     // fullScanDeadlineMillis and may return a truncated prefix.
-                    assertTrue(
-                            actual.size() <= expectedLimitedStatusCount, "status query size must not exceed expected");
+                    assertTrue(actual.size() <= statusQueryMaxCount, "status query size must not exceed expected");
                     if (actual.size() < expectedLimitedStatusCount) {
                         log(
                                 "  [query.status] truncated by scan deadline: returned %d of %d expected",
