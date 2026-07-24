@@ -40,6 +40,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
+import org.apache.seata.server.storage.rocksdb.lock.RocksDBOrphanLockCleanupController;
 import org.apache.seata.server.storage.rocksdb.migration.RocksDBMigrationService;
 import org.apache.seata.server.store.FileStoreEngine;
 import org.apache.seata.server.store.StoreConfig;
@@ -97,6 +98,8 @@ public class SessionHolder {
     private static DistributedLocker DISTRIBUTED_LOCKER;
 
     private static final int ROCKSDB_STARTUP_ORPHAN_LOCK_CLEAN_LIMIT = 1024;
+
+    private static volatile RocksDBOrphanLockCleanupController ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER;
 
     public static void init() {
         init(null);
@@ -159,6 +162,7 @@ public class SessionHolder {
                             FileStoreEngine.ROCKSDB.getName(),
                             new Object[] {ROOT_SESSION_MANAGER_NAME});
                     cleanRocksDBOrphanLocks();
+                    startRocksDBOrphanLockCleanup(rocksDBStoreEngine);
                     reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
                 } else {
                     ROOT_SESSION_MANAGER =
@@ -177,6 +181,22 @@ public class SessionHolder {
             // unknown store
             throw new IllegalArgumentException("unknown store mode:" + sessionMode.getName());
         }
+    }
+
+    private static void startRocksDBOrphanLockCleanup(RocksDBStoreEngine rocksDBStoreEngine) {
+        RocksDBOrphanLockCleanupController previous = ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER;
+        if (previous != null) {
+            previous.close();
+        }
+        LockManager lockManager = LockerManagerFactory.getLockManager();
+        if (!(lockManager instanceof RocksDBLockManager)) {
+            ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER = null;
+            return;
+        }
+        RocksDBOrphanLockCleanupController controller =
+                RocksDBOrphanLockCleanupController.create((RocksDBLockManager) lockManager, rocksDBStoreEngine);
+        controller.start();
+        ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER = controller;
     }
 
     private static void cleanRocksDBOrphanLocks() {
@@ -498,6 +518,11 @@ public class SessionHolder {
 
     public static void destroy() {
         RaftServerManager.destroy();
+        RocksDBOrphanLockCleanupController orphanLockCleanupController = ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER;
+        if (orphanLockCleanupController != null) {
+            orphanLockCleanupController.close();
+            ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER = null;
+        }
         if (ROOT_SESSION_MANAGER != null) {
             ROOT_SESSION_MANAGER.destroy();
         }
