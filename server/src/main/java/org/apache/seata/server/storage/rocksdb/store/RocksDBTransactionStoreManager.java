@@ -496,7 +496,10 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (value == null) {
                 continue;
             }
-            GlobalSession globalSession = decodeGlobalSession(value, sessionCondition.isLazyLoadBranch());
+            // Use lightweight decode for verification (skips applicationId,
+            // serviceGroup, transactionName, applicationData allocations)
+            GlobalSession globalSession =
+                    decodeGlobalSessionLightweight(value, sessionCondition.isLazyLoadBranch());
             if (globalSession.getStatus() == entry.getStatus()
                     && globalSession.getBeginTime() == entry.getBeginTime()
                     && matches(globalSession, sessionCondition)) {
@@ -694,6 +697,24 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
         GlobalSession globalSession = new GlobalSession(null, null, null, 0, lazyLoadBranch);
         globalSession.decode(decodedValue.getPayload());
+        return globalSession;
+    }
+
+    /**
+     * Lightweight decode that only extracts fields needed for status-query verification:
+     * transactionId, timeout, xid, beginTime, status.
+     * <p>
+     * Skips String allocation for applicationId, transactionServiceGroup,
+     * transactionName, and applicationData — these fields are not accessed
+     * during index verification or {@link #matches} filtering.
+     */
+    private GlobalSession decodeGlobalSessionLightweight(byte[] value, boolean lazyLoadBranch) {
+        RocksDBValueCodec.DecodedValue decodedValue = RocksDBValueCodec.decode(value);
+        if (decodedValue.getType() != RocksDBValueCodec.ValueType.GLOBAL_SESSION) {
+            throw new StoreException("unexpected RocksDB value type for global session:" + decodedValue.getType());
+        }
+        GlobalSession globalSession = new GlobalSession(null, null, null, 0, lazyLoadBranch);
+        globalSession.decodeLightweight(decodedValue.getPayload());
         return globalSession;
     }
 

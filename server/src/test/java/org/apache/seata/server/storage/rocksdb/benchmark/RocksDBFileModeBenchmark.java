@@ -2246,6 +2246,17 @@ public final class RocksDBFileModeBenchmark {
                     "benchmark-app", "benchmark-group", "phase4-tx-" + seed + "-" + round + "-" + index, 60000);
             globalSession.setStatus(status);
             globalSession.setBeginTime(beginTime);
+            // Simulate production applicationData (business context JSON, ~800 bytes)
+            globalSession.setApplicationData(
+                    "{\"bizType\":\"ORDER_CREATE\",\"userId\":\"U" + (100000 + index % 50000)
+                    + "\",\"merchantId\":\"M" + (200000 + index % 30000)
+                    + "\",\"orderId\":\"ORD" + seed + round + index
+                    + "\",\"amount\":" + (100 + index % 9900) + "." + (index % 100)
+                    + ",\"currency\":\"CNY\",\"channel\":\"APP\",\"retryCount\":0"
+                    + ",\"timeoutNotify\":\"http://callback.internal/notify\","
+                    + "\"rollbackPolicy\":\"SAGA\",\"priority\":\"NORMAL\","
+                    + "\"traceId\":\"trace-" + Long.toHexString(seed) + "-" + Integer.toHexString(index)
+                    + "\",\"extra\":{\"source\":\"benchmark\",\"region\":\"cn-east-1\"}}");
             return globalSession;
         }
 
