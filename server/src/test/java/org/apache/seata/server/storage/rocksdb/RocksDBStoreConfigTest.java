@@ -61,7 +61,8 @@ class RocksDBStoreConfigTest {
         Assertions.assertFalse(config.isEnableStatistics());
         Assertions.assertFalse(config.isOptimizeFiltersForHits());
         Assertions.assertNull(config.getCompressionType());
-        Assertions.assertFalse(config.isEnableRangeDelete());
+        Assertions.assertTrue(
+                config.isEnableRangeDelete(), "enableRangeDelete defaults to true since the Direction C optimization");
         Assertions.assertFalse(config.isRangeDeleteCompactAfterDelete());
         Assertions.assertEquals(RocksDBWalSyncMode.NONE, config.getWalSyncMode());
         Assertions.assertEquals(RocksDBStoreConfig.DEFAULT_WAL_SYNC_INTERVAL_MILLIS, config.getWalSyncIntervalMillis());

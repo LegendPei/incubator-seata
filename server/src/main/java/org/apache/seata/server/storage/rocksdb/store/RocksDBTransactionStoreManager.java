@@ -498,8 +498,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             }
             // Use lightweight decode for verification (skips applicationId,
             // serviceGroup, transactionName, applicationData allocations)
-            GlobalSession globalSession =
-                    decodeGlobalSessionLightweight(value, sessionCondition.isLazyLoadBranch());
+            GlobalSession globalSession = decodeGlobalSessionLightweight(value, sessionCondition.isLazyLoadBranch());
             if (globalSession.getStatus() == entry.getStatus()
                     && globalSession.getBeginTime() == entry.getBeginTime()
                     && matches(globalSession, sessionCondition)) {

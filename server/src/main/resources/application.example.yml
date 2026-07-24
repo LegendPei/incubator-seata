@@ -215,6 +215,12 @@ seata:
         wal-sync-write-threshold: 10
         wal-sync-on-shutdown: true
         wal-sync-warn-threshold-millis: 1000
+        # background orphan lock cleanup: bounded rounds with persisted cursor instead of one full-pass stall.
+        orphan-lock-clean-enabled: true
+        orphan-lock-clean-interval-millis: 60000
+        orphan-lock-clean-batch-limit: 1000
+        orphan-lock-clean-max-batches: 10
+        orphan-lock-clean-round-sleep-millis: 100
     db:
       datasource: druid
       db-type: mysql

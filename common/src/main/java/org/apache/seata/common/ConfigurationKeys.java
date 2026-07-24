@@ -305,6 +305,38 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS = STORE_FILE_ROCKSDB_PREFIX + "fullScanDeadlineMillis";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_ENABLED.
+     * Whether the background orphan lock cleanup controller is enabled.
+     */
+    String STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_ENABLED = STORE_FILE_ROCKSDB_PREFIX + "orphanLockCleanEnabled";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_INTERVAL_MILLIS.
+     * Delay (ms) between the start of two background orphan lock cleanup cycles.
+     */
+    String STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_INTERVAL_MILLIS =
+            STORE_FILE_ROCKSDB_PREFIX + "orphanLockCleanIntervalMillis";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_BATCH_LIMIT.
+     * Max lock index entries scanned per batch inside one cleanup round.
+     */
+    String STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_BATCH_LIMIT = STORE_FILE_ROCKSDB_PREFIX + "orphanLockCleanBatchLimit";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_MAX_BATCHES.
+     * Max batches executed per cleanup round; round work is capped at batchLimit * maxBatches entries.
+     */
+    String STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_MAX_BATCHES = STORE_FILE_ROCKSDB_PREFIX + "orphanLockCleanMaxBatches";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS.
+     * Sleep (ms) between cleanup rounds within one cycle to limit foreground I/O interference. 0 disables sleeping.
+     */
+    String STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS =
+            STORE_FILE_ROCKSDB_PREFIX + "orphanLockCleanRoundSleepMillis";
+
+    /**
      * The constant SERVICE_GROUP_MAPPING_PREFIX.
      */
     String SERVICE_GROUP_MAPPING_PREFIX = SERVICE_PREFIX + "vgroupMapping.";
