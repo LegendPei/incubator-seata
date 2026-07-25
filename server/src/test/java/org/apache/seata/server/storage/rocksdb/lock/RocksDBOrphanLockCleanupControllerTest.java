@@ -169,6 +169,22 @@ class RocksDBOrphanLockCleanupControllerTest {
     }
 
     @Test
+    void testDefaultMaxBatchesFavorsForegroundLatency() throws Exception {
+        try (RocksDBStoreEngine engine = open("default-max-batches")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            RocksDBOrphanLockCleanupController controller =
+                    RocksDBOrphanLockCleanupController.create(lockManager, engine);
+            try {
+                Field maxBatches = RocksDBOrphanLockCleanupController.class.getDeclaredField("maxBatches");
+                maxBatches.setAccessible(true);
+                Assertions.assertEquals(2, maxBatches.getInt(controller));
+            } finally {
+                controller.close();
+            }
+        }
+    }
+
+    @Test
     void testInterruptedSleepStopsCycleButPersistsCursorForResume() throws Exception {
         try (RocksDBStoreEngine engine = open("interrupted-sleep")) {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);

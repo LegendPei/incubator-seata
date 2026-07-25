@@ -53,7 +53,7 @@ public class RocksDBOrphanLockCleanupController implements AutoCloseable {
     public static final boolean DEFAULT_ORPHAN_LOCK_CLEAN_ENABLED = true;
     public static final long DEFAULT_ORPHAN_LOCK_CLEAN_INTERVAL_MILLIS = 60_000L;
     public static final int DEFAULT_ORPHAN_LOCK_CLEAN_BATCH_LIMIT = 1000;
-    public static final int DEFAULT_ORPHAN_LOCK_CLEAN_MAX_BATCHES = 10;
+    public static final int DEFAULT_ORPHAN_LOCK_CLEAN_MAX_BATCHES = 2;
     public static final long DEFAULT_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS = 100L;
 
     static final byte[] ORPHAN_LOCK_CLEAN_CURSOR_KEY = "orphan_lock_clean_cursor".getBytes(StandardCharsets.UTF_8);
