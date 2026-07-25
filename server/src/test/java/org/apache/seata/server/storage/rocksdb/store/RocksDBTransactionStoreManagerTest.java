@@ -690,6 +690,30 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testUnfilteredSessionScanRecordsScanStats() {
+        try (RocksDBStoreEngine engine = open("condition-unfiltered-scan-stats")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession("tx-unfiltered-1", GlobalStatus.Begin));
+            storeManager.writeSession(
+                    LogOperation.GLOBAL_ADD, globalSession("tx-unfiltered-2", GlobalStatus.Committing));
+            storeManager.writeSession(
+                    LogOperation.GLOBAL_ADD, globalSession("tx-unfiltered-3", GlobalStatus.Committed));
+
+            SessionCondition condition = new SessionCondition();
+            condition.setLazyLoadBranch(true);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+            SessionScanStats stats = condition.getScanStats();
+
+            Assertions.assertEquals(3, actual.size());
+            Assertions.assertEquals(3, stats.getRowsScanned());
+            Assertions.assertEquals(3, stats.getRowsReturned());
+            Assertions.assertEquals(0, stats.getPointReads());
+            Assertions.assertEquals(3, stats.getSessionsReturned());
+            Assertions.assertFalse(stats.isLimitReached());
+        }
+    }
+
+    @Test
     void testReadByStatusAndLimitHonorsScanCursor() {
         try (RocksDBStoreEngine engine = open("condition-status-limit-cursor")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
