@@ -773,7 +773,9 @@ public final class RocksDBFileModeBenchmark {
                 }
                 if (options.queryWorkloadIncludes("begin_sorted")) {
                     measure(beginSortedStats, round, options, () -> {
-                        List<GlobalSession> actual = storeManager.readSortByTimeoutBeginSessions(false);
+                        SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+                        condition.setLazyLoadBranch(true);
+                        List<GlobalSession> actual = storeManager.readSession(condition);
                         // Since Direction A an unlimited scan is bounded by fullScanDeadlineMillis
                         // and may return a truncated prefix.
                         assertTrue(
@@ -785,7 +787,7 @@ public final class RocksDBFileModeBenchmark {
                                     actual.size(), expectedBeginCount);
                         }
                         sinkCount = actual.size();
-                        return RowMetrics.scannedAndReturned(actual.size(), actual.size());
+                        return RowMetrics.fromScanStats(condition.getScanStats(), actual.size());
                     });
                 }
                 if (options.queryWorkloadIncludes("full_scan_filter")) {
@@ -808,7 +810,7 @@ public final class RocksDBFileModeBenchmark {
                                     count, expectedStatusCount);
                         }
                         sinkCount = count;
-                        return RowMetrics.scannedAndReturned(options.globalCount, count);
+                        return RowMetrics.fromScanStats(condition.getScanStats(), count);
                     });
                 }
             }

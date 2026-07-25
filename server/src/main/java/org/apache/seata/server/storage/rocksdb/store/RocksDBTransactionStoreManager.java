@@ -278,6 +278,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     private List<GlobalSession> scanGlobalSessions(SessionCondition sessionCondition) {
         List<GlobalSession> result = new ArrayList<>();
+        long startedAtNanos = System.nanoTime();
         long deadlineNanos = fullScanDeadlineMillis > 0
                 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fullScanDeadlineMillis)
                 : 0L;
@@ -291,6 +292,13 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                         result.add(globalSession);
                     }
                 });
+        sessionCondition.setScanStats(new SessionScanStats(
+                stats.getRowsScanned(),
+                stats.getRowsReturned(),
+                0L,
+                result.size(),
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos),
+                stats.isTruncated()));
         if (stats.isTruncated()) {
             LOGGER.warn(
                     "scanGlobalSessions truncated: scanned={}, returned={}, limitReached={}, deadlineReached={}, "

@@ -17,6 +17,7 @@
 package org.apache.seata.server.storage.rocksdb.benchmark;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
@@ -450,6 +451,94 @@ class RocksDBFileModeBenchmarkTest {
             Assertions.assertEquals("2", statusLine.get("iteratorNext"));
             Assertions.assertEquals(1, lines.size());
             Assertions.assertFalse(lines.stream().anyMatch(line -> line.startsWith("query.xid,")));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testFullScanFilterBenchmarkUsesActualScanStats() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-full-scan-stats-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_MAX_LIMIT, "2");
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, environment);
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=query",
+                    "--globalCount=6",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=RollbackRetrying:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--queryIterationsPerRound=1",
+                    "--queryWorkload=full_scan_filter",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> fullScanLine = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("query.full_scan_filter,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("query.full_scan_filter row missing")));
+            Assertions.assertEquals("2", fullScanLine.get("rowsScanned"));
+            Assertions.assertEquals("2", fullScanLine.get("rowsReturned"));
+            Assertions.assertEquals("0", fullScanLine.get("pointReads"));
+            Assertions.assertEquals("2", fullScanLine.get("iteratorNext"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testBeginSortedBenchmarkUsesStatusScanStats() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-begin-scan-stats-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=query",
+                    "--globalCount=6",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=Begin:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--queryIterationsPerRound=1",
+                    "--queryWorkload=begin_sorted",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> beginLine = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("query.begin_sorted,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("query.begin_sorted row missing")));
+            Assertions.assertEquals("6", beginLine.get("rowsScanned"));
+            Assertions.assertEquals("6", beginLine.get("rowsReturned"));
+            Assertions.assertEquals("6", beginLine.get("pointReads"));
+            Assertions.assertEquals("6", beginLine.get("iteratorNext"));
         } finally {
             ConfigurationCache.clear();
             restoreEnvironment(originalEnvironment);
