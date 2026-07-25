@@ -374,10 +374,13 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 : 0L;
         boolean deadlineReached = false;
         if (sessionCondition.getStatuses().length > 1) {
-            List<GlobalSession> merged =
-                    readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit, scanBudget, scanStats);
-            sessionCondition.setScanStats(scanStats.toStats(merged.size()));
-            return merged;
+            MultiStatusScanResult merged = readByStatusesWithKWayMerge(
+                    sessionCondition, maxBeginTime, limit, scanBudget, deadlineNanos, scanStats);
+            if (merged.isDeadlineReached()) {
+                logStatusScanDeadline(sessionCondition, merged.getSessions().size());
+            }
+            sessionCondition.setScanStats(scanStats.toStats(merged.getSessions().size()));
+            return merged.getSessions();
         }
         for (GlobalStatus status : sessionCondition.getStatuses()) {
             byte[] cursor = sessionCondition.getStatusScanCursor();
@@ -403,21 +406,18 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             sessionCondition.setNextStatusScanCursor(cursor);
         }
         if (deadlineReached) {
-            LOGGER.warn(
-                    "readByStatuses deadline reached: statuses={}, returned={}, deadlineMillis={}",
-                    sessionCondition.getStatuses(),
-                    result.size(),
-                    fullScanDeadlineMillis);
+            logStatusScanDeadline(sessionCondition, result.size());
         }
         sessionCondition.setScanStats(scanStats.toStats(result.size()));
         return result;
     }
 
-    private List<GlobalSession> readByStatusesWithKWayMerge(
+    private MultiStatusScanResult readByStatusesWithKWayMerge(
             SessionCondition sessionCondition,
             Long maxBeginTime,
             Integer limit,
             ScanBudget scanBudget,
+            long deadlineNanos,
             SessionScanStatsAccumulator scanStats) {
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
@@ -426,12 +426,18 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                         .thenComparingInt(StatusScanCursor::statusCode)
                         .thenComparing(StatusScanCursor::xid));
         for (GlobalStatus status : sessionCondition.getStatuses()) {
+            if (isDeadlineReached(deadlineNanos)) {
+                return new MultiStatusScanResult(result, true);
+            }
             StatusScanCursor cursor = new StatusScanCursor(status, maxBeginTime, limit, scanBudget, scanStats);
             if (cursor.hasCurrent()) {
                 queue.offer(cursor);
             }
         }
         while (!queue.isEmpty() && !isLimitReached(limit, result)) {
+            if (isDeadlineReached(deadlineNanos)) {
+                return new MultiStatusScanResult(result, true);
+            }
             StatusScanCursor cursor = queue.poll();
             RocksDBIndexManager.StatusIndexEntry entry = cursor.current();
             appendMatchingSession(
@@ -450,7 +456,19 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 queue.offer(cursor);
             }
         }
-        return result;
+        return new MultiStatusScanResult(result, false);
+    }
+
+    private boolean isDeadlineReached(long deadlineNanos) {
+        return deadlineNanos > 0 && System.nanoTime() >= deadlineNanos;
+    }
+
+    private void logStatusScanDeadline(SessionCondition sessionCondition, int returned) {
+        LOGGER.warn(
+                "readByStatuses deadline reached: statuses={}, returned={}, deadlineMillis={}",
+                sessionCondition.getStatuses(),
+                returned,
+                fullScanDeadlineMillis);
     }
 
     private boolean appendMatchingSession(
@@ -679,6 +697,24 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             index = 0;
             nextCursor = scanResult.getNextCursor();
             exhausted = nextCursor == null;
+        }
+    }
+
+    private static class MultiStatusScanResult {
+        private final List<GlobalSession> sessions;
+        private final boolean deadlineReached;
+
+        private MultiStatusScanResult(List<GlobalSession> sessions, boolean deadlineReached) {
+            this.sessions = sessions;
+            this.deadlineReached = deadlineReached;
+        }
+
+        private List<GlobalSession> getSessions() {
+            return sessions;
+        }
+
+        private boolean isDeadlineReached() {
+            return deadlineReached;
         }
     }
 

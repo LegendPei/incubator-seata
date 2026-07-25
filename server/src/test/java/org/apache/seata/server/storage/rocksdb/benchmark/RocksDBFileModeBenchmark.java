@@ -39,6 +39,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBValueCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncMode;
 import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncStats;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
+import org.apache.seata.server.storage.rocksdb.lock.RocksDBOrphanLockCleanupController;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.rocksdb.RocksDB;
@@ -67,6 +68,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 /**
@@ -80,7 +82,7 @@ public final class RocksDBFileModeBenchmark {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String CSV_HEADER =
             "scenario,globalCount,branchPerGlobal,lockPerBranch,writeWorkload,syncWrite,enableRangeDelete,warmupRounds,"
-                    + "measureRounds,batchSize,lockIndexScanBatchSize,queryIterationsPerRound,queryLimit,repeatRun,"
+                    + "measureRounds,batchSize,lockIndexScanBatchSize,orphanCleanRoundSleepMillis,queryIterationsPerRound,queryLimit,repeatRun,"
                     + "compareOrder,ops,totalMs,"
                     + "opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles,"
                     + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
@@ -116,8 +118,9 @@ public final class RocksDBFileModeBenchmark {
     private static final String LOCK_OP_CLEAN_ORPHAN_BATCHED = "clean_orphan_batched";
     private static final int CLEAN_ORPHAN_BATCHED_BATCH_LIMIT = 1000;
     private static final int CLEAN_ORPHAN_BATCHED_MAX_BATCHES = 10;
+    private static final long CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS =
+            RocksDBOrphanLockCleanupController.DEFAULT_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS;
     private static final int CLEAN_ORPHAN_FOREGROUND_PROBE_BRANCHES = 100;
-    private static final int CLEAN_ORPHAN_FOREGROUND_PROBE_SAMPLE_CAPACITY = 200_000;
     private static final String WRITE_WORKLOAD_FULL = "full";
     private static final String WRITE_WORKLOAD_APPEND = "append";
     private static final List<String> ALL_LOCK_WORKLOADS = Arrays.asList(
@@ -834,6 +837,7 @@ public final class RocksDBFileModeBenchmark {
         OperationStats releaseGlobalStats = new OperationStats(options.sampleEvery);
         OperationStats cleanOrphanStats = new OperationStats(options.sampleEvery);
         OperationStats cleanOrphanBatchedStats = new OperationStats(options.sampleEvery);
+        OperationStats cleanOrphanBatchedProbeStats = new OperationStats(options.sampleEvery);
         Path lastDbPath = null;
         RocksDBWalSyncStats lastWalSyncStats = RocksDBWalSyncStats.NONE;
 
@@ -1007,14 +1011,12 @@ public final class RocksDBFileModeBenchmark {
                         probeBranches.add(probe);
                         storeManager.writeSession(LogOperation.BRANCH_ADD, probe);
                     }
-                    long[] probeLatencyNanos = new long[CLEAN_ORPHAN_FOREGROUND_PROBE_SAMPLE_CAPACITY];
-                    int[] probeSampleCount = new int[1];
-                    int[] probeOps = new int[1];
-                    boolean[] probeRunning = {true};
+                    boolean measureProbe = round >= options.warmupRounds;
+                    AtomicBoolean probeRunning = new AtomicBoolean(true);
                     Thread probeThread = new Thread(
                             () -> {
                                 int index = 0;
-                                while (probeRunning[0]) {
+                                while (probeRunning.get()) {
                                     BranchSession branch = probeBranches.get(index % probeBranches.size());
                                     index++;
                                     long startedAt = System.nanoTime();
@@ -1026,9 +1028,8 @@ public final class RocksDBFileModeBenchmark {
                                     } catch (Exception e) {
                                         continue;
                                     }
-                                    probeOps[0]++;
-                                    if (probeSampleCount[0] < probeLatencyNanos.length) {
-                                        probeLatencyNanos[probeSampleCount[0]++] = System.nanoTime() - startedAt;
+                                    if (measureProbe) {
+                                        cleanOrphanBatchedProbeStats.record(System.nanoTime() - startedAt);
                                     }
                                 }
                             },
@@ -1039,42 +1040,48 @@ public final class RocksDBFileModeBenchmark {
                     int totalCleaned = 0;
                     int batchRounds = 0;
                     long passStartNanos = System.nanoTime();
-                    while (true) {
-                        byte[] seekKey = cursor;
-                        RocksDBLockManager.CleanOrphanLocksResult[] resultHolder =
-                                new RocksDBLockManager.CleanOrphanLocksResult[1];
-                        measure(cleanOrphanBatchedStats, round, options, () -> {
-                            RocksDBLockManager.CleanOrphanLocksResult batchedResult =
-                                    lockManager.cleanOrphanLocksBatches(
-                                            seekKey,
-                                            CLEAN_ORPHAN_BATCHED_BATCH_LIMIT,
-                                            CLEAN_ORPHAN_BATCHED_MAX_BATCHES);
-                            resultHolder[0] = batchedResult;
-                            return RowMetrics.scannedPointReadAndUpdated(
-                                    batchedResult.getScanned(),
-                                    batchedResult.getScanned(),
-                                    batchedResult.getCleaned(),
-                                    0L);
-                        });
-                        RocksDBLockManager.CleanOrphanLocksResult result = resultHolder[0];
-                        totalCleaned += result.getCleaned();
-                        batchRounds++;
-                        cursor = result.getNextSeekKey();
-                        if (!result.isLimitReached() || cursor == null) {
-                            break;
+                    try {
+                        while (true) {
+                            byte[] seekKey = cursor;
+                            RocksDBLockManager.CleanOrphanLocksResult[] resultHolder =
+                                    new RocksDBLockManager.CleanOrphanLocksResult[1];
+                            measure(cleanOrphanBatchedStats, round, options, () -> {
+                                RocksDBLockManager.CleanOrphanLocksResult batchedResult =
+                                        lockManager.cleanOrphanLocksBatches(
+                                                seekKey,
+                                                CLEAN_ORPHAN_BATCHED_BATCH_LIMIT,
+                                                CLEAN_ORPHAN_BATCHED_MAX_BATCHES);
+                                resultHolder[0] = batchedResult;
+                                return RowMetrics.scannedPointReadAndUpdated(
+                                        batchedResult.getScanned(),
+                                        batchedResult.getScanned(),
+                                        batchedResult.getCleaned(),
+                                        0L);
+                            });
+                            RocksDBLockManager.CleanOrphanLocksResult result = resultHolder[0];
+                            totalCleaned += result.getCleaned();
+                            batchRounds++;
+                            cursor = result.getNextSeekKey();
+                            if (!result.isLimitReached() || cursor == null) {
+                                break;
+                            }
+                            Thread.sleep(CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS);
                         }
+                    } finally {
+                        probeRunning.set(false);
+                        probeThread.join();
                     }
-                    probeRunning[0] = false;
-                    probeThread.join();
                     double passMillis = (System.nanoTime() - passStartNanos) / 1_000_000.0;
                     // The probe thread releases/reacquires its locks while the cleaner scans; when a probe
                     // release lands between the cleaner's index scan and its LOCK point-read, the cleaner counts
                     // one harmless phantom clean (an idempotent delete of an already-deleted index entry).
                     // Hence cleaned may exceed orphanRows by up to the number of probe operations.
                     assertTrue(
-                            totalCleaned >= orphanRows && totalCleaned <= orphanRows + probeOps[0],
+                            totalCleaned >= orphanRows
+                                    && totalCleaned <= orphanRows + cleanOrphanBatchedProbeStats.ops(),
                             "batched clean orphan should clean all prepared locks, expected:" + orphanRows
-                                    + ", cleaned:" + totalCleaned + ", probeOps:" + probeOps[0]);
+                                    + ", cleaned:" + totalCleaned + ", probeOps:"
+                                    + cleanOrphanBatchedProbeStats.ops());
                     assertTrue(
                             engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0])
                                     .isEmpty(),
@@ -1085,25 +1092,24 @@ public final class RocksDBFileModeBenchmark {
                             "lock branch index should be empty after batched clean orphan");
                     log(
                             "  [lock.clean_orphan_batched] round %d pass completed: batchRounds=%d, cleaned=%d "
-                                    + "(phantom=%d), passMillis=%.1f (%.1f ms/round avg)",
+                                    + "(phantom=%d), passMillis=%.1f (%.1f ms/round avg), roundSleepMillis=%d",
                             round + 1,
                             batchRounds,
                             totalCleaned,
                             totalCleaned - orphanRows,
                             passMillis,
-                            batchRounds == 0 ? 0D : passMillis / batchRounds);
-                    int probeSamples = probeSampleCount[0];
-                    if (probeSamples > 0) {
-                        Arrays.sort(probeLatencyNanos, 0, probeSamples);
+                            batchRounds == 0 ? 0D : passMillis / batchRounds,
+                            CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS);
+                    if (cleanOrphanBatchedProbeStats.ops() > 0L) {
                         log(
                                 "  [lock.clean_orphan_batched] foreground probe: ops=%d samples=%d "
                                         + "p50=%.3fms p95=%.3fms p99=%.3fms max=%.3fms",
-                                probeOps[0],
-                                probeSamples,
-                                probeLatencyNanos[Math.min(probeSamples - 1, (int) (probeSamples * 0.50D))] / 1e6,
-                                probeLatencyNanos[Math.min(probeSamples - 1, (int) (probeSamples * 0.95D))] / 1e6,
-                                probeLatencyNanos[Math.min(probeSamples - 1, (int) (probeSamples * 0.99D))] / 1e6,
-                                probeLatencyNanos[probeSamples - 1] / 1e6);
+                                cleanOrphanBatchedProbeStats.ops(),
+                                cleanOrphanBatchedProbeStats.sampleCount(),
+                                cleanOrphanBatchedProbeStats.percentile(50) / 1e6,
+                                cleanOrphanBatchedProbeStats.percentile(95) / 1e6,
+                                cleanOrphanBatchedProbeStats.percentile(99) / 1e6,
+                                cleanOrphanBatchedProbeStats.percentile(100) / 1e6);
                     }
                     lastOrphanBatchedWalSyncStats = engine.diagnostics().getWalSyncStats();
                 }
@@ -1140,6 +1146,12 @@ public final class RocksDBFileModeBenchmark {
                     "lock.clean_orphan_batched",
                     options,
                     cleanOrphanBatchedStats,
+                    DbFootprint.from(lastOrphanBatchedDbPath, lastOrphanBatchedWalSyncStats),
+                    csvLines);
+            emit(
+                    "lock.clean_orphan_batched_foreground_probe",
+                    options,
+                    cleanOrphanBatchedProbeStats,
                     DbFootprint.from(lastOrphanBatchedDbPath, lastOrphanBatchedWalSyncStats),
                     csvLines);
         }
@@ -1608,6 +1620,8 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + options.lockIndexScanBatchSize
                 + ","
+                + CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS
+                + ","
                 + options.queryIterationsPerRound
                 + ","
                 + options.queryLimit
@@ -1754,6 +1768,7 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("measureRounds=" + options.measureRounds);
         System.out.println("batchSize=" + options.batchSize);
         System.out.println("lockIndexScanBatchSize=" + options.lockIndexScanBatchSize);
+        System.out.println("orphanCleanRoundSleepMillis=" + CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS);
         System.out.println("queryIterationsPerRound=" + options.queryIterationsPerRound);
         System.out.println("queryLimit=" + options.queryLimit);
         System.out.println("repeatRuns=" + options.repeatRuns);
@@ -1840,6 +1855,7 @@ public final class RocksDBFileModeBenchmark {
                 + ",statusDistribution=" + options.statusDistribution
                 + ",expiredRatio=" + options.expiredRatio
                 + ",lockWorkload=" + options.lockWorkload
+                + ",orphanCleanRoundSleepMillis=" + CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS
                 + ",lockConflictRatio=" + options.lockConflictRatio
                 + ",xidFanoutDistribution=" + options.xidFanoutDistribution;
         int hash = raw.hashCode();
@@ -2517,6 +2533,10 @@ public final class RocksDBFileModeBenchmark {
 
         private long ops() {
             return ops;
+        }
+
+        private int sampleCount() {
+            return sampleCount;
         }
 
         private long totalNanos() {
