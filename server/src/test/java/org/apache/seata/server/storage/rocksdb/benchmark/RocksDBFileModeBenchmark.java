@@ -81,8 +81,8 @@ public final class RocksDBFileModeBenchmark {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String CSV_HEADER =
-            "scenario,globalCount,branchPerGlobal,lockPerBranch,writeWorkload,syncWrite,enableRangeDelete,warmupRounds,"
-                    + "measureRounds,batchSize,lockIndexScanBatchSize,orphanCleanRoundSleepMillis,queryIterationsPerRound,queryLimit,repeatRun,"
+            "scenario,globalCount,branchPerGlobal,lockPerBranch,writeWorkload,dataPayloadProfile,queryWorkload,syncWrite,enableRangeDelete,warmupRounds,"
+                    + "measureRounds,batchSize,lockIndexScanBatchSize,orphanCleanBatchLimit,orphanCleanMaxBatches,orphanCleanRoundSleepMillis,queryIterationsPerRound,queryLimit,repeatRun,"
                     + "compareOrder,ops,totalMs,"
                     + "opsPerSecond,p50Ms,p95Ms,p99Ms,dbSizeBytes,fileCount,sstFiles,walFiles,"
                     + "estimateLiveDataSizeBytes,totalSstFilesSizeBytes,pendingCompactionBytes,"
@@ -123,6 +123,9 @@ public final class RocksDBFileModeBenchmark {
     private static final int CLEAN_ORPHAN_FOREGROUND_PROBE_BRANCHES = 100;
     private static final String WRITE_WORKLOAD_FULL = "full";
     private static final String WRITE_WORKLOAD_APPEND = "append";
+    private static final String DATA_PAYLOAD_PROFILE_PRODUCTION = "production";
+    private static final String DATA_PAYLOAD_PROFILE_PHASE4 = "phase4";
+    private static final String QUERY_WORKLOAD_ALL = "all";
     private static final List<String> ALL_LOCK_WORKLOADS = Arrays.asList(
             LOCK_OP_ACQUIRE,
             LOCK_OP_CONFLICT,
@@ -724,89 +727,111 @@ public final class RocksDBFileModeBenchmark {
                     boolean warmup = round < options.warmupRounds;
                     logRoundStart(scenario, round, options.totalRounds(), warmup);
                 }
-                measure(xidStats, round, options, () -> {
-                    GlobalSession globalSession = dataSet.pick(iteration);
-                    GlobalSession actual = storeManager.readSession(globalSession.getXid(), false);
-                    assertTrue(actual != null, "xid query returned no session");
-                    sinkXid = actual.getXid();
-                    return RowMetrics.pointReadReturned(1, 1);
-                });
-                measure(transactionIdStats, round, options, () -> {
-                    GlobalSession globalSession = dataSet.pick(iteration * 9973);
-                    SessionCondition condition = new SessionCondition();
-                    condition.setTransactionId(globalSession.getTransactionId());
-                    condition.setLazyLoadBranch(true);
-                    List<GlobalSession> actual = storeManager.readSession(condition);
-                    assertEquals(1, actual.size(), "transactionId query size");
-                    sinkXid = actual.get(0).getXid();
-                    return RowMetrics.pointReadReturned(2, actual.size());
-                });
-                measure(statusStats, round, options, () -> {
-                    SessionCondition condition = new SessionCondition(TARGET_STATUS);
-                    condition.setLazyLoadBranch(true);
-                    if (useOvertimeStatusQuery) {
-                        condition.setOverTimeAliveMills((long) SESSION_TIMEOUT_MILLIS);
-                    }
-                    if (options.queryLimit > 0) {
-                        condition.setLimit(options.queryLimit);
-                    }
-                    List<GlobalSession> actual = storeManager.readSession(condition);
-                    // Since Direction A an unlimited status scan is bounded by
-                    // fullScanDeadlineMillis and may return a truncated prefix.
-                    assertTrue(actual.size() <= statusQueryMaxCount, "status query size must not exceed expected");
-                    if (actual.size() < expectedLimitedStatusCount) {
-                        log(
-                                "  [query.status] truncated by scan deadline: returned %d of %d expected",
-                                actual.size(), expectedLimitedStatusCount);
-                    }
-                    sinkCount = actual.size();
-                    return statusQueryMetrics(condition, actual.size());
-                });
-                measure(beginSortedStats, round, options, () -> {
-                    List<GlobalSession> actual = storeManager.readSortByTimeoutBeginSessions(false);
-                    // Since Direction A an unlimited scan is bounded by fullScanDeadlineMillis
-                    // and may return a truncated prefix.
-                    assertTrue(actual.size() <= expectedBeginCount, "begin sorted query size must not exceed expected");
-                    if (actual.size() < expectedBeginCount) {
-                        log(
-                                "  [query.begin_sorted] truncated by scan deadline: returned %d of %d expected",
-                                actual.size(), expectedBeginCount);
-                    }
-                    sinkCount = actual.size();
-                    return RowMetrics.scannedAndReturned(actual.size(), actual.size());
-                });
-                measure(fullScanStats, round, options, () -> {
-                    SessionCondition condition = new SessionCondition();
-                    condition.setLazyLoadBranch(true);
-                    int count = 0;
-                    for (GlobalSession globalSession : storeManager.readSession(condition)) {
-                        if (globalSession.getStatus() == TARGET_STATUS) {
-                            count++;
+                if (options.queryWorkloadIncludes("xid")) {
+                    measure(xidStats, round, options, () -> {
+                        GlobalSession globalSession = dataSet.pick(iteration);
+                        GlobalSession actual = storeManager.readSession(globalSession.getXid(), false);
+                        assertTrue(actual != null, "xid query returned no session");
+                        sinkXid = actual.getXid();
+                        return RowMetrics.pointReadReturned(1, 1);
+                    });
+                }
+                if (options.queryWorkloadIncludes("transaction_id")) {
+                    measure(transactionIdStats, round, options, () -> {
+                        GlobalSession globalSession = dataSet.pick(iteration * 9973);
+                        SessionCondition condition = new SessionCondition();
+                        condition.setTransactionId(globalSession.getTransactionId());
+                        condition.setLazyLoadBranch(true);
+                        List<GlobalSession> actual = storeManager.readSession(condition);
+                        assertEquals(1, actual.size(), "transactionId query size");
+                        sinkXid = actual.get(0).getXid();
+                        return RowMetrics.pointReadReturned(2, actual.size());
+                    });
+                }
+                if (options.queryWorkloadIncludes("status")) {
+                    measure(statusStats, round, options, () -> {
+                        SessionCondition condition = new SessionCondition(TARGET_STATUS);
+                        condition.setLazyLoadBranch(true);
+                        if (useOvertimeStatusQuery) {
+                            condition.setOverTimeAliveMills((long) SESSION_TIMEOUT_MILLIS);
                         }
-                    }
-                    // Since Direction A an unconditional full scan is deliberately bounded
-                    // (store.file.rocksdb.fullScanMaxLimit / fullScanDeadlineMillis), so the
-                    // result may be a truncated prefix instead of the full match set.
-                    assertTrue(count <= expectedStatusCount, "full scan status count must not exceed expected");
-                    if (count < expectedStatusCount) {
-                        log(
-                                "  [query.full_scan_filter] truncated by scan protection: matched %d of %d expected",
-                                count, expectedStatusCount);
-                    }
-                    sinkCount = count;
-                    return RowMetrics.scannedAndReturned(options.globalCount, count);
-                });
+                        if (options.queryLimit > 0) {
+                            condition.setLimit(options.queryLimit);
+                        }
+                        List<GlobalSession> actual = storeManager.readSession(condition);
+                        // Since Direction A an unlimited status scan is bounded by
+                        // fullScanDeadlineMillis and may return a truncated prefix.
+                        assertTrue(actual.size() <= statusQueryMaxCount, "status query size must not exceed expected");
+                        if (actual.size() < expectedLimitedStatusCount) {
+                            log(
+                                    "  [query.status] truncated by scan deadline: returned %d of %d expected",
+                                    actual.size(), expectedLimitedStatusCount);
+                        }
+                        sinkCount = actual.size();
+                        return statusQueryMetrics(condition, actual.size());
+                    });
+                }
+                if (options.queryWorkloadIncludes("begin_sorted")) {
+                    measure(beginSortedStats, round, options, () -> {
+                        List<GlobalSession> actual = storeManager.readSortByTimeoutBeginSessions(false);
+                        // Since Direction A an unlimited scan is bounded by fullScanDeadlineMillis
+                        // and may return a truncated prefix.
+                        assertTrue(
+                                actual.size() <= expectedBeginCount,
+                                "begin sorted query size must not exceed expected");
+                        if (actual.size() < expectedBeginCount) {
+                            log(
+                                    "  [query.begin_sorted] truncated by scan deadline: returned %d of %d expected",
+                                    actual.size(), expectedBeginCount);
+                        }
+                        sinkCount = actual.size();
+                        return RowMetrics.scannedAndReturned(actual.size(), actual.size());
+                    });
+                }
+                if (options.queryWorkloadIncludes("full_scan_filter")) {
+                    measure(fullScanStats, round, options, () -> {
+                        SessionCondition condition = new SessionCondition();
+                        condition.setLazyLoadBranch(true);
+                        int count = 0;
+                        for (GlobalSession globalSession : storeManager.readSession(condition)) {
+                            if (globalSession.getStatus() == TARGET_STATUS) {
+                                count++;
+                            }
+                        }
+                        // Since Direction A an unconditional full scan is deliberately bounded
+                        // (store.file.rocksdb.fullScanMaxLimit / fullScanDeadlineMillis), so the
+                        // result may be a truncated prefix instead of the full match set.
+                        assertTrue(count <= expectedStatusCount, "full scan status count must not exceed expected");
+                        if (count < expectedStatusCount) {
+                            log(
+                                    "  [query.full_scan_filter] truncated by scan protection: matched %d of %d expected",
+                                    count, expectedStatusCount);
+                        }
+                        sinkCount = count;
+                        return RowMetrics.scannedAndReturned(options.globalCount, count);
+                    });
+                }
             }
             logBlockCacheStats(engine);
             walSyncStats = engine.diagnostics().getWalSyncStats();
         }
 
         DbFootprint footprint = DbFootprint.from(dbPath, walSyncStats);
-        emit("query.xid", options, xidStats, footprint, csvLines);
-        emit("query.transaction_id", options, transactionIdStats, footprint, csvLines);
-        emit("query.status", options, statusStats, footprint, csvLines);
-        emit("query.begin_sorted", options, beginSortedStats, footprint, csvLines);
-        emit("query.full_scan_filter", options, fullScanStats, footprint, csvLines);
+        if (options.queryWorkloadIncludes("xid")) {
+            emit("query.xid", options, xidStats, footprint, csvLines);
+        }
+        if (options.queryWorkloadIncludes("transaction_id")) {
+            emit("query.transaction_id", options, transactionIdStats, footprint, csvLines);
+        }
+        if (options.queryWorkloadIncludes("status")) {
+            emit("query.status", options, statusStats, footprint, csvLines);
+        }
+        if (options.queryWorkloadIncludes("begin_sorted")) {
+            emit("query.begin_sorted", options, beginSortedStats, footprint, csvLines);
+        }
+        if (options.queryWorkloadIncludes("full_scan_filter")) {
+            emit("query.full_scan_filter", options, fullScanStats, footprint, csvLines);
+        }
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
@@ -1048,9 +1073,7 @@ public final class RocksDBFileModeBenchmark {
                             measure(cleanOrphanBatchedStats, round, options, () -> {
                                 RocksDBLockManager.CleanOrphanLocksResult batchedResult =
                                         lockManager.cleanOrphanLocksBatches(
-                                                seekKey,
-                                                CLEAN_ORPHAN_BATCHED_BATCH_LIMIT,
-                                                CLEAN_ORPHAN_BATCHED_MAX_BATCHES);
+                                                seekKey, options.orphanCleanBatchLimit, options.orphanCleanMaxBatches);
                                 resultHolder[0] = batchedResult;
                                 return RowMetrics.scannedPointReadAndUpdated(
                                         batchedResult.getScanned(),
@@ -1065,7 +1088,7 @@ public final class RocksDBFileModeBenchmark {
                             if (!result.isLimitReached() || cursor == null) {
                                 break;
                             }
-                            Thread.sleep(CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS);
+                            Thread.sleep(options.orphanCleanRoundSleepMillis);
                         }
                     } finally {
                         probeRunning.set(false);
@@ -1099,7 +1122,7 @@ public final class RocksDBFileModeBenchmark {
                             totalCleaned - orphanRows,
                             passMillis,
                             batchRounds == 0 ? 0D : passMillis / batchRounds,
-                            CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS);
+                            options.orphanCleanRoundSleepMillis);
                     if (cleanOrphanBatchedProbeStats.ops() > 0L) {
                         log(
                                 "  [lock.clean_orphan_batched] foreground probe: ops=%d samples=%d "
@@ -1608,6 +1631,10 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + options.writeWorkload
                 + ","
+                + options.dataPayloadProfile
+                + ","
+                + options.queryWorkload
+                + ","
                 + options.syncWrite
                 + ","
                 + options.enableRangeDelete
@@ -1620,7 +1647,11 @@ public final class RocksDBFileModeBenchmark {
                 + ","
                 + options.lockIndexScanBatchSize
                 + ","
-                + CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS
+                + options.orphanCleanBatchLimit
+                + ","
+                + options.orphanCleanMaxBatches
+                + ","
+                + options.orphanCleanRoundSleepMillis
                 + ","
                 + options.queryIterationsPerRound
                 + ","
@@ -1768,7 +1799,11 @@ public final class RocksDBFileModeBenchmark {
         System.out.println("measureRounds=" + options.measureRounds);
         System.out.println("batchSize=" + options.batchSize);
         System.out.println("lockIndexScanBatchSize=" + options.lockIndexScanBatchSize);
-        System.out.println("orphanCleanRoundSleepMillis=" + CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS);
+        System.out.println("dataPayloadProfile=" + options.dataPayloadProfile);
+        System.out.println("queryWorkload=" + options.queryWorkload);
+        System.out.println("orphanCleanBatchLimit=" + options.orphanCleanBatchLimit);
+        System.out.println("orphanCleanMaxBatches=" + options.orphanCleanMaxBatches);
+        System.out.println("orphanCleanRoundSleepMillis=" + options.orphanCleanRoundSleepMillis);
         System.out.println("queryIterationsPerRound=" + options.queryIterationsPerRound);
         System.out.println("queryLimit=" + options.queryLimit);
         System.out.println("repeatRuns=" + options.repeatRuns);
@@ -1855,7 +1890,11 @@ public final class RocksDBFileModeBenchmark {
                 + ",statusDistribution=" + options.statusDistribution
                 + ",expiredRatio=" + options.expiredRatio
                 + ",lockWorkload=" + options.lockWorkload
-                + ",orphanCleanRoundSleepMillis=" + CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS
+                + ",dataPayloadProfile=" + options.dataPayloadProfile
+                + ",queryWorkload=" + options.queryWorkload
+                + ",orphanCleanBatchLimit=" + options.orphanCleanBatchLimit
+                + ",orphanCleanMaxBatches=" + options.orphanCleanMaxBatches
+                + ",orphanCleanRoundSleepMillis=" + options.orphanCleanRoundSleepMillis
                 + ",lockConflictRatio=" + options.lockConflictRatio
                 + ",xidFanoutDistribution=" + options.xidFanoutDistribution;
         int hash = raw.hashCode();
@@ -2361,6 +2400,9 @@ public final class RocksDBFileModeBenchmark {
                 }
                 GlobalSession globalSession =
                         globalSession(i, round, options.seed, beginTime, options.statusForIndex(i));
+                if (options.usesProductionPayload()) {
+                    globalSession.setApplicationData(productionApplicationData(i, round, options.seed));
+                }
                 globals.add(globalSession);
                 int branchCount = options.branchCountForIndex(i);
                 List<BranchSession> globalBranches = new ArrayList<>(branchCount);
@@ -2439,8 +2481,11 @@ public final class RocksDBFileModeBenchmark {
                     "benchmark-app", "benchmark-group", "phase4-tx-" + seed + "-" + round + "-" + index, 60000);
             globalSession.setStatus(status);
             globalSession.setBeginTime(beginTime);
-            // Simulate production applicationData (business context JSON, ~800 bytes)
-            globalSession.setApplicationData("{\"bizType\":\"ORDER_CREATE\",\"userId\":\"U" + (100000 + index % 50000)
+            return globalSession;
+        }
+
+        private static String productionApplicationData(int index, int round, long seed) {
+            return "{\"bizType\":\"ORDER_CREATE\",\"userId\":\"U" + (100000 + index % 50000)
                     + "\",\"merchantId\":\"M" + (200000 + index % 30000)
                     + "\",\"orderId\":\"ORD" + seed + round + index
                     + "\",\"amount\":" + (100 + index % 9900) + "." + (index % 100)
@@ -2448,8 +2493,7 @@ public final class RocksDBFileModeBenchmark {
                     + ",\"timeoutNotify\":\"http://callback.internal/notify\","
                     + "\"rollbackPolicy\":\"SAGA\",\"priority\":\"NORMAL\","
                     + "\"traceId\":\"trace-" + Long.toHexString(seed) + "-" + Integer.toHexString(index)
-                    + "\",\"extra\":{\"source\":\"benchmark\",\"region\":\"cn-east-1\"}}");
-            return globalSession;
+                    + "\",\"extra\":{\"source\":\"benchmark\",\"region\":\"cn-east-1\"}}";
         }
 
         private static BranchSession branchSession(
@@ -2804,6 +2848,11 @@ public final class RocksDBFileModeBenchmark {
         private final double lockConflictRatio;
         private final String xidFanoutDistribution;
         private final List<IntWeight> parsedXidFanoutDistribution;
+        private String dataPayloadProfile = DATA_PAYLOAD_PROFILE_PRODUCTION;
+        private String queryWorkload = QUERY_WORKLOAD_ALL;
+        private int orphanCleanBatchLimit = CLEAN_ORPHAN_BATCHED_BATCH_LIMIT;
+        private int orphanCleanMaxBatches = CLEAN_ORPHAN_BATCHED_MAX_BATCHES;
+        private long orphanCleanRoundSleepMillis = CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS;
 
         private BenchmarkOptions(
                 int globalCount,
@@ -3054,10 +3103,39 @@ public final class RocksDBFileModeBenchmark {
                     parseSizeOption(values, "indexWriteBufferSize", 0L),
                     parseSizeOption(values, "metadataWriteBufferSize", 0L),
                     parseSizeOption(values, "maxTotalWalSize", 0L));
+            BenchmarkOptions resolved = options;
             if (options.compare == null || "explicitR4".equals(options.compare)) {
-                return options.withTuningProfile(options.tuningProfile).withExplicitR4Overrides(values);
+                resolved = options.withTuningProfile(options.tuningProfile).withExplicitR4Overrides(values);
             }
-            return options;
+            return resolved.withExecutionProfiles(
+                    stringValue(values, "dataPayloadProfile", DATA_PAYLOAD_PROFILE_PRODUCTION),
+                    stringValue(values, "queryWorkload", QUERY_WORKLOAD_ALL),
+                    intValue(values, "orphanCleanBatchLimit", CLEAN_ORPHAN_BATCHED_BATCH_LIMIT),
+                    intValue(values, "orphanCleanMaxBatches", CLEAN_ORPHAN_BATCHED_MAX_BATCHES),
+                    longValue(values, "orphanCleanRoundSleepMillis", CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS));
+        }
+
+        private BenchmarkOptions withExecutionProfiles(
+                String dataPayloadProfile,
+                String queryWorkload,
+                int orphanCleanBatchLimit,
+                int orphanCleanMaxBatches,
+                long orphanCleanRoundSleepMillis) {
+            this.dataPayloadProfile = normalizeDataPayloadProfile(dataPayloadProfile);
+            this.queryWorkload = normalizeQueryWorkload(queryWorkload);
+            this.orphanCleanBatchLimit = positive(orphanCleanBatchLimit, "orphanCleanBatchLimit");
+            this.orphanCleanMaxBatches = positive(orphanCleanMaxBatches, "orphanCleanMaxBatches");
+            this.orphanCleanRoundSleepMillis = nonNegative(orphanCleanRoundSleepMillis, "orphanCleanRoundSleepMillis");
+            return this;
+        }
+
+        private BenchmarkOptions copyExecutionProfilesFrom(BenchmarkOptions source) {
+            return withExecutionProfiles(
+                    source.dataPayloadProfile,
+                    source.queryWorkload,
+                    source.orphanCleanBatchLimit,
+                    source.orphanCleanMaxBatches,
+                    source.orphanCleanRoundSleepMillis);
         }
 
         private GlobalStatus statusForIndex(int index) {
@@ -3102,6 +3180,14 @@ public final class RocksDBFileModeBenchmark {
             return WRITE_WORKLOAD_FULL.equals(writeWorkload);
         }
 
+        private boolean usesProductionPayload() {
+            return DATA_PAYLOAD_PROFILE_PRODUCTION.equals(dataPayloadProfile);
+        }
+
+        private boolean queryWorkloadIncludes(String operation) {
+            return QUERY_WORKLOAD_ALL.equals(queryWorkload) || queryWorkload.equals(operation);
+        }
+
         private boolean includeByRatio(int index, double ratioValue) {
             if (ratioValue <= 0D) {
                 return false;
@@ -3134,59 +3220,60 @@ public final class RocksDBFileModeBenchmark {
 
         private BenchmarkOptions withAtLeastOneLock() {
             return new BenchmarkOptions(
-                    globalCount,
-                    Math.max(1, branchPerGlobal),
-                    Math.max(1, lockPerBranch),
-                    writeWorkload,
-                    syncWrite,
-                    enableRangeDelete,
-                    blockCacheSize,
-                    writeBufferSize,
-                    maxWriteBufferNumber,
-                    minWriteBufferNumberToMerge,
-                    maxBackgroundJobs,
-                    maxOpenFiles,
-                    targetFileSizeBase,
-                    level0FileNumCompactionTrigger,
-                    level0SlowdownWritesTrigger,
-                    level0StopWritesTrigger,
-                    enableStatistics,
-                    optimizeFiltersForHits,
-                    compressionType,
-                    walSyncMode,
-                    walSyncIntervalMillis,
-                    walSyncWriteThreshold,
-                    walSyncOnShutdown,
-                    walSyncWarnThresholdMillis,
-                    walSyncCompareMode,
-                    cleanup,
-                    warmupRounds,
-                    measureRounds,
-                    batchSize,
-                    lockIndexScanBatchSize,
-                    queryIterationsPerRound,
-                    queryLimit,
-                    repeatRuns,
-                    compareOrder,
-                    runLabel,
-                    sampleEvery,
-                    seed,
-                    dbPath,
-                    benchmarks,
-                    compare,
-                    tuningProfile,
-                    statusDistribution,
-                    expiredRatio,
-                    lockWorkload,
-                    lockConflictRatio,
-                    xidFanoutDistribution,
-                    dbWriteBufferSize,
-                    globalWriteBufferSize,
-                    branchWriteBufferSize,
-                    lockWriteBufferSize,
-                    indexWriteBufferSize,
-                    metadataWriteBufferSize,
-                    maxTotalWalSize);
+                            globalCount,
+                            Math.max(1, branchPerGlobal),
+                            Math.max(1, lockPerBranch),
+                            writeWorkload,
+                            syncWrite,
+                            enableRangeDelete,
+                            blockCacheSize,
+                            writeBufferSize,
+                            maxWriteBufferNumber,
+                            minWriteBufferNumberToMerge,
+                            maxBackgroundJobs,
+                            maxOpenFiles,
+                            targetFileSizeBase,
+                            level0FileNumCompactionTrigger,
+                            level0SlowdownWritesTrigger,
+                            level0StopWritesTrigger,
+                            enableStatistics,
+                            optimizeFiltersForHits,
+                            compressionType,
+                            walSyncMode,
+                            walSyncIntervalMillis,
+                            walSyncWriteThreshold,
+                            walSyncOnShutdown,
+                            walSyncWarnThresholdMillis,
+                            walSyncCompareMode,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            lockIndexScanBatchSize,
+                            queryIterationsPerRound,
+                            queryLimit,
+                            repeatRuns,
+                            compareOrder,
+                            runLabel,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare,
+                            tuningProfile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution,
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize)
+                    .copyExecutionProfilesFrom(this);
         }
 
         private BenchmarkOptions comparisonBaseOptions() {
@@ -3217,170 +3304,173 @@ public final class RocksDBFileModeBenchmark {
             switch (compare) {
                 case "syncWrite":
                     return new BenchmarkOptions(
-                            globalCount,
-                            branchPerGlobal,
-                            lockPerBranch,
-                            writeWorkload,
-                            !syncWrite,
-                            enableRangeDelete,
-                            blockCacheSize,
-                            writeBufferSize,
-                            maxWriteBufferNumber,
-                            minWriteBufferNumberToMerge,
-                            maxBackgroundJobs,
-                            maxOpenFiles,
-                            targetFileSizeBase,
-                            level0FileNumCompactionTrigger,
-                            level0SlowdownWritesTrigger,
-                            level0StopWritesTrigger,
-                            enableStatistics,
-                            optimizeFiltersForHits,
-                            compressionType,
-                            walSyncMode,
-                            walSyncIntervalMillis,
-                            walSyncWriteThreshold,
-                            walSyncOnShutdown,
-                            walSyncWarnThresholdMillis,
-                            walSyncCompareMode,
-                            cleanup,
-                            warmupRounds,
-                            measureRounds,
-                            batchSize,
-                            lockIndexScanBatchSize,
-                            queryIterationsPerRound,
-                            queryLimit,
-                            repeatRuns,
-                            compareOrder,
-                            runLabel,
-                            sampleEvery,
-                            seed,
-                            dbPath,
-                            benchmarks,
-                            compare,
-                            tuningProfile,
-                            statusDistribution,
-                            expiredRatio,
-                            lockWorkload,
-                            lockConflictRatio,
-                            xidFanoutDistribution,
-                            dbWriteBufferSize,
-                            globalWriteBufferSize,
-                            branchWriteBufferSize,
-                            lockWriteBufferSize,
-                            indexWriteBufferSize,
-                            metadataWriteBufferSize,
-                            maxTotalWalSize);
+                                    globalCount,
+                                    branchPerGlobal,
+                                    lockPerBranch,
+                                    writeWorkload,
+                                    !syncWrite,
+                                    enableRangeDelete,
+                                    blockCacheSize,
+                                    writeBufferSize,
+                                    maxWriteBufferNumber,
+                                    minWriteBufferNumberToMerge,
+                                    maxBackgroundJobs,
+                                    maxOpenFiles,
+                                    targetFileSizeBase,
+                                    level0FileNumCompactionTrigger,
+                                    level0SlowdownWritesTrigger,
+                                    level0StopWritesTrigger,
+                                    enableStatistics,
+                                    optimizeFiltersForHits,
+                                    compressionType,
+                                    walSyncMode,
+                                    walSyncIntervalMillis,
+                                    walSyncWriteThreshold,
+                                    walSyncOnShutdown,
+                                    walSyncWarnThresholdMillis,
+                                    walSyncCompareMode,
+                                    cleanup,
+                                    warmupRounds,
+                                    measureRounds,
+                                    batchSize,
+                                    lockIndexScanBatchSize,
+                                    queryIterationsPerRound,
+                                    queryLimit,
+                                    repeatRuns,
+                                    compareOrder,
+                                    runLabel,
+                                    sampleEvery,
+                                    seed,
+                                    dbPath,
+                                    benchmarks,
+                                    compare,
+                                    tuningProfile,
+                                    statusDistribution,
+                                    expiredRatio,
+                                    lockWorkload,
+                                    lockConflictRatio,
+                                    xidFanoutDistribution,
+                                    dbWriteBufferSize,
+                                    globalWriteBufferSize,
+                                    branchWriteBufferSize,
+                                    lockWriteBufferSize,
+                                    indexWriteBufferSize,
+                                    metadataWriteBufferSize,
+                                    maxTotalWalSize)
+                            .copyExecutionProfilesFrom(this);
                 case "enableRangeDelete":
                     return new BenchmarkOptions(
-                            globalCount,
-                            branchPerGlobal,
-                            lockPerBranch,
-                            writeWorkload,
-                            syncWrite,
-                            !enableRangeDelete,
-                            blockCacheSize,
-                            writeBufferSize,
-                            maxWriteBufferNumber,
-                            minWriteBufferNumberToMerge,
-                            maxBackgroundJobs,
-                            maxOpenFiles,
-                            targetFileSizeBase,
-                            level0FileNumCompactionTrigger,
-                            level0SlowdownWritesTrigger,
-                            level0StopWritesTrigger,
-                            enableStatistics,
-                            optimizeFiltersForHits,
-                            compressionType,
-                            walSyncMode,
-                            walSyncIntervalMillis,
-                            walSyncWriteThreshold,
-                            walSyncOnShutdown,
-                            walSyncWarnThresholdMillis,
-                            walSyncCompareMode,
-                            cleanup,
-                            warmupRounds,
-                            measureRounds,
-                            batchSize,
-                            lockIndexScanBatchSize,
-                            queryIterationsPerRound,
-                            queryLimit,
-                            repeatRuns,
-                            compareOrder,
-                            runLabel,
-                            sampleEvery,
-                            seed,
-                            dbPath,
-                            benchmarks,
-                            compare,
-                            tuningProfile,
-                            statusDistribution,
-                            expiredRatio,
-                            lockWorkload,
-                            lockConflictRatio,
-                            xidFanoutDistribution,
-                            dbWriteBufferSize,
-                            globalWriteBufferSize,
-                            branchWriteBufferSize,
-                            lockWriteBufferSize,
-                            indexWriteBufferSize,
-                            metadataWriteBufferSize,
-                            maxTotalWalSize);
+                                    globalCount,
+                                    branchPerGlobal,
+                                    lockPerBranch,
+                                    writeWorkload,
+                                    syncWrite,
+                                    !enableRangeDelete,
+                                    blockCacheSize,
+                                    writeBufferSize,
+                                    maxWriteBufferNumber,
+                                    minWriteBufferNumberToMerge,
+                                    maxBackgroundJobs,
+                                    maxOpenFiles,
+                                    targetFileSizeBase,
+                                    level0FileNumCompactionTrigger,
+                                    level0SlowdownWritesTrigger,
+                                    level0StopWritesTrigger,
+                                    enableStatistics,
+                                    optimizeFiltersForHits,
+                                    compressionType,
+                                    walSyncMode,
+                                    walSyncIntervalMillis,
+                                    walSyncWriteThreshold,
+                                    walSyncOnShutdown,
+                                    walSyncWarnThresholdMillis,
+                                    walSyncCompareMode,
+                                    cleanup,
+                                    warmupRounds,
+                                    measureRounds,
+                                    batchSize,
+                                    lockIndexScanBatchSize,
+                                    queryIterationsPerRound,
+                                    queryLimit,
+                                    repeatRuns,
+                                    compareOrder,
+                                    runLabel,
+                                    sampleEvery,
+                                    seed,
+                                    dbPath,
+                                    benchmarks,
+                                    compare,
+                                    tuningProfile,
+                                    statusDistribution,
+                                    expiredRatio,
+                                    lockWorkload,
+                                    lockConflictRatio,
+                                    xidFanoutDistribution,
+                                    dbWriteBufferSize,
+                                    globalWriteBufferSize,
+                                    branchWriteBufferSize,
+                                    lockWriteBufferSize,
+                                    indexWriteBufferSize,
+                                    metadataWriteBufferSize,
+                                    maxTotalWalSize)
+                            .copyExecutionProfilesFrom(this);
                 case "blockCacheSize":
                     long flipped = blockCacheSize > 0 ? 0L : 128L * 1024 * 1024;
                     return new BenchmarkOptions(
-                            globalCount,
-                            branchPerGlobal,
-                            lockPerBranch,
-                            writeWorkload,
-                            syncWrite,
-                            enableRangeDelete,
-                            flipped,
-                            writeBufferSize,
-                            maxWriteBufferNumber,
-                            minWriteBufferNumberToMerge,
-                            maxBackgroundJobs,
-                            maxOpenFiles,
-                            targetFileSizeBase,
-                            level0FileNumCompactionTrigger,
-                            level0SlowdownWritesTrigger,
-                            level0StopWritesTrigger,
-                            enableStatistics,
-                            optimizeFiltersForHits,
-                            compressionType,
-                            walSyncMode,
-                            walSyncIntervalMillis,
-                            walSyncWriteThreshold,
-                            walSyncOnShutdown,
-                            walSyncWarnThresholdMillis,
-                            walSyncCompareMode,
-                            cleanup,
-                            warmupRounds,
-                            measureRounds,
-                            batchSize,
-                            lockIndexScanBatchSize,
-                            queryIterationsPerRound,
-                            queryLimit,
-                            repeatRuns,
-                            compareOrder,
-                            runLabel,
-                            sampleEvery,
-                            seed,
-                            dbPath,
-                            benchmarks,
-                            compare,
-                            tuningProfile,
-                            statusDistribution,
-                            expiredRatio,
-                            lockWorkload,
-                            lockConflictRatio,
-                            xidFanoutDistribution,
-                            dbWriteBufferSize,
-                            globalWriteBufferSize,
-                            branchWriteBufferSize,
-                            lockWriteBufferSize,
-                            indexWriteBufferSize,
-                            metadataWriteBufferSize,
-                            maxTotalWalSize);
+                                    globalCount,
+                                    branchPerGlobal,
+                                    lockPerBranch,
+                                    writeWorkload,
+                                    syncWrite,
+                                    enableRangeDelete,
+                                    flipped,
+                                    writeBufferSize,
+                                    maxWriteBufferNumber,
+                                    minWriteBufferNumberToMerge,
+                                    maxBackgroundJobs,
+                                    maxOpenFiles,
+                                    targetFileSizeBase,
+                                    level0FileNumCompactionTrigger,
+                                    level0SlowdownWritesTrigger,
+                                    level0StopWritesTrigger,
+                                    enableStatistics,
+                                    optimizeFiltersForHits,
+                                    compressionType,
+                                    walSyncMode,
+                                    walSyncIntervalMillis,
+                                    walSyncWriteThreshold,
+                                    walSyncOnShutdown,
+                                    walSyncWarnThresholdMillis,
+                                    walSyncCompareMode,
+                                    cleanup,
+                                    warmupRounds,
+                                    measureRounds,
+                                    batchSize,
+                                    lockIndexScanBatchSize,
+                                    queryIterationsPerRound,
+                                    queryLimit,
+                                    repeatRuns,
+                                    compareOrder,
+                                    runLabel,
+                                    sampleEvery,
+                                    seed,
+                                    dbPath,
+                                    benchmarks,
+                                    compare,
+                                    tuningProfile,
+                                    statusDistribution,
+                                    expiredRatio,
+                                    lockWorkload,
+                                    lockConflictRatio,
+                                    xidFanoutDistribution,
+                                    dbWriteBufferSize,
+                                    globalWriteBufferSize,
+                                    branchWriteBufferSize,
+                                    lockWriteBufferSize,
+                                    indexWriteBufferSize,
+                                    metadataWriteBufferSize,
+                                    maxTotalWalSize)
+                            .copyExecutionProfilesFrom(this);
                 case "tuningProfile":
                     return withTuningProfile(tuningProfile);
                 case "walSyncMode":
@@ -3509,59 +3599,60 @@ public final class RocksDBFileModeBenchmark {
                 boolean newOptimizeFiltersForHits,
                 String newCompressionType) {
             return new BenchmarkOptions(
-                    globalCount,
-                    branchPerGlobal,
-                    lockPerBranch,
-                    writeWorkload,
-                    syncWrite,
-                    enableRangeDelete,
-                    blockCacheSize,
-                    newWriteBufferSize,
-                    newMaxWriteBufferNumber,
-                    newMinWriteBufferNumberToMerge,
-                    newMaxBackgroundJobs,
-                    newMaxOpenFiles,
-                    newTargetFileSizeBase,
-                    newLevel0FileNumCompactionTrigger,
-                    newLevel0SlowdownWritesTrigger,
-                    newLevel0StopWritesTrigger,
-                    newEnableStatistics,
-                    newOptimizeFiltersForHits,
-                    newCompressionType,
-                    walSyncMode,
-                    walSyncIntervalMillis,
-                    walSyncWriteThreshold,
-                    walSyncOnShutdown,
-                    walSyncWarnThresholdMillis,
-                    walSyncCompareMode,
-                    cleanup,
-                    warmupRounds,
-                    measureRounds,
-                    batchSize,
-                    lockIndexScanBatchSize,
-                    queryIterationsPerRound,
-                    queryLimit,
-                    repeatRuns,
-                    compareOrder,
-                    runLabel,
-                    sampleEvery,
-                    seed,
-                    dbPath,
-                    benchmarks,
-                    compare,
-                    profile,
-                    statusDistribution,
-                    expiredRatio,
-                    lockWorkload,
-                    lockConflictRatio,
-                    xidFanoutDistribution,
-                    dbWriteBufferSize,
-                    globalWriteBufferSize,
-                    branchWriteBufferSize,
-                    lockWriteBufferSize,
-                    indexWriteBufferSize,
-                    metadataWriteBufferSize,
-                    maxTotalWalSize);
+                            globalCount,
+                            branchPerGlobal,
+                            lockPerBranch,
+                            writeWorkload,
+                            syncWrite,
+                            enableRangeDelete,
+                            blockCacheSize,
+                            newWriteBufferSize,
+                            newMaxWriteBufferNumber,
+                            newMinWriteBufferNumberToMerge,
+                            newMaxBackgroundJobs,
+                            newMaxOpenFiles,
+                            newTargetFileSizeBase,
+                            newLevel0FileNumCompactionTrigger,
+                            newLevel0SlowdownWritesTrigger,
+                            newLevel0StopWritesTrigger,
+                            newEnableStatistics,
+                            newOptimizeFiltersForHits,
+                            newCompressionType,
+                            walSyncMode,
+                            walSyncIntervalMillis,
+                            walSyncWriteThreshold,
+                            walSyncOnShutdown,
+                            walSyncWarnThresholdMillis,
+                            walSyncCompareMode,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            lockIndexScanBatchSize,
+                            queryIterationsPerRound,
+                            queryLimit,
+                            repeatRuns,
+                            compareOrder,
+                            runLabel,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare,
+                            profile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution,
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize)
+                    .copyExecutionProfilesFrom(this);
         }
 
         private BenchmarkOptions withExplicitR4Overrides(Map<String, String> values) {
@@ -3598,173 +3689,176 @@ public final class RocksDBFileModeBenchmark {
                 long newMetadataWriteBufferSize,
                 long newMaxTotalWalSize) {
             return new BenchmarkOptions(
-                    globalCount,
-                    branchPerGlobal,
-                    lockPerBranch,
-                    writeWorkload,
-                    syncWrite,
-                    enableRangeDelete,
-                    blockCacheSize,
-                    writeBufferSize,
-                    maxWriteBufferNumber,
-                    minWriteBufferNumberToMerge,
-                    maxBackgroundJobs,
-                    maxOpenFiles,
-                    targetFileSizeBase,
-                    level0FileNumCompactionTrigger,
-                    level0SlowdownWritesTrigger,
-                    level0StopWritesTrigger,
-                    enableStatistics,
-                    optimizeFiltersForHits,
-                    compressionType,
-                    walSyncMode,
-                    walSyncIntervalMillis,
-                    walSyncWriteThreshold,
-                    walSyncOnShutdown,
-                    walSyncWarnThresholdMillis,
-                    walSyncCompareMode,
-                    cleanup,
-                    warmupRounds,
-                    measureRounds,
-                    batchSize,
-                    lockIndexScanBatchSize,
-                    queryIterationsPerRound,
-                    queryLimit,
-                    repeatRuns,
-                    compareOrder,
-                    runLabel,
-                    sampleEvery,
-                    seed,
-                    dbPath,
-                    benchmarks,
-                    compare,
-                    tuningProfile,
-                    statusDistribution,
-                    expiredRatio,
-                    lockWorkload,
-                    lockConflictRatio,
-                    xidFanoutDistribution,
-                    newDbWriteBufferSize,
-                    newGlobalWriteBufferSize,
-                    newBranchWriteBufferSize,
-                    newLockWriteBufferSize,
-                    newIndexWriteBufferSize,
-                    newMetadataWriteBufferSize,
-                    newMaxTotalWalSize);
+                            globalCount,
+                            branchPerGlobal,
+                            lockPerBranch,
+                            writeWorkload,
+                            syncWrite,
+                            enableRangeDelete,
+                            blockCacheSize,
+                            writeBufferSize,
+                            maxWriteBufferNumber,
+                            minWriteBufferNumberToMerge,
+                            maxBackgroundJobs,
+                            maxOpenFiles,
+                            targetFileSizeBase,
+                            level0FileNumCompactionTrigger,
+                            level0SlowdownWritesTrigger,
+                            level0StopWritesTrigger,
+                            enableStatistics,
+                            optimizeFiltersForHits,
+                            compressionType,
+                            walSyncMode,
+                            walSyncIntervalMillis,
+                            walSyncWriteThreshold,
+                            walSyncOnShutdown,
+                            walSyncWarnThresholdMillis,
+                            walSyncCompareMode,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            lockIndexScanBatchSize,
+                            queryIterationsPerRound,
+                            queryLimit,
+                            repeatRuns,
+                            compareOrder,
+                            runLabel,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare,
+                            tuningProfile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution,
+                            newDbWriteBufferSize,
+                            newGlobalWriteBufferSize,
+                            newBranchWriteBufferSize,
+                            newLockWriteBufferSize,
+                            newIndexWriteBufferSize,
+                            newMetadataWriteBufferSize,
+                            newMaxTotalWalSize)
+                    .copyExecutionProfilesFrom(this);
         }
 
         private BenchmarkOptions withWalSyncMode(RocksDBWalSyncMode newWalSyncMode) {
             return new BenchmarkOptions(
-                    globalCount,
-                    branchPerGlobal,
-                    lockPerBranch,
-                    writeWorkload,
-                    syncWrite,
-                    enableRangeDelete,
-                    blockCacheSize,
-                    writeBufferSize,
-                    maxWriteBufferNumber,
-                    minWriteBufferNumberToMerge,
-                    maxBackgroundJobs,
-                    maxOpenFiles,
-                    targetFileSizeBase,
-                    level0FileNumCompactionTrigger,
-                    level0SlowdownWritesTrigger,
-                    level0StopWritesTrigger,
-                    enableStatistics,
-                    optimizeFiltersForHits,
-                    compressionType,
-                    newWalSyncMode,
-                    walSyncIntervalMillis,
-                    walSyncWriteThreshold,
-                    walSyncOnShutdown,
-                    walSyncWarnThresholdMillis,
-                    newWalSyncMode,
-                    cleanup,
-                    warmupRounds,
-                    measureRounds,
-                    batchSize,
-                    lockIndexScanBatchSize,
-                    queryIterationsPerRound,
-                    queryLimit,
-                    repeatRuns,
-                    compareOrder,
-                    runLabel,
-                    sampleEvery,
-                    seed,
-                    dbPath,
-                    benchmarks,
-                    compare,
-                    tuningProfile,
-                    statusDistribution,
-                    expiredRatio,
-                    lockWorkload,
-                    lockConflictRatio,
-                    xidFanoutDistribution,
-                    dbWriteBufferSize,
-                    globalWriteBufferSize,
-                    branchWriteBufferSize,
-                    lockWriteBufferSize,
-                    indexWriteBufferSize,
-                    metadataWriteBufferSize,
-                    maxTotalWalSize);
+                            globalCount,
+                            branchPerGlobal,
+                            lockPerBranch,
+                            writeWorkload,
+                            syncWrite,
+                            enableRangeDelete,
+                            blockCacheSize,
+                            writeBufferSize,
+                            maxWriteBufferNumber,
+                            minWriteBufferNumberToMerge,
+                            maxBackgroundJobs,
+                            maxOpenFiles,
+                            targetFileSizeBase,
+                            level0FileNumCompactionTrigger,
+                            level0SlowdownWritesTrigger,
+                            level0StopWritesTrigger,
+                            enableStatistics,
+                            optimizeFiltersForHits,
+                            compressionType,
+                            newWalSyncMode,
+                            walSyncIntervalMillis,
+                            walSyncWriteThreshold,
+                            walSyncOnShutdown,
+                            walSyncWarnThresholdMillis,
+                            newWalSyncMode,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            lockIndexScanBatchSize,
+                            queryIterationsPerRound,
+                            queryLimit,
+                            repeatRuns,
+                            compareOrder,
+                            runLabel,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare,
+                            tuningProfile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution,
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize)
+                    .copyExecutionProfilesFrom(this);
         }
 
         private BenchmarkOptions withRunLabel(String newRunLabel) {
             return new BenchmarkOptions(
-                    globalCount,
-                    branchPerGlobal,
-                    lockPerBranch,
-                    writeWorkload,
-                    syncWrite,
-                    enableRangeDelete,
-                    blockCacheSize,
-                    writeBufferSize,
-                    maxWriteBufferNumber,
-                    minWriteBufferNumberToMerge,
-                    maxBackgroundJobs,
-                    maxOpenFiles,
-                    targetFileSizeBase,
-                    level0FileNumCompactionTrigger,
-                    level0SlowdownWritesTrigger,
-                    level0StopWritesTrigger,
-                    enableStatistics,
-                    optimizeFiltersForHits,
-                    compressionType,
-                    walSyncMode,
-                    walSyncIntervalMillis,
-                    walSyncWriteThreshold,
-                    walSyncOnShutdown,
-                    walSyncWarnThresholdMillis,
-                    walSyncCompareMode,
-                    cleanup,
-                    warmupRounds,
-                    measureRounds,
-                    batchSize,
-                    lockIndexScanBatchSize,
-                    queryIterationsPerRound,
-                    queryLimit,
-                    repeatRuns,
-                    compareOrder,
-                    newRunLabel,
-                    sampleEvery,
-                    seed,
-                    dbPath,
-                    benchmarks,
-                    compare,
-                    tuningProfile,
-                    statusDistribution,
-                    expiredRatio,
-                    lockWorkload,
-                    lockConflictRatio,
-                    xidFanoutDistribution,
-                    dbWriteBufferSize,
-                    globalWriteBufferSize,
-                    branchWriteBufferSize,
-                    lockWriteBufferSize,
-                    indexWriteBufferSize,
-                    metadataWriteBufferSize,
-                    maxTotalWalSize);
+                            globalCount,
+                            branchPerGlobal,
+                            lockPerBranch,
+                            writeWorkload,
+                            syncWrite,
+                            enableRangeDelete,
+                            blockCacheSize,
+                            writeBufferSize,
+                            maxWriteBufferNumber,
+                            minWriteBufferNumberToMerge,
+                            maxBackgroundJobs,
+                            maxOpenFiles,
+                            targetFileSizeBase,
+                            level0FileNumCompactionTrigger,
+                            level0SlowdownWritesTrigger,
+                            level0StopWritesTrigger,
+                            enableStatistics,
+                            optimizeFiltersForHits,
+                            compressionType,
+                            walSyncMode,
+                            walSyncIntervalMillis,
+                            walSyncWriteThreshold,
+                            walSyncOnShutdown,
+                            walSyncWarnThresholdMillis,
+                            walSyncCompareMode,
+                            cleanup,
+                            warmupRounds,
+                            measureRounds,
+                            batchSize,
+                            lockIndexScanBatchSize,
+                            queryIterationsPerRound,
+                            queryLimit,
+                            repeatRuns,
+                            compareOrder,
+                            newRunLabel,
+                            sampleEvery,
+                            seed,
+                            dbPath,
+                            benchmarks,
+                            compare,
+                            tuningProfile,
+                            statusDistribution,
+                            expiredRatio,
+                            lockWorkload,
+                            lockConflictRatio,
+                            xidFanoutDistribution,
+                            dbWriteBufferSize,
+                            globalWriteBufferSize,
+                            branchWriteBufferSize,
+                            lockWriteBufferSize,
+                            indexWriteBufferSize,
+                            metadataWriteBufferSize,
+                            maxTotalWalSize)
+                    .copyExecutionProfilesFrom(this);
         }
 
         private List<String> comparisonRunLabels() {
@@ -3950,6 +4044,32 @@ public final class RocksDBFileModeBenchmark {
                     : value.trim().toLowerCase(Locale.ROOT);
             if (!WRITE_WORKLOAD_FULL.equals(normalized) && !WRITE_WORKLOAD_APPEND.equals(normalized)) {
                 throw new IllegalArgumentException("Unsupported writeWorkload: " + value);
+            }
+            return normalized;
+        }
+
+        private static String normalizeDataPayloadProfile(String value) {
+            String normalized = StringUtils.isBlank(value)
+                    ? DATA_PAYLOAD_PROFILE_PRODUCTION
+                    : value.trim().toLowerCase(Locale.ROOT);
+            if (!DATA_PAYLOAD_PROFILE_PRODUCTION.equals(normalized)
+                    && !DATA_PAYLOAD_PROFILE_PHASE4.equals(normalized)) {
+                throw new IllegalArgumentException("Unsupported dataPayloadProfile: " + value);
+            }
+            return normalized;
+        }
+
+        private static String normalizeQueryWorkload(String value) {
+            String normalized = StringUtils.isBlank(value)
+                    ? QUERY_WORKLOAD_ALL
+                    : value.trim().toLowerCase(Locale.ROOT);
+            if (!QUERY_WORKLOAD_ALL.equals(normalized)
+                    && !"xid".equals(normalized)
+                    && !"transaction_id".equals(normalized)
+                    && !"status".equals(normalized)
+                    && !"begin_sorted".equals(normalized)
+                    && !"full_scan_filter".equals(normalized)) {
+                throw new IllegalArgumentException("Unsupported queryWorkload: " + value);
             }
             return normalized;
         }
