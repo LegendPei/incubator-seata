@@ -63,6 +63,56 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testParsePhase4ComparisonOptions() throws Exception {
+        Object options = parseOptions(
+                "--dataPayloadProfile=phase4",
+                "--queryWorkload=status",
+                "--orphanCleanBatchLimit=500",
+                "--orphanCleanMaxBatches=2",
+                "--orphanCleanRoundSleepMillis=75");
+
+        Assertions.assertEquals("phase4", stringField(options, "dataPayloadProfile"));
+        Assertions.assertEquals("status", stringField(options, "queryWorkload"));
+        Assertions.assertEquals(500, intField(options, "orphanCleanBatchLimit"));
+        Assertions.assertEquals(2, intField(options, "orphanCleanMaxBatches"));
+        Assertions.assertEquals(75L, longField(options, "orphanCleanRoundSleepMillis"));
+    }
+
+    @Test
+    void testDerivedOptionsPreserveExecutionProfiles() throws Exception {
+        Object options = parseOptions(
+                "--dataPayloadProfile=phase4",
+                "--queryWorkload=status",
+                "--orphanCleanBatchLimit=500",
+                "--orphanCleanMaxBatches=2",
+                "--orphanCleanRoundSleepMillis=75");
+
+        Method method = options.getClass().getDeclaredMethod("withRunLabel", String.class);
+        method.setAccessible(true);
+        Object derived = method.invoke(options, "R1");
+
+        Assertions.assertEquals("phase4", stringField(derived, "dataPayloadProfile"));
+        Assertions.assertEquals("status", stringField(derived, "queryWorkload"));
+        Assertions.assertEquals(500, intField(derived, "orphanCleanBatchLimit"));
+        Assertions.assertEquals(2, intField(derived, "orphanCleanMaxBatches"));
+        Assertions.assertEquals(75L, longField(derived, "orphanCleanRoundSleepMillis"));
+    }
+
+    @Test
+    void testPhase4PayloadProfileOmitsProductionApplicationData() throws Exception {
+        Object phase4Options = parseOptions("--globalCount=2", "--dataPayloadProfile=phase4");
+        Object productionOptions = parseOptions("--globalCount=2", "--dataPayloadProfile=production");
+
+        List<GlobalSession> phase4Sessions = globalSessions(createDataSet(phase4Options, 0));
+        List<GlobalSession> productionSessions = globalSessions(createDataSet(productionOptions, 0));
+
+        Assertions.assertTrue(phase4Sessions.stream().allMatch(session -> session.getApplicationData() == null));
+        Assertions.assertTrue(productionSessions.stream()
+                .allMatch(session -> session.getApplicationData() != null
+                        && !session.getApplicationData().isEmpty()));
+    }
+
+    @Test
     void testMemoryBalancedProfileAppliesWalAndWriteBufferBudgets() throws Exception {
         Object options = parseOptions("--tuningProfile=memory-balanced");
 
@@ -378,6 +428,7 @@ class RocksDBFileModeBenchmarkTest {
                     "--measureRounds=1",
                     "--queryIterationsPerRound=1",
                     "--queryLimit=2",
+                    "--queryWorkload=status",
                     "--cleanup=true",
                     "--dbPath=" + dbPath);
             Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
@@ -397,6 +448,8 @@ class RocksDBFileModeBenchmarkTest {
             Assertions.assertEquals("2", statusLine.get("rowsReturned"));
             Assertions.assertEquals("2", statusLine.get("pointReads"));
             Assertions.assertEquals("2", statusLine.get("iteratorNext"));
+            Assertions.assertEquals(1, lines.size());
+            Assertions.assertFalse(lines.stream().anyMatch(line -> line.startsWith("query.xid,")));
         } finally {
             ConfigurationCache.clear();
             restoreEnvironment(originalEnvironment);
@@ -421,6 +474,9 @@ class RocksDBFileModeBenchmarkTest {
                     "--warmupRounds=0",
                     "--measureRounds=1",
                     "--sampleEvery=1",
+                    "--orphanCleanBatchLimit=2",
+                    "--orphanCleanMaxBatches=1",
+                    "--orphanCleanRoundSleepMillis=7",
                     "--cleanup=true",
                     "--dbPath=" + dbPath);
             Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
@@ -437,7 +493,9 @@ class RocksDBFileModeBenchmarkTest {
                     .findFirst()
                     .orElseThrow(() -> new AssertionError("foreground probe row missing")));
             Assertions.assertTrue(Long.parseLong(probe.get("ops")) > 0L);
-            Assertions.assertEquals("100", probe.get("orphanCleanRoundSleepMillis"));
+            Assertions.assertEquals("2", probe.get("orphanCleanBatchLimit"));
+            Assertions.assertEquals("1", probe.get("orphanCleanMaxBatches"));
+            Assertions.assertEquals("7", probe.get("orphanCleanRoundSleepMillis"));
         } finally {
             ConfigurationCache.clear();
             restoreEnvironment(originalEnvironment);
@@ -481,6 +539,10 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertTrue(header.contains("queryIterationsPerRound"));
         Assertions.assertTrue(header.contains("queryLimit"));
         Assertions.assertTrue(header.contains("lockIndexScanBatchSize"));
+        Assertions.assertTrue(header.contains("dataPayloadProfile"));
+        Assertions.assertTrue(header.contains("queryWorkload"));
+        Assertions.assertTrue(header.contains("orphanCleanBatchLimit"));
+        Assertions.assertTrue(header.contains("orphanCleanMaxBatches"));
         Assertions.assertTrue(header.contains("repeatRun"));
         Assertions.assertTrue(header.contains("compareOrder"));
         Assertions.assertTrue(header.contains("rowsScanned"));
