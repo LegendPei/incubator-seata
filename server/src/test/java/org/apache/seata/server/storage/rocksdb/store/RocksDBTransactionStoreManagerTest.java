@@ -16,6 +16,7 @@
  */
 package org.apache.seata.server.storage.rocksdb.store;
 
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
@@ -57,11 +58,13 @@ class RocksDBTransactionStoreManagerTest {
     private Object originalEnvironment;
     private SessionManager originalRootSessionManager;
     private Map<String, SessionManager> originalSessionManagerMap;
+    private MockEnvironment environment;
 
     @BeforeEach
     void beforeEach() throws Exception {
         originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
-        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        environment = new MockEnvironment();
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, environment);
         ConfigurationCache.clear();
         originalRootSessionManager = getRootSessionManager();
         originalSessionManagerMap = getSessionManagerMap();
@@ -645,6 +648,31 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByMultipleStatusesWithoutLimitHonorsFullScanDeadline() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-multi-status-deadline")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            Assertions.assertEquals(1L, fullScanDeadlineMillis(storeManager));
+            int sessionCount = 4096;
+            for (int i = 0; i < sessionCount; i++) {
+                GlobalStatus status = i % 2 == 0 ? GlobalStatus.Committed : GlobalStatus.Rollbacked;
+                GlobalSession session = globalSession("tx-multi-deadline-" + i, status);
+                session.setBeginTime(i);
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, session);
+            }
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            condition.setLazyLoadBranch(true);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertTrue(
+                    actual.size() < sessionCount,
+                    "an unlimited multi-status scan must stop when fullScanDeadlineMillis is reached");
+        }
+    }
+
+    @Test
     void testReadByMultipleStatusesAndLimitUsesGlobalBeginTimeOrder() {
         try (RocksDBStoreEngine engine = open("condition-multi-status-limit-order")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -817,6 +845,12 @@ class RocksDBTransactionStoreManagerTest {
         Field field = RocksDBTransactionStoreManager.class.getDeclaredField("indexManager");
         field.setAccessible(true);
         field.set(storeManager, indexManager);
+    }
+
+    private long fullScanDeadlineMillis(RocksDBTransactionStoreManager storeManager) throws Exception {
+        Field field = RocksDBTransactionStoreManager.class.getDeclaredField("fullScanDeadlineMillis");
+        field.setAccessible(true);
+        return field.getLong(storeManager);
     }
 
     private static final class CountingIndexManager extends RocksDBIndexManager {

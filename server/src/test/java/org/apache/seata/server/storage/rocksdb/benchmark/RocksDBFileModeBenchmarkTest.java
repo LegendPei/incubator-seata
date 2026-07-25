@@ -405,6 +405,47 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testBatchedOrphanBenchmarkEmitsForegroundProbeMetrics() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-orphan-probe-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=lock",
+                    "--lockWorkload=clean_orphan_batched",
+                    "--globalCount=4",
+                    "--branchPerGlobal=1",
+                    "--lockPerBranch=1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--sampleEvery=1",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> probe = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("lock.clean_orphan_batched_foreground_probe,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("foreground probe row missing")));
+            Assertions.assertTrue(Long.parseLong(probe.get("ops")) > 0L);
+            Assertions.assertEquals("100", probe.get("orphanCleanRoundSleepMillis"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
     void testExpiredRatioActiveSamplesStayOutsideLongBenchmarkWindow() throws Exception {
         Object originalEnvironment =
                 ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
@@ -448,6 +489,7 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertTrue(header.contains("innerOperations"));
         Assertions.assertTrue(header.contains("pointReads"));
         Assertions.assertTrue(header.contains("iteratorNext"));
+        Assertions.assertTrue(header.contains("orphanCleanRoundSleepMillis"));
         Assertions.assertTrue(header.contains("writeBatchBytes"));
     }
 
