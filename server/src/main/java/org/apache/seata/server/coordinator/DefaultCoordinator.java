@@ -75,6 +75,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -644,6 +645,10 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         if (statuses.length == 1) {
             return findBackgroundSessionsBySingleStatus(statuses[0], lazyLoadBranch);
         }
+        SessionManager sessionManager = SessionHolder.getRootSessionManager();
+        if (sessionManager instanceof RocksDBSessionManager && backgroundSessionQueryLimit >= statuses.length) {
+            return findBackgroundSessionsByMultipleStatusesForRocksDB(statuses, lazyLoadBranch, sessionManager);
+        }
         List<GlobalSession> sessions = new ArrayList<>();
         if (backgroundSessionQueryLimit < statuses.length) {
             int startIndex = nextBackgroundSessionStatusStart(statuses, backgroundSessionQueryLimit);
@@ -675,6 +680,30 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         return nextStart.getAndUpdate(current -> (current + statusesPerRound) % statuses.length);
     }
 
+    private synchronized List<GlobalSession> findBackgroundSessionsByMultipleStatusesForRocksDB(
+            GlobalStatus[] statuses, boolean lazyLoadBranch, SessionManager sessionManager) {
+        SessionCondition sessionCondition = new SessionCondition(statuses);
+        sessionCondition.setLazyLoadBranch(lazyLoadBranch);
+        sessionCondition.setLimit(backgroundSessionQueryLimit);
+        sessionCondition.setScanLimit(backgroundSessionQueryLimit);
+        Map<GlobalStatus, byte[]> statusScanCursors = new EnumMap<>(GlobalStatus.class);
+        for (GlobalStatus status : statuses) {
+            byte[] cursor = backgroundSessionStatusCursors.get(status);
+            if (cursor != null) {
+                statusScanCursors.put(status, cursor);
+            }
+        }
+        sessionCondition.setStatusScanCursors(statusScanCursors);
+        long startedAt = System.nanoTime();
+        List<GlobalSession> sessions = sessionManager.findGlobalSessions(sessionCondition);
+        updateBackgroundSessionCursors(statuses, sessionCondition);
+        logBackgroundSessionScan(Arrays.toString(statuses), sessions, sessionCondition.getScanStats(), startedAt);
+        if (CollectionUtils.isEmpty(sessions)) {
+            return Collections.emptyList();
+        }
+        return limitBackgroundSessions(sessions);
+    }
+
     private List<GlobalSession> findBackgroundSessionsBySingleStatus(GlobalStatus status, boolean lazyLoadBranch) {
         return limitBackgroundSessions(findBackgroundSessionsBySingleStatus(
                 status, lazyLoadBranch, backgroundSessionQueryLimit));
@@ -700,8 +729,20 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         return sessions;
     }
 
+    private void updateBackgroundSessionCursors(GlobalStatus[] statuses, SessionCondition sessionCondition) {
+        Map<GlobalStatus, byte[]> nextCursors = sessionCondition.getNextStatusScanCursors();
+        for (GlobalStatus status : statuses) {
+            byte[] nextCursor = nextCursors.get(status);
+            if (nextCursor == null) {
+                backgroundSessionStatusCursors.remove(status);
+            } else {
+                backgroundSessionStatusCursors.put(status, Arrays.copyOf(nextCursor, nextCursor.length));
+            }
+        }
+    }
+
     private void logBackgroundSessionScan(
-            GlobalStatus status, List<GlobalSession> sessions, SessionScanStats scanStats, long startedAtNanos) {
+            Object status, List<GlobalSession> sessions, SessionScanStats scanStats, long startedAtNanos) {
         if (!LOGGER.isDebugEnabled()) {
             return;
         }

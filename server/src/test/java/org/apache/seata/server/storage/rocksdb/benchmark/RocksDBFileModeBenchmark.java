@@ -62,6 +62,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -107,6 +108,7 @@ public final class RocksDBFileModeBenchmark {
         GlobalStatus.Committed
     };
     private static final GlobalStatus TARGET_STATUS = GlobalStatus.RollbackRetrying;
+    private static final GlobalStatus SECONDARY_STATUS = GlobalStatus.TimeoutRollbacking;
     private static final int SESSION_TIMEOUT_MILLIS = 60000;
     private static final long ACTIVE_BENCHMARK_WINDOW_MULTIPLIER = 10L;
     private static final String LOCK_OP_ACQUIRE = "acquire";
@@ -695,6 +697,7 @@ public final class RocksDBFileModeBenchmark {
         OperationStats xidStats = new OperationStats(options.sampleEvery);
         OperationStats transactionIdStats = new OperationStats(options.sampleEvery);
         OperationStats statusStats = new OperationStats(options.sampleEvery);
+        OperationStats multiStatusStats = new OperationStats(options.sampleEvery);
         OperationStats beginSortedStats = new OperationStats(options.sampleEvery);
         OperationStats fullScanStats = new OperationStats(options.sampleEvery);
         RocksDBWalSyncStats walSyncStats = RocksDBWalSyncStats.NONE;
@@ -707,6 +710,7 @@ public final class RocksDBFileModeBenchmark {
 
             int iterations = options.totalRounds() * options.queryIterationsPerRound;
             int expectedStatusCount = dataSet.countByStatus(TARGET_STATUS);
+            int expectedMultiStatusCount = expectedStatusCount + dataSet.countByStatus(SECONDARY_STATUS);
             boolean useOvertimeStatusQuery = options.expiredRatio > 0D;
             int expectedStatusQueryCount = useOvertimeStatusQuery
                     ? dataSet.countByStatusAndOverTime(TARGET_STATUS, SESSION_TIMEOUT_MILLIS)
@@ -719,7 +723,11 @@ public final class RocksDBFileModeBenchmark {
             // the query loop, so every session (not just the back-dated ones) can become eligible.
             int statusQueryMaxCount =
                     options.queryLimit > 0 ? Math.min(expectedStatusCount, options.queryLimit) : expectedStatusCount;
+            int multiStatusQueryMaxCount = options.queryLimit > 0
+                    ? Math.min(expectedMultiStatusCount, options.queryLimit)
+                    : expectedMultiStatusCount;
             int expectedBeginCount = dataSet.countByStatus(GlobalStatus.Begin);
+            Map<GlobalStatus, byte[]> multiStatusCursors = new EnumMap<>(GlobalStatus.class);
             for (int i = 0; i < iterations; i++) {
                 final int iteration = i;
                 int round = i / options.queryIterationsPerRound;
@@ -769,6 +777,24 @@ public final class RocksDBFileModeBenchmark {
                         }
                         sinkCount = actual.size();
                         return statusQueryMetrics(condition, actual.size());
+                    });
+                }
+                if (options.queryWorkloadIncludes("status_multi")) {
+                    measure(multiStatusStats, round, options, () -> {
+                        SessionCondition condition = new SessionCondition(TARGET_STATUS, SECONDARY_STATUS);
+                        condition.setLazyLoadBranch(true);
+                        condition.setStatusScanCursors(multiStatusCursors);
+                        if (options.queryLimit > 0) {
+                            condition.setLimit(options.queryLimit);
+                        }
+                        List<GlobalSession> actual = storeManager.readSession(condition);
+                        assertTrue(
+                                actual.size() <= multiStatusQueryMaxCount,
+                                "multi-status query size must not exceed expected");
+                        multiStatusCursors.clear();
+                        multiStatusCursors.putAll(condition.getNextStatusScanCursors());
+                        sinkCount = actual.size();
+                        return RowMetrics.fromScanStats(condition.getScanStats(), actual.size());
                     });
                 }
                 if (options.queryWorkloadIncludes("begin_sorted")) {
@@ -827,6 +853,9 @@ public final class RocksDBFileModeBenchmark {
         }
         if (options.queryWorkloadIncludes("status")) {
             emit("query.status", options, statusStats, footprint, csvLines);
+        }
+        if (options.queryWorkloadIncludes("status_multi")) {
+            emit("query.status_multi", options, multiStatusStats, footprint, csvLines);
         }
         if (options.queryWorkloadIncludes("begin_sorted")) {
             emit("query.begin_sorted", options, beginSortedStats, footprint, csvLines);
@@ -4069,6 +4098,7 @@ public final class RocksDBFileModeBenchmark {
                     && !"xid".equals(normalized)
                     && !"transaction_id".equals(normalized)
                     && !"status".equals(normalized)
+                    && !"status_multi".equals(normalized)
                     && !"begin_sorted".equals(normalized)
                     && !"full_scan_filter".equals(normalized)) {
                 throw new IllegalArgumentException("Unsupported queryWorkload: " + value);

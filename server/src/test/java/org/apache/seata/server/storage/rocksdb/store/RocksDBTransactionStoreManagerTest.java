@@ -825,6 +825,84 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByMultipleStatusesAndLimitResumesWithPerStatusCursors() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-limit-cursor")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committedEarly = globalSession("tx-committed-early", GlobalStatus.Committed);
+            committedEarly.setBeginTime(100L);
+            GlobalSession rollbackedMiddle = globalSession("tx-rollbacked-middle", GlobalStatus.Rollbacked);
+            rollbackedMiddle.setBeginTime(200L);
+            GlobalSession committedLate = globalSession("tx-committed-late", GlobalStatus.Committed);
+            committedLate.setBeginTime(300L);
+            GlobalSession rollbackedLate = globalSession("tx-rollbacked-late", GlobalStatus.Rollbacked);
+            rollbackedLate.setBeginTime(400L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committedLate);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedLate);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committedEarly);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedMiddle);
+
+            SessionCondition firstPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            firstPage.setLazyLoadBranch(true);
+            firstPage.setLimit(2);
+            List<GlobalSession> firstActual = storeManager.readSession(firstPage);
+
+            Assertions.assertEquals(
+                    List.of(committedEarly.getXid(), rollbackedMiddle.getXid()),
+                    firstActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+            Map<GlobalStatus, byte[]> nextCursors = firstPage.getNextStatusScanCursors();
+            Assertions.assertNotNull(nextCursors.get(GlobalStatus.Committed));
+            Assertions.assertNotNull(nextCursors.get(GlobalStatus.Rollbacked));
+
+            SessionCondition secondPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            secondPage.setLazyLoadBranch(true);
+            secondPage.setLimit(2);
+            secondPage.setStatusScanCursors(nextCursors);
+            List<GlobalSession> secondActual = storeManager.readSession(secondPage);
+
+            Assertions.assertEquals(
+                    List.of(committedLate.getXid(), rollbackedLate.getXid()),
+                    secondActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesKeepsExhaustedStatusCursorUntilOtherStatusesFinish() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-exhausted-cursor")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committed = globalSession("tx-committed-only", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            GlobalSession rollbackedFirst = globalSession("tx-rollbacked-first", GlobalStatus.Rollbacked);
+            rollbackedFirst.setBeginTime(200L);
+            GlobalSession rollbackedSecond = globalSession("tx-rollbacked-second", GlobalStatus.Rollbacked);
+            rollbackedSecond.setBeginTime(300L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedFirst);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedSecond);
+
+            SessionCondition firstPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            firstPage.setLazyLoadBranch(true);
+            firstPage.setLimit(2);
+            List<GlobalSession> firstActual = storeManager.readSession(firstPage);
+
+            Assertions.assertEquals(
+                    List.of(committed.getXid(), rollbackedFirst.getXid()),
+                    firstActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+            Assertions.assertNotNull(firstPage.getNextStatusScanCursors().get(GlobalStatus.Committed));
+
+            SessionCondition secondPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            secondPage.setLazyLoadBranch(true);
+            secondPage.setLimit(2);
+            secondPage.setStatusScanCursors(firstPage.getNextStatusScanCursors());
+            List<GlobalSession> secondActual = storeManager.readSession(secondPage);
+
+            Assertions.assertEquals(
+                    List.of(rollbackedSecond.getXid()),
+                    secondActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
     void testReadByMultipleStatusesIgnoresStaleStatusIndexForOrdering() {
         try (RocksDBStoreEngine engine = open("condition-multi-status-stale-index-order")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);

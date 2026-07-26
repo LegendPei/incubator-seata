@@ -19,6 +19,9 @@ package org.apache.seata.server.session;
 import org.apache.seata.core.model.GlobalStatus;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.Map;
 
 /**
  * The type Session condition.
@@ -42,6 +45,8 @@ public class SessionCondition {
     private byte[] statusScanCursor;
     private byte[] nextStatusScanCursor;
     private ScanContinuation statusScanContinuation = ScanContinuation.UNSET;
+    private Map<GlobalStatus, byte[]> statusScanCursors = Collections.emptyMap();
+    private Map<GlobalStatus, byte[]> nextStatusScanCursors = Collections.emptyMap();
     private Long maxTimeoutDeadlineMillis;
     private byte[] timeoutScanCursor;
     private byte[] nextTimeoutScanCursor;
@@ -205,6 +210,26 @@ public class SessionCondition {
         statusScanContinuation = ScanContinuation.UNSET;
     }
 
+    public Map<GlobalStatus, byte[]> getStatusScanCursors() {
+        return copyStatusScanCursors(statusScanCursors);
+    }
+
+    public void setStatusScanCursors(Map<GlobalStatus, byte[]> statusScanCursors) {
+        this.statusScanCursors = copyStatusScanCursors(statusScanCursors);
+    }
+
+    public Map<GlobalStatus, byte[]> getNextStatusScanCursors() {
+        return copyStatusScanCursors(nextStatusScanCursors);
+    }
+
+    public void setNextStatusScanCursors(Map<GlobalStatus, byte[]> nextStatusScanCursors) {
+        this.nextStatusScanCursors = copyStatusScanCursors(nextStatusScanCursors);
+    }
+
+    public void clearNextStatusScanCursors() {
+        nextStatusScanCursors = Collections.emptyMap();
+    }
+
     public Long getMaxTimeoutDeadlineMillis() {
         return maxTimeoutDeadlineMillis;
     }
@@ -256,5 +281,19 @@ public class SessionCondition {
 
     public void clearScanStats() {
         this.scanStats = SessionScanStats.empty();
+    }
+
+    private static Map<GlobalStatus, byte[]> copyStatusScanCursors(Map<GlobalStatus, byte[]> cursors) {
+        if (cursors == null || cursors.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<GlobalStatus, byte[]> copies = new EnumMap<>(GlobalStatus.class);
+        for (Map.Entry<GlobalStatus, byte[]> entry : cursors.entrySet()) {
+            if (entry.getKey() != null && entry.getValue() != null) {
+                byte[] cursor = entry.getValue();
+                copies.put(entry.getKey(), Arrays.copyOf(cursor, cursor.length));
+            }
+        }
+        return copies.isEmpty() ? Collections.emptyMap() : Collections.unmodifiableMap(copies);
     }
 }
