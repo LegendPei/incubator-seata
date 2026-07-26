@@ -44,10 +44,13 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -354,6 +357,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
         sessionCondition.setNextStatusScanCursor(null);
+        sessionCondition.setNextStatusScanCursors(Collections.emptyMap());
         Long overTimeAliveMills = sessionCondition.getOverTimeAliveMills();
         Integer limit = sessionCondition.getLimit();
         Long maxBeginTime = overTimeAliveMills != null && overTimeAliveMills > 0
@@ -371,6 +375,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (merged.isDeadlineReached()) {
                 logStatusScanDeadline(sessionCondition, merged.getSessions().size());
             }
+            sessionCondition.setNextStatusScanCursors(merged.getNextStatusScanCursors());
             sessionCondition.setScanStats(scanStats.toStats(merged.getSessions().size()));
             return merged.getSessions();
         }
@@ -412,18 +417,22 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 new PriorityQueue<>(Comparator.comparingLong(StatusScanCursor::beginTime)
                         .thenComparingInt(StatusScanCursor::statusCode)
                         .thenComparing(StatusScanCursor::xid));
+        List<StatusScanCursor> cursors = new ArrayList<>();
+        Map<GlobalStatus, byte[]> initialCursors = sessionCondition.getStatusScanCursors();
         for (GlobalStatus status : sessionCondition.getStatuses()) {
             if (isDeadlineReached(deadlineNanos)) {
-                return new MultiStatusScanResult(result, true);
+                return multiStatusScanResult(result, cursors, initialCursors, true);
             }
-            StatusScanCursor cursor = new StatusScanCursor(status, maxBeginTime, limit, scanStats);
+            StatusScanCursor cursor =
+                    new StatusScanCursor(status, maxBeginTime, initialCursors.get(status), limit, scanStats);
+            cursors.add(cursor);
             if (cursor.hasCurrent()) {
                 queue.offer(cursor);
             }
         }
         while (!queue.isEmpty() && !isLimitReached(limit, result)) {
             if (isDeadlineReached(deadlineNanos)) {
-                return new MultiStatusScanResult(result, true);
+                return multiStatusScanResult(result, cursors, initialCursors, true);
             }
             StatusScanCursor cursor = queue.poll();
             RocksDBIndexManager.StatusIndexEntry entry = cursor.current();
@@ -435,15 +444,32 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                     entry.getStatus(),
                     entry.getBeginTime(),
                     scanStats);
-            if (isLimitReached(limit, result)) {
+            boolean limitReached = isLimitReached(limit, result);
+            cursor.advance(limit, result, scanStats, !limitReached);
+            if (limitReached) {
                 break;
             }
-            cursor.advance(limit, result, scanStats);
             if (cursor.hasCurrent()) {
                 queue.offer(cursor);
             }
         }
-        return new MultiStatusScanResult(result, false);
+        return multiStatusScanResult(result, cursors, initialCursors, false);
+    }
+
+    private MultiStatusScanResult multiStatusScanResult(
+            List<GlobalSession> sessions,
+            List<StatusScanCursor> cursors,
+            Map<GlobalStatus, byte[]> initialCursors,
+            boolean deadlineReached) {
+        Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
+        nextCursors.putAll(initialCursors);
+        for (StatusScanCursor cursor : cursors) {
+            byte[] resumeCursor = cursor.resumeCursor();
+            if (resumeCursor != null) {
+                nextCursors.put(cursor.status(), resumeCursor);
+            }
+        }
+        return new MultiStatusScanResult(sessions, nextCursors, deadlineReached);
     }
 
     private boolean isDeadlineReached(long deadlineNanos) {
@@ -587,12 +613,20 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         private final Long maxBeginTime;
         private List<RocksDBIndexManager.StatusIndexEntry> entries = Collections.emptyList();
         private byte[] nextCursor;
+        private byte[] resumeCursor;
         private int index;
         private boolean exhausted;
 
-        StatusScanCursor(GlobalStatus status, Long maxBeginTime, Integer limit, SessionScanStatsAccumulator scanStats) {
+        StatusScanCursor(
+                GlobalStatus status,
+                Long maxBeginTime,
+                byte[] initialCursor,
+                Integer limit,
+                SessionScanStatsAccumulator scanStats) {
             this.status = status;
             this.maxBeginTime = maxBeginTime;
+            this.nextCursor = initialCursor;
+            this.resumeCursor = initialCursor;
             loadNextPage(limit, Collections.emptyList(), scanStats);
         }
 
@@ -616,11 +650,37 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return current().getXid();
         }
 
-        void advance(Integer limit, List<GlobalSession> result, SessionScanStatsAccumulator scanStats) {
+        GlobalStatus status() {
+            return status;
+        }
+
+        byte[] resumeCursor() {
+            RocksDBIndexManager.StatusIndexEntry current = current();
+            return current == null
+                    ? (nextCursor == null ? resumeCursor : nextCursor)
+                    : RocksDBKeyCodec.encodeGlobalStatusIndex(status, current.getBeginTime(), current.getXid());
+        }
+
+        void advance(
+                Integer limit,
+                List<GlobalSession> result,
+                SessionScanStatsAccumulator scanStats,
+                boolean loadNextPage) {
+            RocksDBIndexManager.StatusIndexEntry current = current();
+            if (current != null) {
+                resumeCursor = nextSeekKey(
+                        RocksDBKeyCodec.encodeGlobalStatusIndex(status, current.getBeginTime(), current.getXid()));
+            }
             index++;
-            if (index >= entries.size()) {
+            if (loadNextPage && index >= entries.size()) {
                 loadNextPage(limit, result, scanStats);
             }
+        }
+
+        private byte[] nextSeekKey(byte[] key) {
+            byte[] next = Arrays.copyOf(key, key.length + 1);
+            next[key.length] = 0;
+            return next;
         }
 
         private void loadNextPage(Integer limit, List<GlobalSession> result, SessionScanStatsAccumulator scanStats) {
@@ -645,15 +705,24 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     private static class MultiStatusScanResult {
         private final List<GlobalSession> sessions;
+        private final Map<GlobalStatus, byte[]> nextStatusScanCursors;
         private final boolean deadlineReached;
 
-        private MultiStatusScanResult(List<GlobalSession> sessions, boolean deadlineReached) {
+        private MultiStatusScanResult(
+                List<GlobalSession> sessions,
+                Map<GlobalStatus, byte[]> nextStatusScanCursors,
+                boolean deadlineReached) {
             this.sessions = sessions;
+            this.nextStatusScanCursors = nextStatusScanCursors;
             this.deadlineReached = deadlineReached;
         }
 
         private List<GlobalSession> getSessions() {
             return sessions;
+        }
+
+        private Map<GlobalStatus, byte[]> getNextStatusScanCursors() {
+            return nextStatusScanCursors;
         }
 
         private boolean isDeadlineReached() {

@@ -459,6 +459,51 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testQueryMultiStatusBenchmarkCarriesCursorAndUsesBoundedScanStats() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-query-multi-status-stats-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=query",
+                    "--globalCount=6",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=RollbackRetrying:1,TimeoutRollbacking:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--queryIterationsPerRound=2",
+                    "--queryLimit=2",
+                    "--queryWorkload=status_multi",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> statusLine = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("query.status_multi,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("query.status_multi row missing")));
+            Assertions.assertEquals("8", statusLine.get("rowsScanned"));
+            Assertions.assertEquals("8", statusLine.get("rowsReturned"));
+            Assertions.assertEquals("4", statusLine.get("pointReads"));
+            Assertions.assertEquals("8", statusLine.get("iteratorNext"));
+            Assertions.assertEquals(1, lines.size());
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
     void testFullScanFilterBenchmarkUsesActualScanStats() throws Exception {
         Path dbPath = Files.createTempDirectory("rocksdb-benchmark-full-scan-stats-");
         Object originalEnvironment =

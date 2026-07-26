@@ -81,7 +81,9 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -485,6 +487,43 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
 
             Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT + 2, sessions.size());
         }
+    }
+
+    @Test
+    public void multiStatusRocksDBBackgroundScanCarriesCompositeCursorAcrossRounds() throws Exception {
+        clearBackgroundSessionStatusCursors();
+        RocksDBSessionManager sessionManager = mock(RocksDBSessionManager.class);
+        byte[] timeoutRollbackingCursor = new byte[] {1, 2, 3};
+        byte[] timeoutRollbackRetryingCursor = new byte[] {4, 5, 6};
+        List<SessionCondition> conditions = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            conditions.add(condition);
+            if (conditions.size() == 1) {
+                Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
+                nextCursors.put(GlobalStatus.TimeoutRollbacking, timeoutRollbackingCursor);
+                nextCursors.put(GlobalStatus.TimeoutRollbackRetrying, timeoutRollbackRetryingCursor);
+                condition.setNextStatusScanCursors(nextCursors);
+            }
+            return Collections.emptyList();
+        });
+
+        GlobalStatus[] statuses = {GlobalStatus.TimeoutRollbacking, GlobalStatus.TimeoutRollbackRetrying};
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            invokeFindBackgroundSessions(statuses, true);
+            invokeFindBackgroundSessions(statuses, true);
+        }
+
+        Assertions.assertEquals(2, conditions.size());
+        Assertions.assertArrayEquals(statuses, conditions.get(0).getStatuses());
+        Assertions.assertEquals(
+                DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT,
+                conditions.get(0).getLimit());
+        Map<GlobalStatus, byte[]> secondRoundCursors = conditions.get(1).getStatusScanCursors();
+        Assertions.assertArrayEquals(timeoutRollbackingCursor, secondRoundCursors.get(GlobalStatus.TimeoutRollbacking));
+        Assertions.assertArrayEquals(
+                timeoutRollbackRetryingCursor, secondRoundCursors.get(GlobalStatus.TimeoutRollbackRetrying));
     }
 
     @Test
@@ -1461,6 +1500,13 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
                 "findBackgroundSessions", GlobalStatus[].class, boolean.class);
         method.setAccessible(true);
         return (List<GlobalSession>) method.invoke(defaultCoordinator, statuses, lazyLoadBranch);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void clearBackgroundSessionStatusCursors() throws Exception {
+        Field cursorsField = DefaultCoordinator.class.getDeclaredField("backgroundSessionStatusCursors");
+        cursorsField.setAccessible(true);
+        ((Map<GlobalStatus, byte[]>) cursorsField.get(defaultCoordinator)).clear();
     }
 
     private GlobalSession backgroundSession(String xid, GlobalStatus status, long beginTime) {
