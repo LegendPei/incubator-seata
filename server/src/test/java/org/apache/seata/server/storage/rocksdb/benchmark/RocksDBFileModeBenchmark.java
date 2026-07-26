@@ -18,6 +18,7 @@ package org.apache.seata.server.storage.rocksdb.benchmark;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.common.util.StringUtils;
@@ -478,7 +479,12 @@ public final class RocksDBFileModeBenchmark {
     public static void main(String[] args) throws Exception {
         Object originalEnvironment =
                 ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
-        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        Map<String, String> arguments = BenchmarkOptions.parseArgs(args);
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty(
+                        "seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE,
+                        arguments.getOrDefault("multiStatusScanPageSize", "256"));
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, environment);
         ConfigurationCache.clear();
         try {
             new RocksDBFileModeBenchmark().run(BenchmarkOptions.parse(args));

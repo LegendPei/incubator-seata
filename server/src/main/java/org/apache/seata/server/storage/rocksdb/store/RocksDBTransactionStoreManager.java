@@ -63,6 +63,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBTransactionStoreManager.class);
     private static final String MIGRATION_STATUS_KEY = "migration_status";
     private static final int STATUS_SCAN_PAGE_SIZE = 1024;
+    private static final int DEFAULT_MULTI_STATUS_SCAN_PAGE_SIZE = 256;
     private static final int DEFAULT_FULL_SCAN_MAX_LIMIT = 10000;
     private static final long DEFAULT_FULL_SCAN_DEADLINE_MILLIS = 5000L;
 
@@ -72,6 +73,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     private final boolean factoryManaged;
     private final int fullScanMaxLimit;
     private final long fullScanDeadlineMillis;
+    private final int multiStatusScanPageSize;
 
     public RocksDBTransactionStoreManager() {
         this(RocksDBStoreEngineFactory.getInstance(), new RocksDBLocalLocks(), true);
@@ -101,6 +103,11 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 config.getInt(ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_MAX_LIMIT, DEFAULT_FULL_SCAN_MAX_LIMIT);
         this.fullScanDeadlineMillis = config.getLong(
                 ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, DEFAULT_FULL_SCAN_DEADLINE_MILLIS);
+        this.multiStatusScanPageSize = Math.max(
+                1,
+                config.getInt(
+                        ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE,
+                        DEFAULT_MULTI_STATUS_SCAN_PAGE_SIZE));
         logStartupState();
     }
 
@@ -444,8 +451,14 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (isDeadlineReached(deadlineNanos)) {
                 return multiStatusScanResult(result, cursors, initialCursors, true);
             }
-            StatusScanCursor cursor =
-                    new StatusScanCursor(status, maxBeginTime, initialCursors.get(status), limit, scanBudget, scanStats);
+            StatusScanCursor cursor = new StatusScanCursor(
+                    status,
+                    maxBeginTime,
+                    initialCursors.get(status),
+                    limit,
+                    multiStatusScanPageSize,
+                    scanBudget,
+                    scanStats);
             cursors.add(cursor);
             if (cursor.hasCurrent()) {
                 queue.offer(cursor);
@@ -667,6 +680,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         private final GlobalStatus status;
         private final Long maxBeginTime;
         private final ScanBudget scanBudget;
+        private final int pageSize;
         private List<RocksDBIndexManager.StatusIndexEntry> entries = Collections.emptyList();
         private byte[] nextCursor;
         private byte[] resumeCursor;
@@ -678,10 +692,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 Long maxBeginTime,
                 byte[] initialCursor,
                 Integer limit,
+                int pageSize,
                 ScanBudget scanBudget,
                 SessionScanStatsAccumulator scanStats) {
             this.status = status;
             this.maxBeginTime = maxBeginTime;
+            this.pageSize = pageSize;
             this.scanBudget = scanBudget;
             this.nextCursor = initialCursor;
             this.resumeCursor = initialCursor;
@@ -747,7 +763,9 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 index = 0;
                 return;
             }
-            int requested = scanBudget.isBounded() ? 1 : nextPageLimit(limit, result);
+            int requested = scanBudget.isBounded()
+                    ? 1
+                    : Math.min(pageSize, nextPageLimit(limit, result));
             RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
                     status,
                     0L,

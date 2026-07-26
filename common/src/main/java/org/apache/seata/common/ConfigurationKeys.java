@@ -305,6 +305,11 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS = STORE_FILE_ROCKSDB_PREFIX + "fullScanDeadlineMillis";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE = STORE_FILE_ROCKSDB_PREFIX + "multiStatusScanPageSize";
+
+    /**
      * The constant STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_ENABLED.
      * Whether the background orphan lock cleanup controller is enabled.
      */

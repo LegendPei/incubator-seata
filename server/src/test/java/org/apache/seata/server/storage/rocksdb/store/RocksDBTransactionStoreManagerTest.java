@@ -799,6 +799,16 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testMultiStatusScanPageSizeUsesConfiguredValue() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "64");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-multi-status-page-size")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            Assertions.assertEquals(64, multiStatusScanPageSize(storeManager));
+        }
+    }
+
+    @Test
     void testReadByMultipleStatusesAndLimitUsesGlobalBeginTimeOrder() {
         try (RocksDBStoreEngine engine = open("condition-multi-status-limit-order")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -1111,6 +1121,12 @@ class RocksDBTransactionStoreManagerTest {
         Field field = RocksDBTransactionStoreManager.class.getDeclaredField("fullScanDeadlineMillis");
         field.setAccessible(true);
         return field.getLong(storeManager);
+    }
+
+    private int multiStatusScanPageSize(RocksDBTransactionStoreManager storeManager) throws Exception {
+        Field field = RocksDBTransactionStoreManager.class.getDeclaredField("multiStatusScanPageSize");
+        field.setAccessible(true);
+        return field.getInt(storeManager);
     }
 
     private static final class CountingIndexManager extends RocksDBIndexManager {
