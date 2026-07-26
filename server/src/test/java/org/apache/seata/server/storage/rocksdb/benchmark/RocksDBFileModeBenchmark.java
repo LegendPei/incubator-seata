@@ -71,6 +71,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 /**
@@ -101,7 +102,7 @@ public final class RocksDBFileModeBenchmark {
                     + "writeBatchBytesMean,innerOperationsMean,rangeDeleteCountMean,pointDeleteCountMean,"
                     + "deleteBatchCountMean,branchFanoutMean,lockFanoutMean";
     private static final List<String> ALL_BENCHMARKS =
-            Arrays.asList("write", "query", "lock", "cleanup", "lifecycle", "restart");
+            Arrays.asList("write", "query", "lock", "cleanup", "lifecycle", "background", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
         GlobalStatus.Committing,
@@ -125,6 +126,7 @@ public final class RocksDBFileModeBenchmark {
     private static final long CLEAN_ORPHAN_BATCHED_ROUND_SLEEP_MILLIS =
             RocksDBOrphanLockCleanupController.DEFAULT_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS;
     private static final int CLEAN_ORPHAN_FOREGROUND_PROBE_BRANCHES = 100;
+    private static final int BACKGROUND_QUERY_DEFAULT_LIMIT = 1024;
     private static final String WRITE_WORKLOAD_FULL = "full";
     private static final String WRITE_WORKLOAD_APPEND = "append";
     private static final String DATA_PAYLOAD_PROFILE_PRODUCTION = "production";
@@ -568,6 +570,9 @@ public final class RocksDBFileModeBenchmark {
             }
             if (options.isEnabled("lifecycle")) {
                 runLifecycleBenchmark(runPath, options, csvLines);
+            }
+            if (options.isEnabled("background")) {
+                runBackgroundInterferenceBenchmark(runPath, options, csvLines);
             }
             if (options.isEnabled("restart")) {
                 runRestartBenchmark(runPath, options, csvLines);
@@ -1318,6 +1323,103 @@ public final class RocksDBFileModeBenchmark {
                 DbFootprint.from(lastDbPath, lastWalSyncStats),
                 csvLines);
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
+    }
+
+    private void runBackgroundInterferenceBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines)
+            throws Exception {
+        String scenario = "background";
+        logScenarioStart(scenario, options);
+        SystemMetrics metricsBefore = SystemMetrics.snapshot();
+        long scenarioStart = System.nanoTime();
+        OperationStats scanStats = new OperationStats(options.sampleEvery);
+        OperationStats foregroundStats = new OperationStats(options.sampleEvery);
+        Path dbPath = scenarioPath(runPath, "background");
+        RocksDBWalSyncStats walSyncStats = RocksDBWalSyncStats.NONE;
+
+        try (RocksDBStoreEngine engine = open(dbPath, options)) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            BenchmarkDataSet dataSet = BenchmarkDataSet.create(options, 0);
+            writeDataSet(storeManager, dataSet);
+            engine.flush();
+
+            AtomicBoolean probeRunning = new AtomicBoolean(true);
+            AtomicLong probeFailures = new AtomicLong();
+            Thread probeThread = new Thread(
+                    () -> runBackgroundForegroundProbe(
+                            storeManager, options, foregroundStats, probeRunning, probeFailures),
+                    "r2-background-foreground-probe");
+            probeThread.start();
+            try {
+                Map<GlobalStatus, byte[]> cursors = new EnumMap<>(GlobalStatus.class);
+                Set<String> seenXids = new LinkedHashSet<>();
+                long firstRoundLatestBeginTime = Long.MIN_VALUE;
+                boolean advancedPastFirstPage = false;
+                int iterations = Math.max(1, options.totalRounds() * options.queryIterationsPerRound);
+                for (int iteration = 0; iteration < iterations; iteration++) {
+                    SessionCondition condition = new SessionCondition(TARGET_STATUS, SECONDARY_STATUS);
+                    condition.setLazyLoadBranch(true);
+                    condition.setLimit(options.queryLimit > 0 ? options.queryLimit : BACKGROUND_QUERY_DEFAULT_LIMIT);
+                    condition.setStatusScanCursors(cursors);
+                    long scanStartedAt = System.nanoTime();
+                    List<GlobalSession> sessions = storeManager.readSession(condition);
+                    assertTrue(!sessions.isEmpty(), "background cursor scan returned no session");
+                    for (GlobalSession session : sessions) {
+                        assertTrue(seenXids.add(session.getXid()), "background cursor repeated a persistent failure");
+                        if (iteration == 0) {
+                            firstRoundLatestBeginTime = Math.max(firstRoundLatestBeginTime, session.getBeginTime());
+                        } else if (session.getBeginTime() > firstRoundLatestBeginTime) {
+                            advancedPastFirstPage = true;
+                        }
+                    }
+                    cursors.clear();
+                    cursors.putAll(condition.getNextStatusScanCursors());
+                    RowMetrics metrics = RowMetrics.fromScanStats(condition.getScanStats(), sessions.size());
+                    scanStats.record(System.nanoTime() - scanStartedAt, metrics);
+                    log(
+                            "  [background.r2] round=%d returned=%d unique=%d scanned=%d pointReads=%d",
+                            iteration + 1,
+                            sessions.size(),
+                            seenXids.size(),
+                            condition.getScanStats().getRowsScanned(),
+                            condition.getScanStats().getPointReads());
+                }
+                assertTrue(advancedPastFirstPage, "background cursor did not advance past persistent failures");
+            } finally {
+                probeRunning.set(false);
+                probeThread.join();
+            }
+            assertEquals(0L, probeFailures.get(), "foreground probe failed");
+            walSyncStats = engine.diagnostics().getWalSyncStats();
+        }
+
+        DbFootprint footprint = DbFootprint.from(dbPath, walSyncStats);
+        emit("background.r2_multi_status_cursor", options, scanStats, footprint, csvLines);
+        emit("background.r2_foreground_probe", options, foregroundStats, footprint, csvLines);
+        logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
+    }
+
+    private static void runBackgroundForegroundProbe(
+            RocksDBTransactionStoreManager storeManager,
+            BenchmarkOptions options,
+            OperationStats foregroundStats,
+            AtomicBoolean probeRunning,
+            AtomicLong probeFailures) {
+        int index = 0;
+        while (probeRunning.get()) {
+            GlobalSession probe = BenchmarkDataSet.globalSession(
+                    index++, 99, options.seed, System.currentTimeMillis(), GlobalStatus.Begin);
+            long startedAt = System.nanoTime();
+            try {
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, probe);
+                storeManager.writeSession(LogOperation.GLOBAL_REMOVE, probe);
+                foregroundStats.record(
+                        System.nanoTime() - startedAt,
+                        RowMetrics.written(
+                                7L, estimateGlobalPutBytes(probe) + estimateGlobalRemoveBytes(probe, 0, false)));
+            } catch (RuntimeException e) {
+                probeFailures.incrementAndGet();
+            }
+        }
     }
 
     private void runRestartBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {

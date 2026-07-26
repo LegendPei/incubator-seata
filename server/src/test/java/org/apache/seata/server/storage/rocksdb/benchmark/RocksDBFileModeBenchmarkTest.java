@@ -439,6 +439,41 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testBackgroundInterferenceCursorAdvancesPastPersistentFailures() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-background-interference-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=background",
+                    "--globalCount=3000",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=RollbackRetrying:1,TimeoutRollbacking:1",
+                    "--queryLimit=128",
+                    "--queryIterationsPerRound=4",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+            Assertions.assertTrue(lines.stream().anyMatch(line -> line.startsWith("background.r2_multi_status_cursor,")));
+            Assertions.assertTrue(lines.stream().anyMatch(line -> line.startsWith("background.r2_foreground_probe,")));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
     void testAppendWriteBenchmarkOnlyEmitsAddScenarios() throws Exception {
         Path dbPath = Files.createTempDirectory("rocksdb-benchmark-append-write-");
         Object originalEnvironment =
