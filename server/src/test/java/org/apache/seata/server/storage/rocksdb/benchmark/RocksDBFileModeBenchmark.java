@@ -100,7 +100,8 @@ public final class RocksDBFileModeBenchmark {
                     + "p99MsMedian,rowsScannedMean,rowsReturnedMean,rowsUpdatedMean,pointReadsMean,iteratorNextMean,"
                     + "writeBatchBytesMean,innerOperationsMean,rangeDeleteCountMean,pointDeleteCountMean,"
                     + "deleteBatchCountMean,branchFanoutMean,lockFanoutMean";
-    private static final List<String> ALL_BENCHMARKS = Arrays.asList("write", "query", "lock", "cleanup", "restart");
+    private static final List<String> ALL_BENCHMARKS =
+            Arrays.asList("write", "query", "lock", "cleanup", "lifecycle", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
         GlobalStatus.Committing,
@@ -564,6 +565,9 @@ public final class RocksDBFileModeBenchmark {
             }
             if (options.isEnabled("cleanup")) {
                 runCleanupBenchmark(runPath, options, csvLines);
+            }
+            if (options.isEnabled("lifecycle")) {
+                runLifecycleBenchmark(runPath, options, csvLines);
             }
             if (options.isEnabled("restart")) {
                 runRestartBenchmark(runPath, options, csvLines);
@@ -1262,6 +1266,60 @@ public final class RocksDBFileModeBenchmark {
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
+    private void runLifecycleBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
+        String scenario = "lifecycle";
+        logScenarioStart(scenario, options);
+        SystemMetrics metricsBefore = SystemMetrics.snapshot();
+        long scenarioStart = System.nanoTime();
+
+        OperationStats globalRemoveStats = new OperationStats(options.sampleEvery);
+        Path lastDbPath = null;
+        RocksDBWalSyncStats lastWalSyncStats = RocksDBWalSyncStats.NONE;
+
+        for (int round = 0; round < options.totalRounds(); round++) {
+            boolean warmup = round < options.warmupRounds;
+            logRoundStart(scenario, round, options.totalRounds(), warmup);
+            BenchmarkDataSet dataSet = BenchmarkDataSet.create(options.withAtLeastOneLock(), round);
+            Path dbPath = scenarioPath(runPath, "lifecycle-round-" + round);
+            lastDbPath = dbPath;
+            try (RocksDBStoreEngine engine = open(dbPath, options)) {
+                RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+                RocksDBLockManager lockManager = new RocksDBLockManager(engine, options.lockIndexScanBatchSize);
+                writeDataSet(storeManager, dataSet);
+                for (BranchSession branchSession : dataSet.allBranches()) {
+                    assertTrue(lockManager.acquireLock(branchSession), "lifecycle lock setup acquire failed");
+                }
+                engine.flush();
+                for (GlobalSession globalSession : dataSet.globalSessions) {
+                    List<BranchSession> branches = dataSet.branchesOf(globalSession);
+                    int lockCount = lockRows(branches);
+                    measure(
+                            globalRemoveStats,
+                            round,
+                            options,
+                            lifecycleGlobalRemoveMetrics(options, globalSession, branches, lockCount),
+                            () -> {
+                                assertTrue(
+                                        lockManager.releaseGlobalSessionLock(globalSession),
+                                        "lifecycle global lock release failed");
+                                storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession);
+                            });
+                }
+                verifyLifecycleStoreEmpty(engine);
+                engine.flush();
+                lastWalSyncStats = engine.diagnostics().getWalSyncStats();
+            }
+        }
+
+        emit(
+                "lifecycle.global_remove_with_locks",
+                options,
+                globalRemoveStats,
+                DbFootprint.from(lastDbPath, lastWalSyncStats),
+                csvLines);
+        logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
+    }
+
     private void runRestartBenchmark(Path runPath, BenchmarkOptions options, List<String> csvLines) throws Exception {
         String scenario = "restart";
         logScenarioStart(scenario, options);
@@ -1334,6 +1392,16 @@ public final class RocksDBFileModeBenchmark {
         }
     }
 
+    private static void verifyLifecycleStoreEmpty(RocksDBStoreEngine engine) {
+        verifyStoreEmpty(engine);
+        assertTrue(
+                engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty(),
+                "lock table should be empty after lifecycle global remove");
+        assertTrue(
+                engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]).isEmpty(),
+                "lock branch index should be empty after lifecycle global remove");
+    }
+
     private static int lockRows(Collection<BranchSession> branchSessions) {
         int rows = 0;
         for (BranchSession branchSession : branchSessions) {
@@ -1383,6 +1451,25 @@ public final class RocksDBFileModeBenchmark {
                 globalRemovePointDeleteCount(session) + branchCount,
                 pointDeleteCount,
                 estimateGlobalRemoveBytes(session, branchCount, rangeDelete));
+    }
+
+    private static RowMetrics lifecycleGlobalRemoveMetrics(
+            BenchmarkOptions options, GlobalSession session, Collection<BranchSession> branches, int lockCount) {
+        int branchCount = branches.size();
+        byte[] prefix = RocksDBKeyCodec.encodeXidPrefix(session.getXid());
+        boolean rangeDelete = options.enableRangeDelete && RocksDBKeyCodec.prefixEnd(prefix) != null;
+        long sessionPointDeletes = globalRemovePointDeleteCount(session) + (rangeDelete ? 0L : branchCount);
+        int lockDeleteBatches = lockCount == 0
+                ? 0
+                : (lockCount + options.lockIndexScanBatchSize - 1) / options.lockIndexScanBatchSize;
+        return RowMetrics.lifecycleGlobalRemove(
+                rangeDelete,
+                branchCount,
+                lockCount,
+                lockCount + (rangeDelete ? 0L : branchCount),
+                sessionPointDeletes + lockCount * 2L,
+                1L + lockDeleteBatches,
+                estimateGlobalRemoveBytes(session, branchCount, rangeDelete) + estimateLockDeleteBytes(branches));
     }
 
     private static long estimateGlobalRemoveBytes(GlobalSession session, int branchCount, boolean rangeDelete) {
@@ -2155,6 +2242,29 @@ public final class RocksDBFileModeBenchmark {
                     1L,
                     branchFanout,
                     0L);
+        }
+
+        private static RowMetrics lifecycleGlobalRemove(
+                boolean rangeDelete,
+                long branchFanout,
+                long lockFanout,
+                long rowsScanned,
+                long pointDeleteCount,
+                long deleteBatchCount,
+                long writeBatchBytes) {
+            return new RowMetrics(
+                    rowsScanned,
+                    0L,
+                    pointDeleteCount,
+                    0L,
+                    rowsScanned,
+                    writeBatchBytes,
+                    deleteBatchCount,
+                    rangeDelete ? 1L : 0L,
+                    pointDeleteCount,
+                    deleteBatchCount,
+                    branchFanout,
+                    lockFanout);
         }
     }
 

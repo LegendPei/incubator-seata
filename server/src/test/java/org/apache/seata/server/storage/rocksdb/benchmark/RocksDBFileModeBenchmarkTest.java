@@ -408,6 +408,37 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testLifecycleGlobalRemoveReleasesLocksBeforeDeletingSessions() throws Exception {
+        Path scanDbPath = Files.createTempDirectory("rocksdb-benchmark-lifecycle-remove-scan-");
+        Path rangeDbPath = Files.createTempDirectory("rocksdb-benchmark-lifecycle-remove-range-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Map<String, String> scan = runGlobalLifecycleBenchmark(scanDbPath, false);
+            Map<String, String> range = runGlobalLifecycleBenchmark(rangeDbPath, true);
+
+            Assertions.assertEquals("12", scan.get("branchFanout"));
+            Assertions.assertEquals("24", scan.get("lockFanout"));
+            Assertions.assertEquals("36", scan.get("rowsScanned"));
+            Assertions.assertEquals("0", scan.get("pointReads"));
+            Assertions.assertEquals("0", scan.get("rangeDeleteCount"));
+
+            Assertions.assertEquals("12", range.get("branchFanout"));
+            Assertions.assertEquals("24", range.get("lockFanout"));
+            Assertions.assertEquals("24", range.get("rowsScanned"));
+            Assertions.assertEquals("0", range.get("pointReads"));
+            Assertions.assertEquals("4", range.get("rangeDeleteCount"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(scanDbPath);
+            deleteRecursively(rangeDbPath);
+        }
+    }
+
+    @Test
     void testAppendWriteBenchmarkOnlyEmitsAddScenarios() throws Exception {
         Path dbPath = Files.createTempDirectory("rocksdb-benchmark-append-write-");
         Object originalEnvironment =
@@ -1071,6 +1102,31 @@ class RocksDBFileModeBenchmarkTest {
                 .filter(line -> line.startsWith(scenario + ","))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError(scenario + " row missing")));
+    }
+
+    private Map<String, String> runGlobalLifecycleBenchmark(Path dbPath, boolean enableRangeDelete) throws Exception {
+        Object options = parseOptions(
+                "--benchmark=lifecycle",
+                "--globalCount=4",
+                "--branchPerGlobal=3",
+                "--lockPerBranch=2",
+                "--warmupRounds=0",
+                "--measureRounds=1",
+                "--batchSize=1",
+                "--enableRangeDelete=" + enableRangeDelete,
+                "--cleanup=true",
+                "--dbPath=" + dbPath);
+        Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+        return parseCsvLine(lines.stream()
+                .filter(line -> line.startsWith("lifecycle.global_remove_with_locks,"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("lifecycle.global_remove_with_locks row missing")));
     }
 
     private String csvLine(Map<String, String> valuesByColumn) throws Exception {
