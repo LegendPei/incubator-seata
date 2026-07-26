@@ -408,6 +408,18 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testDefaultBenchmarkSetExcludesExplicitBackgroundInterference() throws Exception {
+        Object options = parseOptions();
+        Field field = options.getClass().getDeclaredField("benchmarks");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> benchmarks =
+                (java.util.Set<String>) field.get(options);
+
+        Assertions.assertFalse(benchmarks.contains("background"));
+    }
+
+    @Test
     void testLifecycleGlobalRemoveReleasesLocksBeforeDeletingSessions() throws Exception {
         Path scanDbPath = Files.createTempDirectory("rocksdb-benchmark-lifecycle-remove-scan-");
         Path rangeDbPath = Files.createTempDirectory("rocksdb-benchmark-lifecycle-remove-range-");
@@ -452,7 +464,7 @@ class RocksDBFileModeBenchmarkTest {
                     "--branchPerGlobal=0",
                     "--statusDistribution=RollbackRetrying:1,TimeoutRollbacking:1",
                     "--queryLimit=128",
-                    "--queryIterationsPerRound=4",
+                    "--queryIterationsPerRound=30",
                     "--warmupRounds=0",
                     "--measureRounds=1",
                     "--cleanup=true",
@@ -464,7 +476,8 @@ class RocksDBFileModeBenchmarkTest {
 
             @SuppressWarnings("unchecked")
             List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
-            Assertions.assertTrue(lines.stream().anyMatch(line -> line.startsWith("background.r2_multi_status_cursor,")));
+            Assertions.assertTrue(
+                    lines.stream().anyMatch(line -> line.startsWith("background.r2_coordinator_multi_status_cursor,")));
             Assertions.assertTrue(lines.stream().anyMatch(line -> line.startsWith("background.r2_foreground_probe,")));
         } finally {
             ConfigurationCache.clear();

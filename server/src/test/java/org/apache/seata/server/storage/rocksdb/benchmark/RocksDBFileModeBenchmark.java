@@ -27,9 +27,13 @@ import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
 import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.core.model.LockStatus;
+import org.apache.seata.core.rpc.RemotingServer;
+import org.apache.seata.server.coordinator.DefaultCoordinator;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionManager;
 import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
@@ -41,6 +45,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncMode;
 import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncStats;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBOrphanLockCleanupController;
+import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.rocksdb.RocksDB;
@@ -52,6 +57,8 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -70,8 +77,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Stream;
 
 /**
@@ -102,6 +111,8 @@ public final class RocksDBFileModeBenchmark {
                     + "writeBatchBytesMean,innerOperationsMean,rangeDeleteCountMean,pointDeleteCountMean,"
                     + "deleteBatchCountMean,branchFanoutMean,lockFanoutMean";
     private static final List<String> ALL_BENCHMARKS =
+            Arrays.asList("write", "query", "lock", "cleanup", "lifecycle", "restart");
+    private static final List<String> SUPPORTED_BENCHMARKS =
             Arrays.asList("write", "query", "lock", "cleanup", "lifecycle", "background", "restart");
     private static final GlobalStatus[] STATUSES = {
         GlobalStatus.Begin,
@@ -127,11 +138,13 @@ public final class RocksDBFileModeBenchmark {
             RocksDBOrphanLockCleanupController.DEFAULT_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS;
     private static final int CLEAN_ORPHAN_FOREGROUND_PROBE_BRANCHES = 100;
     private static final int BACKGROUND_QUERY_DEFAULT_LIMIT = 1024;
+    private static final long BACKGROUND_FOREGROUND_PROBE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(1L);
     private static final String WRITE_WORKLOAD_FULL = "full";
     private static final String WRITE_WORKLOAD_APPEND = "append";
     private static final String DATA_PAYLOAD_PROFILE_PRODUCTION = "production";
     private static final String DATA_PAYLOAD_PROFILE_PHASE4 = "phase4";
     private static final String QUERY_WORKLOAD_ALL = "all";
+    private static final String QUERY_WORKLOAD_NONE = "none";
     private static final List<String> ALL_LOCK_WORKLOADS = Arrays.asList(
             LOCK_OP_ACQUIRE,
             LOCK_OP_CONFLICT,
@@ -1342,59 +1355,67 @@ public final class RocksDBFileModeBenchmark {
             writeDataSet(storeManager, dataSet);
             engine.flush();
 
-            AtomicBoolean probeRunning = new AtomicBoolean(true);
             AtomicLong probeFailures = new AtomicLong();
+            int foregroundProbeOperations =
+                    options.queryLimit > 0 ? options.queryLimit : BACKGROUND_QUERY_DEFAULT_LIMIT;
             Thread probeThread = new Thread(
                     () -> runBackgroundForegroundProbe(
-                            storeManager, options, foregroundStats, probeRunning, probeFailures),
+                            storeManager, options, foregroundStats, foregroundProbeOperations, probeFailures),
                     "r2-background-foreground-probe");
             probeThread.start();
-            try {
-                Map<GlobalStatus, byte[]> cursors = new EnumMap<>(GlobalStatus.class);
+            if (!QUERY_WORKLOAD_NONE.equals(options.queryWorkload)) {
+                SessionManager originalSessionManager =
+                        replaceRootSessionManager(new RocksDBSessionManager("root.data", engine));
                 Set<String> seenXids = new LinkedHashSet<>();
                 long firstRoundLatestBeginTime = Long.MIN_VALUE;
                 boolean advancedPastFirstPage = false;
                 int iterations = Math.max(1, options.totalRounds() * options.queryIterationsPerRound);
-                for (int iteration = 0; iteration < iterations; iteration++) {
-                    SessionCondition condition = new SessionCondition(TARGET_STATUS, SECONDARY_STATUS);
-                    condition.setLazyLoadBranch(true);
-                    condition.setLimit(options.queryLimit > 0 ? options.queryLimit : BACKGROUND_QUERY_DEFAULT_LIMIT);
-                    condition.setStatusScanCursors(cursors);
-                    long scanStartedAt = System.nanoTime();
-                    List<GlobalSession> sessions = storeManager.readSession(condition);
-                    assertTrue(!sessions.isEmpty(), "background cursor scan returned no session");
-                    for (GlobalSession session : sessions) {
-                        assertTrue(seenXids.add(session.getXid()), "background cursor repeated a persistent failure");
-                        if (iteration == 0) {
-                            firstRoundLatestBeginTime = Math.max(firstRoundLatestBeginTime, session.getBeginTime());
-                        } else if (session.getBeginTime() > firstRoundLatestBeginTime) {
-                            advancedPastFirstPage = true;
+                try {
+                    DefaultCoordinator coordinator = new BenchmarkCoordinator();
+                    for (int iteration = 0; iteration < iterations; iteration++) {
+                        long scanStartedAt = System.nanoTime();
+                        List<GlobalSession> sessions = findCoordinatorBackgroundSessions(coordinator);
+                        if (sessions.isEmpty()) {
+                            break;
+                        }
+                        for (GlobalSession session : sessions) {
+                            assertTrue(
+                                    seenXids.add(session.getXid()),
+                                    "background cursor repeated before pass completion");
+                            if (iteration == 0) {
+                                firstRoundLatestBeginTime = Math.max(firstRoundLatestBeginTime, session.getBeginTime());
+                            } else if (session.getBeginTime() > firstRoundLatestBeginTime) {
+                                advancedPastFirstPage = true;
+                            }
+                        }
+                        scanStats.record(System.nanoTime() - scanStartedAt, RowMetrics.returned(sessions.size()));
+                        log(
+                                "  [background.r2] round=%d returned=%d unique=%d",
+                                iteration + 1,
+                                sessions.size(),
+                                seenXids.size());
+                        if (sessions.size() < BACKGROUND_QUERY_DEFAULT_LIMIT) {
+                            break;
                         }
                     }
-                    cursors.clear();
-                    cursors.putAll(condition.getNextStatusScanCursors());
-                    RowMetrics metrics = RowMetrics.fromScanStats(condition.getScanStats(), sessions.size());
-                    scanStats.record(System.nanoTime() - scanStartedAt, metrics);
-                    log(
-                            "  [background.r2] round=%d returned=%d unique=%d scanned=%d pointReads=%d",
-                            iteration + 1,
-                            sessions.size(),
-                            seenXids.size(),
-                            condition.getScanStats().getRowsScanned(),
-                            condition.getScanStats().getPointReads());
+                } finally {
+                    replaceRootSessionManager(originalSessionManager);
                 }
+                assertTrue(!seenXids.isEmpty(), "background cursor scan returned no session");
                 assertTrue(advancedPastFirstPage, "background cursor did not advance past persistent failures");
-            } finally {
-                probeRunning.set(false);
-                probeThread.join();
             }
+            probeThread.join();
             assertEquals(0L, probeFailures.get(), "foreground probe failed");
             walSyncStats = engine.diagnostics().getWalSyncStats();
         }
 
         DbFootprint footprint = DbFootprint.from(dbPath, walSyncStats);
-        emit("background.r2_multi_status_cursor", options, scanStats, footprint, csvLines);
-        emit("background.r2_foreground_probe", options, foregroundStats, footprint, csvLines);
+        if (!QUERY_WORKLOAD_NONE.equals(options.queryWorkload)) {
+            emit("background.r2_coordinator_multi_status_cursor", options, scanStats, footprint, csvLines);
+            emit("background.r2_foreground_probe", options, foregroundStats, footprint, csvLines);
+        } else {
+            emit("background.r2_foreground_baseline", options, foregroundStats, footprint, csvLines);
+        }
         logScenarioEnd(scenario, System.nanoTime() - scenarioStart, metricsBefore, SystemMetrics.snapshot());
     }
 
@@ -1402,10 +1423,9 @@ public final class RocksDBFileModeBenchmark {
             RocksDBTransactionStoreManager storeManager,
             BenchmarkOptions options,
             OperationStats foregroundStats,
-            AtomicBoolean probeRunning,
+            int operations,
             AtomicLong probeFailures) {
-        int index = 0;
-        while (probeRunning.get()) {
+        for (int index = 0; index < operations; index++) {
             GlobalSession probe = BenchmarkDataSet.globalSession(
                     index++, 99, options.seed, System.currentTimeMillis(), GlobalStatus.Begin);
             long startedAt = System.nanoTime();
@@ -1419,6 +1439,35 @@ public final class RocksDBFileModeBenchmark {
             } catch (RuntimeException e) {
                 probeFailures.incrementAndGet();
             }
+            LockSupport.parkNanos(BACKGROUND_FOREGROUND_PROBE_INTERVAL_NANOS);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<GlobalSession> findCoordinatorBackgroundSessions(DefaultCoordinator coordinator)
+            throws Exception {
+        Method method = DefaultCoordinator.class.getDeclaredMethod(
+                "findBackgroundSessions", GlobalStatus[].class, boolean.class);
+        method.setAccessible(true);
+        return (List<GlobalSession>) method.invoke(
+                coordinator, new GlobalStatus[] {TARGET_STATUS, SECONDARY_STATUS}, true);
+    }
+
+    private static SessionManager replaceRootSessionManager(SessionManager replacement) throws Exception {
+        Field field = SessionHolder.class.getDeclaredField("ROOT_SESSION_MANAGER");
+        field.setAccessible(true);
+        SessionManager original = (SessionManager) field.get(null);
+        field.set(null, replacement);
+        return original;
+    }
+
+    private static final class BenchmarkCoordinator extends DefaultCoordinator {
+
+        private BenchmarkCoordinator() {
+            super((RemotingServer) Proxy.newProxyInstance(
+                    RemotingServer.class.getClassLoader(),
+                    new Class[] {RemotingServer.class},
+                    (proxy, method, args) -> null));
         }
     }
 
@@ -4211,7 +4260,7 @@ public final class RocksDBFileModeBenchmark {
                 if (benchmark.isEmpty()) {
                     continue;
                 }
-                if (!ALL_BENCHMARKS.contains(benchmark)) {
+                if (!SUPPORTED_BENCHMARKS.contains(benchmark)) {
                     throw new IllegalArgumentException("Unsupported benchmark:" + benchmark);
                 }
                 result.add(benchmark);
@@ -4313,6 +4362,7 @@ public final class RocksDBFileModeBenchmark {
                     ? QUERY_WORKLOAD_ALL
                     : value.trim().toLowerCase(Locale.ROOT);
             if (!QUERY_WORKLOAD_ALL.equals(normalized)
+                    && !QUERY_WORKLOAD_NONE.equals(normalized)
                     && !"xid".equals(normalized)
                     && !"transaction_id".equals(normalized)
                     && !"status".equals(normalized)
