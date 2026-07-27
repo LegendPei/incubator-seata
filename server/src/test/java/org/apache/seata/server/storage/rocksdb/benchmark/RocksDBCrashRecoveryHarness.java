@@ -42,6 +42,8 @@ public final class RocksDBCrashRecoveryHarness {
 
     private static final String WRITER = "writer";
     private static final String PARENT = "parent";
+    private static final String CLEAN = "clean";
+    private static final long DEFAULT_CHECKPOINT_TIMEOUT_MILLIS = 300_000L;
 
     private RocksDBCrashRecoveryHarness() {}
 
@@ -53,6 +55,10 @@ public final class RocksDBCrashRecoveryHarness {
         try {
             if (WRITER.equals(mode)) {
                 writeUntilKilled(options);
+                return;
+            }
+            if (CLEAN.equals(mode)) {
+                runCleanShutdown(options);
                 return;
             }
             runParent(options);
@@ -78,7 +84,7 @@ public final class RocksDBCrashRecoveryHarness {
                         "--syncWrite=" + options.getOrDefault("syncWrite", "true"))
                 .inheritIO()
                 .start();
-        waitForCheckpoint(checkpoint, child);
+        waitForCheckpoint(checkpoint, child, checkpointTimeoutMillis(options));
         child.destroyForcibly();
         child.waitFor();
         long expected = Long.parseLong(new String(Files.readAllBytes(checkpoint), StandardCharsets.UTF_8).trim());
@@ -114,8 +120,33 @@ public final class RocksDBCrashRecoveryHarness {
         }
     }
 
-    private static void waitForCheckpoint(Path checkpoint, Process child) throws Exception {
-        long deadline = System.nanoTime() + 30_000_000_000L;
+    private static void runCleanShutdown(Map<String, String> options) throws Exception {
+        Path dbPath = requiredPath(options, "dbPath");
+        int count = Integer.parseInt(options.getOrDefault("count", "10000"));
+        boolean syncWrite = Boolean.parseBoolean(options.getOrDefault("syncWrite", "true"));
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(new RocksDBStoreConfig(dbPath.toString(), syncWrite))) {
+            RocksDBTransactionStoreManager store = new RocksDBTransactionStoreManager(engine);
+            for (int i = 1; i <= count; i++) {
+                GlobalSession session = new GlobalSession("r8", "r8", "r8-clean-" + i, 60000);
+                session.setStatus(GlobalStatus.Begin);
+                session.setBeginTime(System.currentTimeMillis());
+                store.writeSession(LogOperation.GLOBAL_ADD, session);
+            }
+        }
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(new RocksDBStoreConfig(dbPath.toString(), syncWrite))) {
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
+            int recovered = engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]).size();
+            boolean lastShutdownClean = engine.wasLastShutdownClean();
+            System.out.println("R8_CLEAN_RESULT expected=" + count + " recovered=" + recovered + " lastShutdownClean="
+                    + lastShutdownClean + " clean=" + report.isClean());
+            if (!lastShutdownClean || !report.isClean() || recovered != count) {
+                throw new IllegalStateException("clean shutdown verification failed:" + report);
+            }
+        }
+    }
+
+    private static void waitForCheckpoint(Path checkpoint, Process child, long timeoutMillis) throws Exception {
+        long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
         while (!Files.exists(checkpoint)) {
             if (!child.isAlive()) {
                 throw new IllegalStateException("writer exited before checkpoint, exit=" + child.exitValue());
@@ -133,6 +164,11 @@ public final class RocksDBCrashRecoveryHarness {
             throw new IllegalArgumentException("missing --" + key);
         }
         return Paths.get(value);
+    }
+
+    static long checkpointTimeoutMillis(Map<String, String> options) {
+        String defaultTimeout = Long.toString(DEFAULT_CHECKPOINT_TIMEOUT_MILLIS);
+        return Long.parseLong(options.getOrDefault("checkpointTimeoutMillis", defaultTimeout));
     }
 
     private static Map<String, String> parse(String[] args) {

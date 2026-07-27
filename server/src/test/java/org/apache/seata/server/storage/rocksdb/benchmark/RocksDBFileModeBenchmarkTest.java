@@ -46,6 +46,16 @@ class RocksDBFileModeBenchmarkTest {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     @Test
+    void testCrashRecoveryCheckpointTimeoutSupportsScaledRuns() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("checkpointTimeoutMillis", "300000");
+
+        Assertions.assertEquals(300000L, RocksDBCrashRecoveryHarness.checkpointTimeoutMillis(options));
+        Assertions.assertEquals(
+                300000L, RocksDBCrashRecoveryHarness.checkpointTimeoutMillis(Collections.<String, String>emptyMap()));
+    }
+
+    @Test
     void testOptionsParseQueryAndCompareControls() throws Exception {
         Object options = parseOptions(
                 "--batchSize=5",
