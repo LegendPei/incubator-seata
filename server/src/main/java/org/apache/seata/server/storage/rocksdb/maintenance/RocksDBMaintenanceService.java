@@ -38,6 +38,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -283,8 +286,9 @@ public class RocksDBMaintenanceService {
             return;
         }
         if (!Arrays.equals(key, RocksDBKeyCodec.encodeXid(global.xid))) {
-            report.error("global session key mismatch, xid:" + global.xid);
+            report.invalidGlobal("global session key mismatch, xid:" + global.xid);
         }
+        report.globalTransactionId(global.transactionId, global.xid);
         byte[] xidBytes = global.xid.getBytes(StandardCharsets.UTF_8);
         byte[] statusValue = storeEngine.get(
                 RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
@@ -432,7 +436,7 @@ public class RocksDBMaintenanceService {
                     session.getTimeout());
         } catch (Exception e) {
             if (report != null) {
-                report.error("failed to decode " + description + ", message:" + e.getMessage());
+                report.invalidGlobal("failed to decode " + description + ", message:" + e.getMessage());
             }
             return null;
         }
@@ -506,9 +510,6 @@ public class RocksDBMaintenanceService {
 
     /**
      * Rebuild secondary indexes from global session data.
-     *
-     * <p>This is an explicit repair action. It clears and rebuilds the
-     * {@code GLOBAL_STATUS_INDEX} and {@code TRANSACTION_ID_INDEX} column families.
      */
     public void repairIndexes() {
         storeEngine.withMaintenanceLock(() -> {
@@ -517,6 +518,86 @@ public class RocksDBMaintenanceService {
             LOGGER.info("RocksDB secondary indexes rebuilt");
             return null;
         });
+    }
+
+    /**
+     * Build a read-only repair proposal from the current verification state.
+     */
+    public RocksDBRepairPlan planRepair(RocksDBRepairOptions options) {
+        Objects.requireNonNull(options, "repair options must not be null");
+        RocksDBVerifyReport beforeVerifyReport =
+                verifyCurrentState(RocksDBVerifyOptions.full(100, options.getVerifyDeadlineMillis()));
+        Set<RocksDBRepairPlan.Action> actions = EnumSet.noneOf(RocksDBRepairPlan.Action.class);
+        if (requiresGlobalSecondaryIndexRebuild(beforeVerifyReport)) {
+            actions.add(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES);
+        }
+        return new RocksDBRepairPlan(
+                options.isDryRun(),
+                actions,
+                beforeVerifyReport,
+                beforeVerifyReport.isComplete(),
+                hasUnrepairableSourceViolation(beforeVerifyReport));
+    }
+
+    /**
+     * Execute a previously reviewed repair proposal after explicit safety confirmation.
+     */
+    public RocksDBRepairReport executeRepair(RocksDBRepairPlan plan, RocksDBRepairOptions options) {
+        Objects.requireNonNull(plan, "repair plan must not be null");
+        Objects.requireNonNull(options, "repair options must not be null");
+        if (options.isDryRun()) {
+            return new RocksDBRepairReport(true, 0, plan.getBeforeVerifyReport(), plan.getBeforeVerifyReport());
+        }
+        if (!options.isConfirm() || !options.isMaintenanceMode()) {
+            throw new StoreException("RocksDB repair requires confirm=true and maintenanceMode=true");
+        }
+        if (!plan.isVerificationComplete()) {
+            throw new StoreException("RocksDB repair requires a complete verification plan");
+        }
+        return storeEngine.withMaintenanceLock(() -> executeRepairInMaintenanceWindow(plan, options));
+    }
+
+    private RocksDBRepairReport executeRepairInMaintenanceWindow(
+            RocksDBRepairPlan plan, RocksDBRepairOptions options) {
+        RocksDBVerifyReport beforeVerifyReport =
+                verifyCurrentState(RocksDBVerifyOptions.full(100, options.getVerifyDeadlineMillis()));
+        if (!beforeVerifyReport.isComplete()) {
+            throw new StoreException("RocksDB repair requires a complete pre-repair verification");
+        }
+        if (hasUnrepairableSourceViolation(beforeVerifyReport)) {
+            throw new StoreException("RocksDB repair rejected because source data has unrepairable violations");
+        }
+        int executedActionCount = 0;
+        if (plan.hasAction(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES)) {
+            indexManager.rebuildFromGlobalSessionsAtomically(options.getMaxRepairEntries());
+            executedActionCount++;
+        }
+        RocksDBVerifyReport afterVerifyReport =
+                verifyCurrentState(RocksDBVerifyOptions.full(100, options.getVerifyDeadlineMillis()));
+        if (!afterVerifyReport.isComplete()) {
+            throw new StoreException("RocksDB repair requires a complete post-repair verification");
+        }
+        if (afterVerifyReport.getInconsistentCount() > beforeVerifyReport.getInconsistentCount()) {
+            throw new StoreException("RocksDB repair increased consistency violations");
+        }
+        return new RocksDBRepairReport(false, executedActionCount, beforeVerifyReport, afterVerifyReport);
+    }
+
+    private static boolean requiresGlobalSecondaryIndexRebuild(RocksDBVerifyReport report) {
+        return report.getStaleStatusIndexCount() > 0
+                || report.getStaleTimeoutIndexCount() > 0
+                || report.getStaleTransactionIdIndexCount() > 0
+                || report.getMissingStatusIndexCount() > 0
+                || report.getMissingTimeoutIndexCount() > 0
+                || report.getMissingTransactionIdIndexCount() > 0;
+    }
+
+    private static boolean hasUnrepairableSourceViolation(RocksDBVerifyReport report) {
+        return report.getInvalidGlobalCount() > 0
+                || report.getInvalidBranchCount() > 0
+                || report.getOrphanBranchCount() > 0
+                || report.getOrphanLockCount() > 0
+                || report.getInvalidMetadataCount() > 0;
     }
 
     private void writeCheckpointMetadata(Path checkpointPath) throws IOException {

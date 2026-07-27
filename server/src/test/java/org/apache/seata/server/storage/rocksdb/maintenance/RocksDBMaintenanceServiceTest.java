@@ -635,7 +635,13 @@ class RocksDBMaintenanceServiceTest {
             Assertions.assertFalse(beforeRepair.isClean());
 
             // Repair
-            service.repairIndexes();
+            service.executeRepair(
+                    service.planRepair(RocksDBRepairOptions.defaults()),
+                    RocksDBRepairOptions.builder()
+                            .dryRun(false)
+                            .confirm(true)
+                            .maintenanceMode(true)
+                            .build());
 
             // Verify should be clean after repair
             RocksDBVerifyReport afterRepair = service.verifyCurrentState();
@@ -687,6 +693,322 @@ class RocksDBMaintenanceServiceTest {
                 releaseRepair.countDown();
                 executor.shutdownNow();
             }
+        }
+    }
+
+    @Test
+    void testPlanRepairDryRunClassifiesGlobalIndexesWithoutWriting() {
+        try (RocksDBStoreEngine engine = open("repair-plan-dry-run")) {
+            GlobalSession global = globalSession("repair-plan-dry-run", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            byte[] statusKey =
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(global.getStatus(), global.getBeginTime(), global.getXid());
+            byte[] transactionKey = RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId());
+            engine.delete(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey);
+            engine.put(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    transactionKey,
+                    "wrong-xid".getBytes(StandardCharsets.UTF_8));
+
+            RocksDBRepairPlan plan = new RocksDBMaintenanceService(engine).planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.isDryRun());
+            Assertions.assertTrue(plan.hasAction(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES));
+            Assertions.assertFalse(plan.hasUnrepairableSourceViolation());
+            Assertions.assertEquals(3, plan.getBeforeVerifyReport().getInconsistentCount());
+            Assertions.assertNull(engine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey));
+            Assertions.assertArrayEquals(
+                    "wrong-xid".getBytes(StandardCharsets.UTF_8),
+                    engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey));
+        }
+    }
+
+    @Test
+    void testPlanRepairMarksOrphanBranchAsUnrepairable() {
+        try (RocksDBStoreEngine engine = open("repair-plan-unrepairable")) {
+            GlobalSession orphanGlobal = globalSession("repair-plan-orphan", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine)
+                    .writeSession(LogOperation.BRANCH_ADD, branchSession(orphanGlobal, 1L));
+
+            RocksDBRepairPlan plan = new RocksDBMaintenanceService(engine).planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.hasUnrepairableSourceViolation());
+            Assertions.assertTrue(plan.getActions().isEmpty());
+            Assertions.assertEquals(1, plan.getBeforeVerifyReport().getOrphanBranchCount());
+        }
+    }
+
+    @Test
+    void testExecuteRepairRejectsMissingConfirmOrMaintenanceModeWithoutWriting() {
+        try (RocksDBStoreEngine engine = open("repair-gate")) {
+            GlobalSession global = globalSession("repair-gate", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            byte[] statusKey =
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(global.getStatus(), global.getBeginTime(), global.getXid());
+            engine.delete(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey);
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(false)
+                                    .maintenanceMode(true)
+                                    .build()));
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(false)
+                                    .build()));
+            Assertions.assertNull(engine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey));
+        }
+    }
+
+    @Test
+    void testExecuteRepairRebuildsGlobalIndexesAfterExplicitConfirmation() {
+        try (RocksDBStoreEngine engine = open("repair-global-indexes")) {
+            GlobalSession global = globalSession("repair-global-indexes", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            engine.delete(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(
+                            global.getStatus(), global.getBeginTime(), global.getXid()));
+            engine.delete(
+                    RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                    RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                            global.getBeginTime() + global.getTimeout(), global.getXid()));
+            engine.put(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId()),
+                    "wrong-xid".getBytes(StandardCharsets.UTF_8));
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            RocksDBRepairReport report = service.executeRepair(
+                    plan,
+                    RocksDBRepairOptions.builder()
+                            .dryRun(false)
+                            .confirm(true)
+                            .maintenanceMode(true)
+                            .build());
+
+            Assertions.assertEquals(4, report.getBeforeVerifyReport().getInconsistentCount());
+            Assertions.assertTrue(report.getAfterVerifyReport().isClean());
+            Assertions.assertEquals(1, report.getExecutedActionCount());
+            Assertions.assertTrue(
+                    new RocksDBMaintenanceService(engine).verifyCurrentState().isClean());
+        }
+    }
+
+    @Test
+    void testExecuteRepairRejectsInvalidGlobalSessionSource() {
+        try (RocksDBStoreEngine engine = open("repair-invalid-global-source")) {
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    RocksDBKeyCodec.encodeXid("repair-invalid-global-source"),
+                    new byte[] {1, 2, 3});
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.hasUnrepairableSourceViolation());
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(true)
+                                    .build()));
+        }
+    }
+
+    @Test
+    void testExecuteRepairRejectsDuplicateTransactionIdSource() {
+        try (RocksDBStoreEngine engine = open("repair-duplicate-transaction-id")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("repair-duplicate-transaction-id-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("repair-duplicate-transaction-id-second", GlobalStatus.Begin);
+            second.setTransactionId(first.getTransactionId());
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+            byte[] transactionKey = RocksDBKeyCodec.encodeTransactionIdIndex(first.getTransactionId());
+            byte[] beforeTransactionIndex = engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey);
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.hasUnrepairableSourceViolation());
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(true)
+                                    .build()));
+            Assertions.assertArrayEquals(
+                    beforeTransactionIndex,
+                    engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey));
+        }
+    }
+
+    @Test
+    void testExecuteRepairRejectsGlobalSessionKeyPayloadMismatch() {
+        try (RocksDBStoreEngine engine = open("repair-global-key-payload-mismatch")) {
+            GlobalSession global = globalSession("repair-global-key-payload-mismatch", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            byte[] expectedKey = RocksDBKeyCodec.encodeXid(global.getXid());
+            byte[] statusKey =
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(global.getStatus(), global.getBeginTime(), global.getXid());
+            byte[] rawValue = engine.get(RocksDBColumnFamily.GLOBAL_SESSION, expectedKey);
+            engine.delete(RocksDBColumnFamily.GLOBAL_SESSION, expectedKey);
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    RocksDBKeyCodec.encodeXid("different-global-key"),
+                    rawValue);
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.hasUnrepairableSourceViolation());
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(true)
+                                    .build()));
+            Assertions.assertArrayEquals(
+                    global.getXid().getBytes(StandardCharsets.UTF_8),
+                    engine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey));
+        }
+    }
+
+    @Test
+    void testExecuteRepairRejectsRebuildBeyondEntryLimitWithoutWriting() {
+        try (RocksDBStoreEngine engine = open("repair-entry-limit")) {
+            GlobalSession global = globalSession("repair-entry-limit", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            byte[] statusKey =
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(global.getStatus(), global.getBeginTime(), global.getXid());
+            engine.delete(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey);
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(true)
+                                    .maxRepairEntries(1)
+                                    .build()));
+            Assertions.assertNull(engine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey));
+        }
+    }
+
+    @Test
+    void testMaintenanceLockBlocksConcurrentWrite() throws Exception {
+        try (RocksDBStoreEngine engine = open("repair-maintenance-lock")) {
+            CountDownLatch maintenanceEntered = new CountDownLatch(1);
+            CountDownLatch releaseMaintenance = new CountDownLatch(1);
+            CountDownLatch writerStarted = new CountDownLatch(1);
+            CountDownLatch writerCompleted = new CountDownLatch(1);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            try {
+                Future<?> maintenance = executor.submit(() -> engine.withMaintenanceLock(() -> {
+                    maintenanceEntered.countDown();
+                    await(releaseMaintenance);
+                    return null;
+                }));
+                Assertions.assertTrue(maintenanceEntered.await(5, TimeUnit.SECONDS));
+                Future<?> writer = executor.submit(() -> {
+                    writerStarted.countDown();
+                    engine.put(
+                            RocksDBColumnFamily.METADATA,
+                            "repair-maintenance-lock".getBytes(StandardCharsets.UTF_8),
+                            "blocked".getBytes(StandardCharsets.UTF_8));
+                    writerCompleted.countDown();
+                });
+                Assertions.assertTrue(writerStarted.await(5, TimeUnit.SECONDS));
+                Assertions.assertFalse(writerCompleted.await(200, TimeUnit.MILLISECONDS));
+
+                releaseMaintenance.countDown();
+                maintenance.get(5, TimeUnit.SECONDS);
+                writer.get(5, TimeUnit.SECONDS);
+                Assertions.assertArrayEquals(
+                        "blocked".getBytes(StandardCharsets.UTF_8),
+                        engine.get(
+                                 RocksDBColumnFamily.METADATA,
+                                 "repair-maintenance-lock".getBytes(StandardCharsets.UTF_8)));
+            } finally {
+                releaseMaintenance.countDown();
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    @Test
+    void testExecuteRepairRejectsIncompleteVerification() {
+        try (RocksDBStoreEngine engine = open("repair-incomplete-verification")) {
+            for (int i = 0; i < 300; i++) {
+                String xid = "stale-status-" + i;
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                        RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, i, xid),
+                        xid.getBytes(StandardCharsets.UTF_8));
+            }
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairOptions options =
+                    RocksDBRepairOptions.builder().verifyDeadlineMillis(0).build();
+            RocksDBRepairPlan plan = service.planRepair(options);
+
+            Assertions.assertFalse(plan.isVerificationComplete());
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(true)
+                                    .verifyDeadlineMillis(0)
+                                    .build()));
+        }
+    }
+
+    @Test
+    void testExecuteRepairRejectsUnrepairableSourceViolation() {
+        try (RocksDBStoreEngine engine = open("repair-unrepairable-gate")) {
+            GlobalSession orphanGlobal = globalSession("repair-execute-orphan", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine)
+                    .writeSession(LogOperation.BRANCH_ADD, branchSession(orphanGlobal, 1L));
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(true)
+                                    .build()));
+            Assertions.assertEquals(
+                    1,
+                    new RocksDBMaintenanceService(engine).verifyCurrentState().getOrphanBranchCount());
         }
     }
 
@@ -767,7 +1089,7 @@ class RocksDBMaintenanceServiceTest {
     private void await(CountDownLatch latch) {
         try {
             if (!latch.await(5, TimeUnit.SECONDS)) {
-                throw new AssertionError("timed out waiting for repair release");
+                throw new AssertionError("timed out waiting for maintenance operation release");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

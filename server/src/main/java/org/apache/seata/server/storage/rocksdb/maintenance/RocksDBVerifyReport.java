@@ -18,7 +18,9 @@ package org.apache.seata.server.storage.rocksdb.maintenance;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Immutable report produced by RocksDB consistency verification.
@@ -41,6 +43,7 @@ public class RocksDBVerifyReport {
     private final int missingStatusIndexCount;
     private final int missingTimeoutIndexCount;
     private final int missingTransactionIdIndexCount;
+    private final int invalidGlobalCount;
     private final int invalidBranchCount;
     private final int orphanBranchCount;
     private final int orphanLockCount;
@@ -67,6 +70,7 @@ public class RocksDBVerifyReport {
         this.missingStatusIndexCount = builder.missingStatusIndexCount;
         this.missingTimeoutIndexCount = builder.missingTimeoutIndexCount;
         this.missingTransactionIdIndexCount = builder.missingTransactionIdIndexCount;
+        this.invalidGlobalCount = builder.invalidGlobalCount;
         this.invalidBranchCount = builder.invalidBranchCount;
         this.orphanBranchCount = builder.orphanBranchCount;
         this.orphanLockCount = builder.orphanLockCount;
@@ -141,6 +145,10 @@ public class RocksDBVerifyReport {
         return missingTransactionIdIndexCount;
     }
 
+    public int getInvalidGlobalCount() {
+        return invalidGlobalCount;
+    }
+
     public int getInvalidBranchCount() {
         return invalidBranchCount;
     }
@@ -208,6 +216,7 @@ public class RocksDBVerifyReport {
         private int missingStatusIndexCount;
         private int missingTimeoutIndexCount;
         private int missingTransactionIdIndexCount;
+        private int invalidGlobalCount;
         private int invalidBranchCount;
         private int orphanBranchCount;
         private int orphanLockCount;
@@ -216,6 +225,7 @@ public class RocksDBVerifyReport {
         private int inconsistentCount;
         private int totalErrorCount;
         private final List<String> errorMessages = new ArrayList<>();
+        private final Map<Long, String> globalXidsByTransactionId = new HashMap<>();
 
         private Builder(RocksDBVerifyOptions options) {
             this.mode = options.getMode();
@@ -278,6 +288,18 @@ public class RocksDBVerifyReport {
         void invalidBranch(String message) {
             invalidBranchCount++;
             issue(message);
+        }
+
+        void invalidGlobal(String message) {
+            invalidGlobalCount++;
+            issue(message);
+        }
+
+        void globalTransactionId(long transactionId, String xid) {
+            String existingXid = globalXidsByTransactionId.putIfAbsent(transactionId, xid);
+            if (existingXid != null && !existingXid.equals(xid)) {
+                invalidGlobal("duplicate global transaction id:" + transactionId);
+            }
         }
 
         void orphanBranch(String message) {

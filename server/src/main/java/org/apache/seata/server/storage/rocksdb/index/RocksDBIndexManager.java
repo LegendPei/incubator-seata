@@ -29,8 +29,10 @@ import org.rocksdb.WriteBatch;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Consumer;
 
 /**
@@ -107,6 +109,43 @@ public class RocksDBIndexManager {
             storeEngine.write(metadataBatch);
         } catch (RocksDBException e) {
             throw new StoreException(e, "write RocksDB index metadata failed");
+        }
+    }
+
+    /**
+     * Atomically rebuild global secondary indexes after a bounded preflight scan.
+     */
+    public void rebuildFromGlobalSessionsAtomically(int maxRepairEntries) {
+        if (maxRepairEntries <= 0) {
+            throw new IllegalArgumentException("maxRepairEntries must be positive");
+        }
+        ensureRepairEntryLimit(maxRepairEntries);
+        try (WriteBatch batch = new WriteBatch()) {
+            storeEngine.deleteByPrefix(batch, RocksDBColumnFamily.GLOBAL_STATUS_INDEX, EMPTY_PREFIX);
+            storeEngine.deleteByPrefix(batch, RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX, EMPTY_PREFIX);
+            storeEngine.deleteByPrefix(batch, RocksDBColumnFamily.TRANSACTION_ID_INDEX, EMPTY_PREFIX);
+            Set<Long> transactionIds = new HashSet<>();
+            storeEngine.scanByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, EMPTY_PREFIX, (key, value) -> {
+                GlobalSession globalSession = decodeGlobalSession(value);
+                if (!Arrays.equals(key, RocksDBKeyCodec.encodeXid(globalSession.getXid()))) {
+                    throw new StoreException("global session key does not match payload xid:" + globalSession.getXid());
+                }
+                if (!transactionIds.add(globalSession.getTransactionId())) {
+                    throw new StoreException("duplicate global transaction id:" + globalSession.getTransactionId());
+                }
+                putGlobalIndexes(batch, globalSession);
+            });
+            batch.put(
+                    storeEngine.handle(RocksDBColumnFamily.METADATA),
+                    bytes(INDEX_VERSION_KEY),
+                    bytes(Integer.toString(INDEX_VERSION)));
+            batch.put(
+                    storeEngine.handle(RocksDBColumnFamily.METADATA),
+                    bytes(INDEX_BUILD_STATUS_KEY),
+                    bytes(INDEX_BUILD_STATUS_COMPLETED));
+            storeEngine.write(batch);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "write RocksDB rebuilt indexes failed");
         }
     }
 
@@ -370,6 +409,24 @@ public class RocksDBIndexManager {
         GlobalSession globalSession = new GlobalSession(null, null, null, 0, true);
         globalSession.decode(decodedValue.getPayload());
         return globalSession;
+    }
+
+    private void ensureRepairEntryLimit(int maxRepairEntries) {
+        int checkedEntries = 0;
+        for (RocksDBColumnFamily columnFamily : new RocksDBColumnFamily[] {
+            RocksDBColumnFamily.GLOBAL_SESSION,
+            RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+            RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+            RocksDBColumnFamily.TRANSACTION_ID_INDEX
+        }) {
+            int remaining = maxRepairEntries - checkedEntries;
+            RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
+                    columnFamily, EMPTY_PREFIX, EMPTY_PREFIX, remaining + 1, null, (key, value) -> {});
+            checkedEntries += stats.getRowsReturned();
+            if (checkedEntries > maxRepairEntries) {
+                throw new StoreException("RocksDB repair exceeds maxRepairEntries:" + maxRepairEntries);
+            }
+        }
     }
 
     private int parseIndexVersion(String version) {
