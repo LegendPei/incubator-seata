@@ -18,6 +18,7 @@ package org.apache.seata.server.storage.rocksdb.maintenance;
 
 import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
@@ -37,6 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Maintenance service for RocksDB file store engine.
@@ -49,6 +51,10 @@ public class RocksDBMaintenanceService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBMaintenanceService.class);
     private static final String CHECKPOINT_METADATA_FILE = "seata-checkpoint-metadata.txt";
+    private static final byte[] CLEAN_SHUTDOWN_KEY = "clean_shutdown".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_TRUE = "true".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_FALSE = "false".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] ORPHAN_LOCK_CLEAN_CURSOR_KEY = "orphan_lock_clean_cursor".getBytes(StandardCharsets.UTF_8);
     private static final byte[] EMPTY_PREFIX = new byte[0];
     private static final RocksDBColumnFamily[] VERIFY_COLUMN_FAMILIES = {
         RocksDBColumnFamily.GLOBAL_SESSION,
@@ -126,16 +132,17 @@ public class RocksDBMaintenanceService {
     public RocksDBVerifyReport verifyCurrentState(RocksDBVerifyOptions options) {
         RocksDBVerifyReport.Builder report = RocksDBVerifyReport.builder(options);
         verifyMetadata(report);
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(options.getDeadlineMillis());
         switch (options.getMode()) {
             case SAMPLE:
-                verifySample(options, report);
+                verifySample(deadlineNanos, options, report);
                 break;
             case PAGE:
-                verifyPage(options, report);
+                verifyPage(deadlineNanos, options, report);
                 break;
             case FULL:
             default:
-                verifyFull(report);
+                verifyFull(deadlineNanos, report);
                 break;
         }
         RocksDBVerifyReport result = report.build();
@@ -153,23 +160,39 @@ public class RocksDBMaintenanceService {
             report.error("format_version mismatch, expected:" + expected + ", found:"
                     + new String(versionBytes, StandardCharsets.UTF_8));
         }
+        byte[] cleanShutdown = storeEngine.get(RocksDBColumnFamily.METADATA, CLEAN_SHUTDOWN_KEY);
+        if (!Arrays.equals(cleanShutdown, CLEAN_SHUTDOWN_TRUE) && !Arrays.equals(cleanShutdown, CLEAN_SHUTDOWN_FALSE)) {
+            report.invalidMetadata("invalid clean_shutdown metadata");
+        }
+        byte[] orphanCleanupCursor = storeEngine.get(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY);
+        if (orphanCleanupCursor != null && !RocksDBKeyCodec.isValidLockBranchIndexSeekKey(orphanCleanupCursor)) {
+            report.invalidMetadata("invalid orphan lock cleanup cursor metadata");
+        }
     }
 
-    private void verifyFull(RocksDBVerifyReport.Builder report) {
+    private void verifyFull(long deadlineNanos, RocksDBVerifyReport.Builder report) {
         for (RocksDBColumnFamily columnFamily : VERIFY_COLUMN_FAMILIES) {
-            scanFamily(columnFamily, EMPTY_PREFIX, 0, report);
+            VerifyScanResult result = scanFamily(columnFamily, EMPTY_PREFIX, 0, deadlineNanos, report);
+            if (result.stats.isDeadlineReached()) {
+                truncate(report, columnFamily, result.lastKey, EMPTY_PREFIX);
+                return;
+            }
         }
         report.complete(true);
     }
 
-    private void verifySample(RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
+    private void verifySample(long deadlineNanos, RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
         for (RocksDBColumnFamily columnFamily : VERIFY_COLUMN_FAMILIES) {
-            scanFamily(columnFamily, EMPTY_PREFIX, options.getLimit(), report);
+            VerifyScanResult result = scanFamily(columnFamily, EMPTY_PREFIX, options.getLimit(), deadlineNanos, report);
+            if (result.stats.isDeadlineReached()) {
+                truncate(report, columnFamily, result.lastKey, EMPTY_PREFIX);
+                return;
+            }
         }
         report.complete(false);
     }
 
-    private void verifyPage(RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
+    private void verifyPage(long deadlineNanos, RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
         RocksDBVerifyCursor cursor = options.getCursor();
         int familyIndex = cursor == null ? 0 : familyIndex(cursor.getColumnFamily());
         int remaining = options.getLimit();
@@ -177,15 +200,15 @@ public class RocksDBMaintenanceService {
             RocksDBColumnFamily columnFamily = VERIFY_COLUMN_FAMILIES[i];
             byte[] seekKey =
                     cursor != null && cursor.getColumnFamily() == columnFamily ? cursor.getSeekKey() : EMPTY_PREFIX;
-            byte[][] lastKey = new byte[1][];
-            RocksDBStoreEngine.ScanStats stats =
-                    storeEngine.scanByPrefix(columnFamily, seekKey, EMPTY_PREFIX, remaining, null, (key, value) -> {
-                        lastKey[0] = key;
-                        verifyEntry(columnFamily, key, value, report);
-                    });
-            remaining -= stats.getRowsReturned();
-            if (remaining == 0 && lastKey[0] != null) {
-                report.nextCursor(new RocksDBVerifyCursor(columnFamily, nextSeekKey(lastKey[0])));
+            VerifyScanResult result = scanFamily(columnFamily, seekKey, remaining, deadlineNanos, report);
+            remaining -= result.stats.getRowsReturned();
+            if (result.stats.isDeadlineReached()) {
+                truncate(report, columnFamily, result.lastKey, seekKey);
+                return;
+            }
+            if (remaining == 0 && result.lastKey != null) {
+                report.truncated();
+                report.nextCursor(new RocksDBVerifyCursor(columnFamily, nextSeekKey(result.lastKey)));
                 report.complete(false);
                 return;
             }
@@ -194,15 +217,33 @@ public class RocksDBMaintenanceService {
         report.complete(true);
     }
 
-    private void scanFamily(
-            RocksDBColumnFamily columnFamily, byte[] seekKey, int limit, RocksDBVerifyReport.Builder report) {
-        storeEngine.scanByPrefix(
+    private VerifyScanResult scanFamily(
+            RocksDBColumnFamily columnFamily,
+            byte[] seekKey,
+            int limit,
+            long deadlineNanos,
+            RocksDBVerifyReport.Builder report) {
+        byte[][] lastKey = new byte[1][];
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
                 columnFamily,
                 seekKey,
                 EMPTY_PREFIX,
                 limit,
+                deadlineNanos,
                 null,
-                (key, value) -> verifyEntry(columnFamily, key, value, report));
+                (key, value) -> {
+                    lastKey[0] = key;
+                    verifyEntry(columnFamily, key, value, report);
+                });
+        report.scannedRecords(stats.getRowsScanned());
+        return new VerifyScanResult(stats, lastKey[0]);
+    }
+
+    private static void truncate(
+            RocksDBVerifyReport.Builder report, RocksDBColumnFamily columnFamily, byte[] lastKey, byte[] seekKey) {
+        report.truncated();
+        report.nextCursor(new RocksDBVerifyCursor(columnFamily, lastKey == null ? seekKey : nextSeekKey(lastKey)));
+        report.complete(false);
     }
 
     private void verifyEntry(
@@ -213,7 +254,7 @@ public class RocksDBMaintenanceService {
                 verifyGlobal(key, value, report);
                 break;
             case BRANCH_SESSION:
-                verifyBranch(key, report);
+                verifyBranch(key, value, report);
                 break;
             case LOCK:
                 verifyLock(key, value, report);
@@ -267,12 +308,23 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private void verifyBranch(byte[] key, RocksDBVerifyReport.Builder report) {
+    private void verifyBranch(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
         report.checkedBranch();
         String xid = RocksDBKeyCodec.extractXidFromBranchKey(key);
-        if (xid == null
-                || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid)) == null) {
+        long branchId = RocksDBKeyCodec.extractBranchIdFromBranchKey(key);
+        if (xid == null || branchId < 0) {
+            report.invalidBranch("invalid branch session key");
+            return;
+        }
+        if (storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid)) == null) {
             report.orphanBranch("orphan branch session, xid:" + xid);
+        }
+        BranchVerifyEntry branch = decodeBranch(value, report);
+        if (branch == null) {
+            return;
+        }
+        if (!xid.equals(branch.xid) || branchId != branch.branchId) {
+            report.invalidBranch("branch session payload does not match key, xid:" + xid + ", branchId:" + branchId);
         }
     }
 
@@ -283,6 +335,12 @@ public class RocksDBMaintenanceService {
                 || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null) {
             report.orphanLock("orphan or invalid lock holder");
             return;
+        }
+        if (storeEngine.get(
+                        RocksDBColumnFamily.BRANCH_SESSION,
+                        RocksDBKeyCodec.encodeBranch(lock.xid, lock.branchId))
+                == null) {
+            report.orphanLock("lock holder references missing branch session, xid:" + lock.xid);
         }
         byte[] indexValue = storeEngine.get(
                 RocksDBColumnFamily.LOCK_BRANCH_INDEX,
@@ -340,6 +398,10 @@ public class RocksDBMaintenanceService {
         LockVerifyEntry lock = decodeLock(lockValue);
         if (lock == null
                 || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null
+                || storeEngine.get(
+                                RocksDBColumnFamily.BRANCH_SESSION,
+                                RocksDBKeyCodec.encodeBranch(lock.xid, lock.branchId))
+                        == null
                 || !Arrays.equals(key, RocksDBKeyCodec.encodeLockBranchIndex(lock.xid, lock.branchId, lockKey))) {
             report.staleLockIndex("stale lock branch index");
         }
@@ -391,6 +453,21 @@ public class RocksDBMaintenanceService {
             long branchId = buffer.getLong();
             return xid == null ? null : new LockVerifyEntry(xid, branchId);
         } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static BranchVerifyEntry decodeBranch(byte[] value, RocksDBVerifyReport.Builder report) {
+        try {
+            RocksDBValueCodec.DecodedValue decoded = RocksDBValueCodec.decode(value);
+            if (decoded.getType() != RocksDBValueCodec.ValueType.BRANCH_SESSION) {
+                throw new StoreException("unexpected value type:" + decoded.getType());
+            }
+            BranchSession session = new BranchSession();
+            session.decode(decoded.getPayload());
+            return new BranchVerifyEntry(session.getXid(), session.getBranchId());
+        } catch (Exception e) {
+            report.invalidBranch("failed to decode branch session, message:" + e.getMessage());
             return null;
         }
     }
@@ -499,6 +576,26 @@ public class RocksDBMaintenanceService {
                 return Long.MAX_VALUE;
             }
             return beginTime + timeout;
+        }
+    }
+
+    private static final class BranchVerifyEntry {
+        final String xid;
+        final long branchId;
+
+        private BranchVerifyEntry(String xid, long branchId) {
+            this.xid = xid;
+            this.branchId = branchId;
+        }
+    }
+
+    private static final class VerifyScanResult {
+        final RocksDBStoreEngine.ScanStats stats;
+        final byte[] lastKey;
+
+        private VerifyScanResult(RocksDBStoreEngine.ScanStats stats, byte[] lastKey) {
+            this.stats = stats;
+            this.lastKey = lastKey;
         }
     }
 

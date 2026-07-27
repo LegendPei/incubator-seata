@@ -20,7 +20,10 @@ import org.apache.seata.common.Constants;
 import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
+import org.apache.seata.core.model.BranchStatus;
+import org.apache.seata.core.model.BranchType;
 import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
@@ -330,18 +333,83 @@ class RocksDBMaintenanceServiceTest {
     @Test
     void testVerifyDetectsOrphanBranch() {
         try (RocksDBStoreEngine engine = open("verify-orphan-branch")) {
-            // Write a branch session without a corresponding global session
-            byte[] branchKey = RocksDBKeyCodec.encodeBranch("xid-orphan", 1L);
-            byte[] branchValue = org.apache.seata.server.storage.rocksdb.RocksDBValueCodec.encode(
-                    org.apache.seata.server.storage.rocksdb.RocksDBValueCodec.ValueType.BRANCH_SESSION,
-                    "payload".getBytes(StandardCharsets.UTF_8));
-            engine.put(RocksDBColumnFamily.BRANCH_SESSION, branchKey, branchValue);
+            GlobalSession orphanGlobal = globalSession("xid-orphan", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine)
+                    .writeSession(LogOperation.BRANCH_ADD, branchSession(orphanGlobal, 1L));
 
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
-            RocksDBVerifyReport report = service.verifyCurrentState();
+            RocksDBVerifyReport full = service.verifyCurrentState();
+            RocksDBVerifyReport sample = service.verifyCurrentState(RocksDBVerifyOptions.sample(1, 10));
+
+            Assertions.assertFalse(full.isClean());
+            Assertions.assertFalse(sample.isClean());
+            Assertions.assertEquals(1, full.getOrphanBranchCount());
+            Assertions.assertEquals(1, sample.getOrphanBranchCount());
+        }
+    }
+
+    @Test
+    void testFullVerifyStopsAtDeadlineAndReturnsCursor() {
+        try (RocksDBStoreEngine engine = open("verify-full-deadline")) {
+            for (int i = 0; i < 300; i++) {
+                String xid = "deadline-" + i;
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                        RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, i, xid),
+                        xid.getBytes(StandardCharsets.UTF_8));
+            }
+
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine)
+                    .verifyCurrentState(RocksDBVerifyOptions.full(10, 0));
+
+            Assertions.assertFalse(report.isComplete());
+            Assertions.assertTrue(report.isTruncated());
+            Assertions.assertNotNull(report.getNextCursor());
+            Assertions.assertTrue(report.getScannedRecordCount() >= 256);
+            Assertions.assertTrue(report.getCheckedRecordCount() < 300);
+        }
+    }
+
+    @Test
+    void testPagedVerifyStopsAtDeadlineAndReturnsCursor() {
+        try (RocksDBStoreEngine engine = open("verify-page-deadline")) {
+            for (int i = 0; i < 300; i++) {
+                String xid = "deadline-page-" + i;
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                        RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, i, xid),
+                        xid.getBytes(StandardCharsets.UTF_8));
+            }
+
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine)
+                    .verifyCurrentState(RocksDBVerifyOptions.page(500, null, 10, 0));
+
+            Assertions.assertFalse(report.isComplete());
+            Assertions.assertTrue(report.isTruncated());
+            Assertions.assertNotNull(report.getNextCursor());
+            Assertions.assertTrue(report.getScannedRecordCount() >= 256);
+            Assertions.assertTrue(report.getCheckedRecordCount() < 300);
+        }
+    }
+
+    @Test
+    void testVerifyDetectsBranchPayloadKeyMismatch() {
+        try (RocksDBStoreEngine engine = open("verify-branch-key-mismatch")) {
+            GlobalSession global = globalSession("branch-key-mismatch", GlobalStatus.Begin);
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, global);
+            BranchSession branch = branchSession(global, 1L);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, branch);
+
+            byte[] validKey = RocksDBKeyCodec.encodeBranch(global.getXid(), branch.getBranchId());
+            byte[] payload = engine.get(RocksDBColumnFamily.BRANCH_SESSION, validKey);
+            engine.delete(RocksDBColumnFamily.BRANCH_SESSION, validKey);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch(global.getXid(), 2L), payload);
+
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
 
             Assertions.assertFalse(report.isClean());
-            Assertions.assertEquals(1, report.getOrphanBranchCount());
+            Assertions.assertEquals(1, report.getInvalidBranchCount());
         }
     }
 
@@ -383,12 +451,15 @@ class RocksDBMaintenanceServiceTest {
             GlobalSession global = globalSession("tx-lock", GlobalStatus.Begin);
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             storeManager.writeSession(LogOperation.GLOBAL_ADD, global);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(global, 1L));
 
             // Write consistent LOCK + LOCK_BRANCH_INDEX pair
             byte[] lockKey = RocksDBKeyCodec.encodeRowLock("resource", "table", "pk-1");
             byte[] lockValue =
                     encodeLockHolder(global.getXid(), global.getTransactionId(), 1L, "resource", "table", "pk-1");
             byte[] indexKey = RocksDBKeyCodec.encodeLockBranchIndex(global.getXid(), 1L, lockKey);
+            byte[] cleanupCursor = new byte[indexKey.length + 1];
+            System.arraycopy(indexKey, 0, cleanupCursor, 0, indexKey.length);
 
             try (WriteBatch batch = new WriteBatch()) {
                 engine.put(batch, RocksDBColumnFamily.LOCK, lockKey, lockValue);
@@ -397,12 +468,124 @@ class RocksDBMaintenanceServiceTest {
             } catch (Exception e) {
                 Assertions.fail(e);
             }
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    "orphan_lock_clean_cursor".getBytes(StandardCharsets.UTF_8),
+                    cleanupCursor);
 
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
             RocksDBVerifyReport report = service.verifyCurrentState();
 
             Assertions.assertTrue(report.isClean(), "expected clean state, got: " + report);
             Assertions.assertEquals(1, report.getCheckedLockCount());
+        }
+    }
+
+    @Test
+    void testVerifyDetectsLockWithoutBranchSession() throws Exception {
+        try (RocksDBStoreEngine engine = open("verify-lock-without-branch")) {
+            GlobalSession global = globalSession("lock-without-branch", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            byte[] lockKey = RocksDBKeyCodec.encodeRowLock("resource", "table", "pk-no-branch");
+            byte[] lockValue =
+                    encodeLockHolder(global.getXid(), global.getTransactionId(), 1L, "resource", "table", "pk-no-branch");
+            byte[] indexKey = RocksDBKeyCodec.encodeLockBranchIndex(global.getXid(), 1L, lockKey);
+            try (WriteBatch batch = new WriteBatch()) {
+                batch.put(engine.handle(RocksDBColumnFamily.LOCK), lockKey, lockValue);
+                batch.put(engine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexKey, lockKey);
+                engine.write(batch);
+            }
+
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
+
+            Assertions.assertFalse(report.isClean());
+            Assertions.assertEquals(1, report.getOrphanLockCount());
+            Assertions.assertEquals(1, report.getStaleLockIndexCount());
+        }
+    }
+
+    @Test
+    void testVerifyDetectsInvalidMaintenanceMetadata() {
+        try (RocksDBStoreEngine engine = open("verify-invalid-maintenance-metadata")) {
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    "clean_shutdown".getBytes(StandardCharsets.UTF_8),
+                    "unknown".getBytes(StandardCharsets.UTF_8));
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    "orphan_lock_clean_cursor".getBytes(StandardCharsets.UTF_8),
+                    new byte[] {1});
+
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
+
+            Assertions.assertFalse(report.isClean());
+            Assertions.assertEquals(2, report.getInvalidMetadataCount());
+        }
+    }
+
+    @Test
+    void testVerifyFaultInjectionMatrixIsDetectedByAllReadOnlyModes() throws Exception {
+        try (RocksDBStoreEngine engine = open("verify-fault-injection-matrix")) {
+            GlobalSession global = globalSession("verify-fault-injection", GlobalStatus.Begin);
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, global);
+            engine.delete(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(
+                            global.getStatus(), global.getBeginTime(), global.getXid()));
+            engine.put(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId()),
+                    "wrong-xid".getBytes(StandardCharsets.UTF_8));
+
+            BranchSession branch = branchSession(global, 1L);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, branch);
+            byte[] validBranchKey = RocksDBKeyCodec.encodeBranch(global.getXid(), branch.getBranchId());
+            byte[] branchPayload = engine.get(RocksDBColumnFamily.BRANCH_SESSION, validBranchKey);
+            engine.delete(RocksDBColumnFamily.BRANCH_SESSION, validBranchKey);
+            engine.put(
+                    RocksDBColumnFamily.BRANCH_SESSION,
+                    RocksDBKeyCodec.encodeBranch(global.getXid(), 2L),
+                    branchPayload);
+
+            byte[] lockKey = RocksDBKeyCodec.encodeRowLock("resource", "table", "pk-matrix");
+            byte[] lockValue =
+                    encodeLockHolder(global.getXid(), global.getTransactionId(), 3L, "resource", "table", "pk-matrix");
+            byte[] lockIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(global.getXid(), 3L, lockKey);
+            try (WriteBatch batch = new WriteBatch()) {
+                batch.put(engine.handle(RocksDBColumnFamily.LOCK), lockKey, lockValue);
+                batch.put(engine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), lockIndexKey, lockKey);
+                engine.write(batch);
+            }
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    "clean_shutdown".getBytes(StandardCharsets.UTF_8),
+                    "unknown".getBytes(StandardCharsets.UTF_8));
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    "orphan_lock_clean_cursor".getBytes(StandardCharsets.UTF_8),
+                    new byte[] {1});
+
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBVerifyReport full = service.verifyCurrentState();
+            RocksDBVerifyReport sample = service.verifyCurrentState(RocksDBVerifyOptions.sample(1, 20));
+            RocksDBVerifyReport page = service.verifyCurrentState(RocksDBVerifyOptions.page(100, null, 20));
+
+            Assertions.assertFalse(full.isClean());
+            Assertions.assertFalse(sample.isClean());
+            Assertions.assertFalse(page.isClean());
+            Assertions.assertEquals(1, sample.getMissingStatusIndexCount());
+            Assertions.assertEquals(1, sample.getInvalidBranchCount());
+            Assertions.assertEquals(1, sample.getOrphanLockCount());
+            Assertions.assertEquals(1, sample.getStaleLockIndexCount());
+            Assertions.assertEquals(2, sample.getInvalidMetadataCount());
+            Assertions.assertEquals(sample.getInconsistentCount(), page.getInconsistentCount());
+            System.out.println("R6_VERIFY_RESULT fullViolations=" + full.getInconsistentCount()
+                    + " sampleViolations=" + sample.getInconsistentCount() + " pageViolations="
+                    + page.getInconsistentCount() + " missingStatus=" + sample.getMissingStatusIndexCount()
+                    + " invalidBranch=" + sample.getInvalidBranchCount() + " orphanLock="
+                    + sample.getOrphanLockCount() + " staleLockIndex=" + sample.getStaleLockIndexCount()
+                    + " invalidMetadata=" + sample.getInvalidMetadataCount());
         }
     }
 
@@ -533,6 +716,17 @@ class RocksDBMaintenanceServiceTest {
         GlobalSession globalSession = new GlobalSession("app", "group", name, 60000);
         globalSession.setStatus(status);
         return globalSession;
+    }
+
+    private BranchSession branchSession(GlobalSession globalSession, long branchId) {
+        BranchSession branchSession = new BranchSession(BranchType.AT);
+        branchSession.setXid(globalSession.getXid());
+        branchSession.setTransactionId(globalSession.getTransactionId());
+        branchSession.setBranchId(branchId);
+        branchSession.setStatus(BranchStatus.Registered);
+        branchSession.setResourceId("jdbc:mysql://127.0.0.1/db");
+        branchSession.setLockKey("t_order:1");
+        return branchSession;
     }
 
     private byte[] encodeLockHolder(
