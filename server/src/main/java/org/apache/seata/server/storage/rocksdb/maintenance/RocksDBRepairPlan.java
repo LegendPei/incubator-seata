@@ -26,7 +26,8 @@ import java.util.Set;
 public final class RocksDBRepairPlan {
 
     public enum Action {
-        REBUILD_GLOBAL_SECONDARY_INDEXES
+        REBUILD_GLOBAL_SECONDARY_INDEXES,
+        DELETE_STALE_LOCK_BRANCH_INDEXES
     }
 
     private final boolean dryRun;

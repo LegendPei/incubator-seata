@@ -20,11 +20,20 @@ package org.apache.seata.server.storage.rocksdb.maintenance;
  * Result of a controlled RocksDB repair attempt.
  */
 public final class RocksDBRepairReport {
+    public enum State {
+        DRY_RUN,
+        COMPLETED,
+        PAUSED,
+        STOPPED
+    }
 
     private final boolean dryRun;
     private final int executedActionCount;
     private final RocksDBVerifyReport beforeVerifyReport;
     private final RocksDBVerifyReport afterVerifyReport;
+    private final State state;
+    private final int deletedLockIndexCount;
+    private final byte[] nextSeekKey;
 
     RocksDBRepairReport(
             boolean dryRun,
@@ -35,6 +44,23 @@ public final class RocksDBRepairReport {
         this.executedActionCount = executedActionCount;
         this.beforeVerifyReport = beforeVerifyReport;
         this.afterVerifyReport = afterVerifyReport;
+        this.state = dryRun ? State.DRY_RUN : State.COMPLETED;
+        this.deletedLockIndexCount = 0;
+        this.nextSeekKey = null;
+    }
+    RocksDBRepairReport(
+            State state,
+            int deletedLockIndexCount,
+            byte[] nextSeekKey,
+            RocksDBVerifyReport beforeVerifyReport,
+            RocksDBVerifyReport afterVerifyReport) {
+        this.dryRun = false;
+        this.executedActionCount = state == State.DRY_RUN ? 0 : 1;
+        this.beforeVerifyReport = beforeVerifyReport;
+        this.afterVerifyReport = afterVerifyReport;
+        this.state = state;
+        this.deletedLockIndexCount = deletedLockIndexCount;
+        this.nextSeekKey = nextSeekKey == null ? null : java.util.Arrays.copyOf(nextSeekKey, nextSeekKey.length);
     }
 
     public boolean isDryRun() {
@@ -51,5 +77,16 @@ public final class RocksDBRepairReport {
 
     public RocksDBVerifyReport getAfterVerifyReport() {
         return afterVerifyReport;
+    }
+    public State getState() {
+        return state;
+    }
+
+    public int getDeletedLockIndexCount() {
+        return deletedLockIndexCount;
+    }
+
+    public byte[] getNextSeekKey() {
+        return nextSeekKey == null ? null : java.util.Arrays.copyOf(nextSeekKey, nextSeekKey.length);
     }
 }

@@ -29,6 +29,10 @@ public final class RocksDBRepairOptions {
     private final boolean maintenanceMode;
     private final long verifyDeadlineMillis;
     private final int maxRepairEntries;
+    private final String lockIndexRunId;
+    private final int lockIndexBatchLimit;
+    private final int maxLockIndexBatches;
+    private final long lockIndexRoundSleepMillis;
 
     private RocksDBRepairOptions(Builder builder) {
         this.dryRun = builder.dryRun;
@@ -36,6 +40,10 @@ public final class RocksDBRepairOptions {
         this.maintenanceMode = builder.maintenanceMode;
         this.verifyDeadlineMillis = builder.verifyDeadlineMillis;
         this.maxRepairEntries = builder.maxRepairEntries;
+        this.lockIndexRunId = builder.lockIndexRunId;
+        this.lockIndexBatchLimit = builder.lockIndexBatchLimit;
+        this.maxLockIndexBatches = builder.maxLockIndexBatches;
+        this.lockIndexRoundSleepMillis = builder.lockIndexRoundSleepMillis;
     }
 
     public static RocksDBRepairOptions defaults() {
@@ -65,6 +73,21 @@ public final class RocksDBRepairOptions {
     public int getMaxRepairEntries() {
         return maxRepairEntries;
     }
+    public String getLockIndexRunId() {
+        return lockIndexRunId;
+    }
+
+    public int getLockIndexBatchLimit() {
+        return lockIndexBatchLimit;
+    }
+
+    public int getMaxLockIndexBatches() {
+        return maxLockIndexBatches;
+    }
+
+    public long getLockIndexRoundSleepMillis() {
+        return lockIndexRoundSleepMillis;
+    }
 
     public static final class Builder {
         private boolean dryRun = true;
@@ -72,6 +95,10 @@ public final class RocksDBRepairOptions {
         private boolean maintenanceMode;
         private long verifyDeadlineMillis = DEFAULT_VERIFY_DEADLINE_MILLIS;
         private int maxRepairEntries = DEFAULT_MAX_REPAIR_ENTRIES;
+        private String lockIndexRunId;
+        private int lockIndexBatchLimit = 100;
+        private int maxLockIndexBatches = 1;
+        private long lockIndexRoundSleepMillis;
 
         private Builder() {}
 
@@ -103,6 +130,34 @@ public final class RocksDBRepairOptions {
                 throw new IllegalArgumentException("maxRepairEntries must be positive");
             }
             this.maxRepairEntries = maxRepairEntries;
+            return this;
+        }
+        public Builder lockIndexRunId(String lockIndexRunId) {
+            this.lockIndexRunId = lockIndexRunId;
+            return this;
+        }
+
+        public Builder lockIndexBatchLimit(int lockIndexBatchLimit) {
+            if (lockIndexBatchLimit <= 0) {
+                throw new IllegalArgumentException("lockIndexBatchLimit must be positive");
+            }
+            this.lockIndexBatchLimit = lockIndexBatchLimit;
+            return this;
+        }
+
+        public Builder maxLockIndexBatches(int maxLockIndexBatches) {
+            if (maxLockIndexBatches <= 0) {
+                throw new IllegalArgumentException("maxLockIndexBatches must be positive");
+            }
+            this.maxLockIndexBatches = maxLockIndexBatches;
+            return this;
+        }
+
+        public Builder lockIndexRoundSleepMillis(long lockIndexRoundSleepMillis) {
+            if (lockIndexRoundSleepMillis < 0) {
+                throw new IllegalArgumentException("lockIndexRoundSleepMillis must be non-negative");
+            }
+            this.lockIndexRoundSleepMillis = lockIndexRoundSleepMillis;
             return this;
         }
 

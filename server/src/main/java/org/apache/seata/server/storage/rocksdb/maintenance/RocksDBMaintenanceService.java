@@ -27,6 +27,8 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.RocksDBValueCodec;
 import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
 import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,6 +39,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.Objects;
@@ -58,6 +61,7 @@ public class RocksDBMaintenanceService {
     private static final byte[] CLEAN_SHUTDOWN_TRUE = "true".getBytes(StandardCharsets.UTF_8);
     private static final byte[] CLEAN_SHUTDOWN_FALSE = "false".getBytes(StandardCharsets.UTF_8);
     private static final byte[] ORPHAN_LOCK_CLEAN_CURSOR_KEY = "orphan_lock_clean_cursor".getBytes(StandardCharsets.UTF_8);
+    static final byte[] LOCK_INDEX_REPAIR_PROGRESS_KEY = "rocksdb.repair.lock_branch_index.v1".getBytes(StandardCharsets.UTF_8);
     private static final byte[] EMPTY_PREFIX = new byte[0];
     private static final RocksDBColumnFamily[] VERIFY_COLUMN_FAMILIES = {
         RocksDBColumnFamily.GLOBAL_SESSION,
@@ -471,7 +475,9 @@ public class RocksDBMaintenanceService {
             session.decode(decoded.getPayload());
             return new BranchVerifyEntry(session.getXid(), session.getBranchId());
         } catch (Exception e) {
-            report.invalidBranch("failed to decode branch session, message:" + e.getMessage());
+            if (report != null) {
+                report.invalidBranch("failed to decode branch session, message:" + e.getMessage());
+            }
             return null;
         }
     }
@@ -531,6 +537,9 @@ public class RocksDBMaintenanceService {
         if (requiresGlobalSecondaryIndexRebuild(beforeVerifyReport)) {
             actions.add(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES);
         }
+        if (beforeVerifyReport.getStaleLockIndexCount() > 0) {
+            actions.add(RocksDBRepairPlan.Action.DELETE_STALE_LOCK_BRANCH_INDEXES);
+        }
         return new RocksDBRepairPlan(
                 options.isDryRun(),
                 actions,
@@ -554,7 +563,186 @@ public class RocksDBMaintenanceService {
         if (!plan.isVerificationComplete()) {
             throw new StoreException("RocksDB repair requires a complete verification plan");
         }
+        boolean hasLockIndexRepairProgress = hasLockIndexRepairProgress();
+        if (plan.hasAction(RocksDBRepairPlan.Action.DELETE_STALE_LOCK_BRANCH_INDEXES) || hasLockIndexRepairProgress) {
+            if (plan.hasAction(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES)) {
+                throw new StoreException("lock index repair must run separately from global secondary index rebuild");
+            }
+            return executeLockIndexRepair(options);
+        }
         return storeEngine.withMaintenanceLock(() -> executeRepairInMaintenanceWindow(plan, options));
+    }
+
+    private RocksDBRepairReport executeLockIndexRepair(RocksDBRepairOptions options) {
+        if (options.getLockIndexRunId() == null || options.getLockIndexRunId().isEmpty()) {
+            throw new StoreException("lock index repair requires lockIndexRunId");
+        }
+        RocksDBVerifyReport before = verifyCurrentState();
+        RocksDBLockIndexRepairProgress saved = loadLockIndexProgress(options.getLockIndexRunId());
+        byte[] cursor = saved == null ? null : saved.cursor;
+        int deleted = saved == null ? 0 : saved.deleted;
+        if (hasUnrepairableSourceViolation(before)) {
+            final byte[] stoppedCursor = cursor;
+            final int stoppedDeleted = deleted;
+            storeEngine.withMaintenanceLock(() -> {
+                stopLockIndexRepair(
+                        options.getLockIndexRunId(), stoppedCursor == null ? EMPTY_PREFIX : stoppedCursor, stoppedDeleted);
+                return null;
+            });
+            return new RocksDBRepairReport(RocksDBRepairReport.State.STOPPED, deleted, cursor, before, before);
+        }
+        for (int i = 0; i < options.getMaxLockIndexBatches(); i++) {
+            final byte[] batchCursor = cursor;
+            final int batchDeleted = deleted;
+            LockIndexBatchResult result = storeEngine.withMaintenanceLock(
+                    () -> repairOneLockIndexBatch(
+                            batchCursor,
+                            options.getLockIndexBatchLimit(),
+                            options.getLockIndexRunId(),
+                            batchDeleted,
+                            options.getVerifyDeadlineMillis()));
+            cursor = result.cursor;
+            deleted = result.deleted;
+            if (result.stopped) {
+                return new RocksDBRepairReport(
+                        RocksDBRepairReport.State.STOPPED, deleted, cursor, before, verifyCurrentState());
+            }
+            if (cursor == null) {
+                return new RocksDBRepairReport(
+                        RocksDBRepairReport.State.COMPLETED, deleted, null, before, verifyCurrentState());
+            }
+            if (i + 1 < options.getMaxLockIndexBatches()) {
+                sleepBetweenLockIndexBatches(options.getLockIndexRoundSleepMillis());
+            }
+        }
+        return new RocksDBRepairReport(RocksDBRepairReport.State.PAUSED, deleted, cursor, before, verifyCurrentState());
+    }
+
+    private RocksDBLockIndexRepairProgress loadLockIndexProgress(String runId) {
+        byte[] raw = storeEngine.get(RocksDBColumnFamily.METADATA, LOCK_INDEX_REPAIR_PROGRESS_KEY);
+        if (raw == null) return null;
+        RocksDBLockIndexRepairProgress progress;
+        try {
+            progress = RocksDBLockIndexRepairProgress.decode(raw);
+        } catch (IllegalArgumentException e) {
+            throw new StoreException(e, "invalid persisted lock index repair progress");
+        }
+        if (progress.state == RocksDBLockIndexRepairProgress.State.STOPPED || !runId.equals(progress.runId)) {
+            throw new StoreException("lock index repair cannot resume persisted run");
+        }
+        return progress;
+    }
+
+    private boolean hasLockIndexRepairProgress() {
+        return storeEngine.get(RocksDBColumnFamily.METADATA, LOCK_INDEX_REPAIR_PROGRESS_KEY) != null;
+    }
+
+    private LockIndexBatchResult repairOneLockIndexBatch(
+            byte[] cursor, int limit, String runId, int deletedBefore, long verifyDeadlineMillis) {
+        byte[] seek = cursor == null ? EMPTY_PREFIX : cursor;
+        RocksDBVerifyReport pageBefore = verifyCurrentState(RocksDBVerifyOptions.page(
+                limit,
+                new RocksDBVerifyCursor(RocksDBColumnFamily.LOCK_BRANCH_INDEX, seek),
+                100,
+                verifyDeadlineMillis));
+        ArrayList<RocksDBStoreEngine.RocksDBEntry> entries = new ArrayList<>();
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
+                RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                seek,
+                EMPTY_PREFIX,
+                limit,
+                null,
+                (key, value) -> entries.add(new RocksDBStoreEngine.RocksDBEntry(key, value)));
+        if (entries.isEmpty()) {
+            storeEngine.delete(RocksDBColumnFamily.METADATA, LOCK_INDEX_REPAIR_PROGRESS_KEY);
+            return new LockIndexBatchResult(null, deletedBefore, false);
+        }
+        byte[] next = stats.isLimitReached() ? nextSeekKey(entries.get(entries.size() - 1).getKey()) : null;
+        ArrayList<byte[]> deletions = new ArrayList<>();
+        for (RocksDBStoreEngine.RocksDBEntry entry : entries) {
+            Boolean deletable = isDeletableStaleLockIndex(entry.getKey(), entry.getValue());
+            if (deletable == null) {
+                stopLockIndexRepair(runId, seek, deletedBefore);
+                return new LockIndexBatchResult(seek, deletedBefore, true);
+            }
+            if (deletable) deletions.add(entry.getKey());
+        }
+        int deleted = deletedBefore + deletions.size();
+        try (WriteBatch batch = new WriteBatch()) {
+            for (byte[] key : deletions) batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), key);
+            if (next == null) batch.delete(storeEngine.handle(RocksDBColumnFamily.METADATA), LOCK_INDEX_REPAIR_PROGRESS_KEY);
+            else batch.put(storeEngine.handle(RocksDBColumnFamily.METADATA), LOCK_INDEX_REPAIR_PROGRESS_KEY,
+                    new RocksDBLockIndexRepairProgress(RocksDBLockIndexRepairProgress.State.PAUSED, runId, next, deleted).encode());
+            storeEngine.write(batch);
+        } catch (RocksDBException e) { throw new StoreException(e, "write lock index repair batch failed"); }
+        RocksDBVerifyReport pageAfter = verifyCurrentState(RocksDBVerifyOptions.page(
+                limit,
+                new RocksDBVerifyCursor(RocksDBColumnFamily.LOCK_BRANCH_INDEX, seek),
+                100,
+                verifyDeadlineMillis));
+        if (pageAfter.getInconsistentCount() > pageBefore.getInconsistentCount()) {
+            stopLockIndexRepair(runId, next, deleted);
+            return new LockIndexBatchResult(next, deleted, true);
+        }
+        return new LockIndexBatchResult(next, deleted, false);
+    }
+
+    private Boolean isDeletableStaleLockIndex(byte[] indexKey, byte[] lockKey) {
+        byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
+        if (lockValue == null) return Boolean.TRUE;
+        LockVerifyEntry lock = decodeLock(lockValue);
+        if (lock == null || !hasValidLockSource(lock)) return null;
+        byte[] expected = RocksDBKeyCodec.encodeLockBranchIndex(lock.xid, lock.branchId, lockKey);
+        if (Arrays.equals(indexKey, expected)) return Boolean.FALSE;
+        return Arrays.equals(lockKey, storeEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, expected)) ? Boolean.TRUE : null;
+    }
+
+    private boolean hasValidLockSource(LockVerifyEntry lock) {
+        byte[] globalValue = storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid));
+        GlobalVerifyEntry global = decodeGlobal(globalValue, null, "global session");
+        if (global == null || !lock.xid.equals(global.xid)) {
+            return false;
+        }
+        byte[] branchValue = storeEngine.get(
+                RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch(lock.xid, lock.branchId));
+        BranchVerifyEntry branch = decodeBranch(branchValue, null);
+        return branch != null && lock.xid.equals(branch.xid) && lock.branchId == branch.branchId;
+    }
+
+    private void stopLockIndexRepair(String runId, byte[] cursor, int deleted) {
+        storeEngine.put(
+                RocksDBColumnFamily.METADATA,
+                LOCK_INDEX_REPAIR_PROGRESS_KEY,
+                new RocksDBLockIndexRepairProgress(
+                                RocksDBLockIndexRepairProgress.State.STOPPED,
+                                runId,
+                                cursor == null || cursor.length == 0 ? null : cursor,
+                                deleted)
+                        .encode());
+    }
+
+    private static void sleepBetweenLockIndexBatches(long sleepMillis) {
+        if (sleepMillis == 0) {
+            return;
+        }
+        try {
+            Thread.sleep(sleepMillis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new StoreException(e, "lock index repair interrupted between batches");
+        }
+    }
+
+    private static final class LockIndexBatchResult {
+        final byte[] cursor;
+        final int deleted;
+        final boolean stopped;
+
+        private LockIndexBatchResult(byte[] cursor, int deleted, boolean stopped) {
+            this.cursor = cursor;
+            this.deleted = deleted;
+            this.stopped = stopped;
+        }
     }
 
     private RocksDBRepairReport executeRepairInMaintenanceWindow(
