@@ -23,6 +23,8 @@ import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.session.GlobalSession;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
+import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncMode;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
@@ -33,6 +35,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
@@ -53,6 +56,96 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals(300000L, RocksDBCrashRecoveryHarness.checkpointTimeoutMillis(options));
         Assertions.assertEquals(
                 300000L, RocksDBCrashRecoveryHarness.checkpointTimeoutMillis(Collections.<String, String>emptyMap()));
+    }
+
+    @Test
+    void testCrashHarnessBuildsPeriodicWalConfigFromOptions() throws Exception {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("syncWrite", "false");
+        options.put("walSyncMode", "periodic");
+        options.put("walSyncIntervalMillis", "100");
+        options.put("walSyncWriteThreshold", "10");
+
+        RocksDBStoreConfig config = RocksDBCrashRecoveryHarness.storeConfig(Files.createTempDirectory("r8-wal"), options);
+
+        Assertions.assertFalse(config.isSyncWrite());
+        Assertions.assertEquals(RocksDBWalSyncMode.PERIODIC, config.getWalSyncMode());
+        Assertions.assertEquals(100, config.getWalSyncIntervalMillis());
+        Assertions.assertEquals(10L, config.getWalSyncWriteThreshold());
+    }
+
+    @Test
+    void testCrashHarnessForwardsWarmupOptionToWriter() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("warmupWrites", "2");
+        options.put("syncWrite", "false");
+        options.put("walSyncMode", "periodic");
+        options.put("walSyncIntervalMillis", "100");
+        options.put("walSyncWriteThreshold", "10");
+        options.put("checkpointPolicy", "afterSync");
+        options.put("checkpointSyncTimeoutMillis", "5000");
+
+        List<String> arguments = RocksDBCrashRecoveryHarness.writerArguments(
+                Paths.get("db"), Paths.get("checkpoint"), options);
+
+        Assertions.assertTrue(arguments.contains("--warmupWrites=2"));
+        Assertions.assertTrue(arguments.contains("--syncWrite=false"));
+        Assertions.assertTrue(arguments.contains("--walSyncMode=periodic"));
+        Assertions.assertTrue(arguments.contains("--walSyncIntervalMillis=100"));
+        Assertions.assertTrue(arguments.contains("--walSyncWriteThreshold=10"));
+        Assertions.assertTrue(arguments.contains("--checkpointPolicy=afterSync"));
+        Assertions.assertTrue(arguments.contains("--checkpointSyncTimeoutMillis=5000"));
+    }
+
+    @Test
+    void testCrashHarnessRejectsAfterSyncWithoutDurabilityMechanism() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("syncWrite", "false");
+        options.put("walSyncMode", "none");
+        options.put("checkpointPolicy", "afterSync");
+
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+
+        options.remove("checkpointPolicy");
+        options.put("warmupWrites", "1");
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+    }
+
+    @Test
+    void testCrashHarnessRequiresExactRecoveryForDurableCheckpoint() {
+        Map<String, String> syncWrite = new LinkedHashMap<>();
+        syncWrite.put("syncWrite", "true");
+        Map<String, String> afterSync = new LinkedHashMap<>();
+        afterSync.put("syncWrite", "false");
+        afterSync.put("walSyncMode", "periodic");
+        afterSync.put("checkpointPolicy", "afterSync");
+        Map<String, String> asyncBeforeSync = new LinkedHashMap<>();
+        asyncBeforeSync.put("syncWrite", "false");
+        asyncBeforeSync.put("walSyncMode", "periodic");
+
+        Assertions.assertTrue(RocksDBCrashRecoveryHarness.requiresExactRecovery(syncWrite));
+        Assertions.assertTrue(RocksDBCrashRecoveryHarness.requiresExactRecovery(afterSync));
+        Assertions.assertFalse(RocksDBCrashRecoveryHarness.requiresExactRecovery(asyncBeforeSync));
+    }
+
+    @Test
+    void testCrashHarnessRejectsInvalidCheckpointBounds() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("count", "5");
+        options.put("checkpointAfter", "6");
+
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+
+        options.put("checkpointAfter", "0");
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
     }
 
     @Test

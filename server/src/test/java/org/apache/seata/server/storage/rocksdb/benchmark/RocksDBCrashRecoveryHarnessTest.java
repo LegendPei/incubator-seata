@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 class RocksDBCrashRecoveryHarnessTest {
@@ -35,12 +36,36 @@ class RocksDBCrashRecoveryHarnessTest {
         Path dbPath = tempDir.resolve("clean");
 
         RocksDBCrashRecoveryHarness.main(new String[] {
-            "--mode=clean", "--dbPath=" + dbPath, "--count=3", "--syncWrite=true"
+            "--mode=clean", "--dbPath=" + dbPath, "--warmupWrites=2", "--count=3", "--syncWrite=true"
         });
 
         try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(new RocksDBStoreConfig(dbPath.toString(), true))) {
             Assertions.assertTrue(engine.wasLastShutdownClean());
-            Assertions.assertEquals(3, engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]).size());
+            Assertions.assertEquals(5, engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]).size());
         }
+    }
+
+    @Test
+    void testPeriodicAfterSyncCrashRecovery() throws Exception {
+        Path dbPath = tempDir.resolve("periodic");
+        Path checkpoint = tempDir.resolve("periodic.checkpoint");
+
+        RocksDBCrashRecoveryHarness.main(new String[] {
+            "--mode=parent",
+            "--dbPath=" + dbPath,
+            "--checkpoint=" + checkpoint,
+            "--warmupWrites=1",
+            "--count=1",
+            "--checkpointAfter=1",
+            "--syncWrite=false",
+            "--walSyncMode=periodic",
+            "--walSyncIntervalMillis=10",
+            "--walSyncWriteThreshold=100000",
+            "--checkpointPolicy=afterSync",
+            "--checkpointTimeoutMillis=30000",
+            "--checkpointSyncTimeoutMillis=30000"
+        });
+
+        Assertions.assertTrue(Files.exists(checkpoint));
     }
 }
