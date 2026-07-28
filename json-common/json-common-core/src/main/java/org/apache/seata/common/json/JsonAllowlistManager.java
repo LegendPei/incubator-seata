@@ -31,6 +31,9 @@ public class JsonAllowlistManager {
 
     private static final int MAX_REPORTED_CLASS_NAME_LENGTH = 256;
 
+    /**
+     * Caps memory used by positive allowlist checks. Once full, new allowed classes are still accepted but not cached.
+     */
     private static final int MAX_CACHE_SIZE = 4096;
 
     /**

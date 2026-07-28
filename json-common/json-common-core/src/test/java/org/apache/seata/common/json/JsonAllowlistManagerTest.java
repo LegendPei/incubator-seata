@@ -371,9 +371,10 @@ public class JsonAllowlistManagerTest {
     public void testAllowedClassCacheIsBounded() {
         JsonAllowlistManager manager = JsonAllowlistManager.getInstance();
         manager.clearUserAllowlist();
+        manager.addUserPrefix("com.allowed.generated.");
 
         for (int i = 0; i < 5000; i++) {
-            assertThat(manager.isAllowed("org.apache.seata.generated.AllowedClass" + i))
+            assertThat(manager.isAllowed("com.allowed.generated.AllowedClass" + i))
                     .isTrue();
         }
 
