@@ -20,18 +20,21 @@ import com.alibaba.fastjson2.JSONB;
 import com.alibaba.fastjson2.JSONReader;
 import com.alibaba.fastjson2.JSONWriter;
 import org.apache.seata.common.executor.Initialize;
+import org.apache.seata.common.json.Fastjson2ObjectReaderWarmup;
 import org.apache.seata.common.loader.LoadLevel;
+import org.apache.seata.rm.datasource.sql.struct.Field;
+import org.apache.seata.rm.datasource.sql.struct.Row;
+import org.apache.seata.rm.datasource.sql.struct.TableRecords;
 import org.apache.seata.rm.datasource.undo.BranchUndoLog;
+import org.apache.seata.rm.datasource.undo.SQLUndoLog;
 import org.apache.seata.rm.datasource.undo.UndoLogParser;
+import org.apache.seata.sqlparser.SQLType;
 
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.ArrayList;
 
 @LoadLevel(name = Fastjson2UndoLogParser.NAME)
 public class Fastjson2UndoLogParser implements UndoLogParser, Initialize {
     public static final String NAME = "fastjson2";
-
-    private static final Lock PARSE_LOCK = new ReentrantLock();
 
     private JSONReader.Feature[] jsonReaderFeature;
     private JSONWriter.Feature[] jsonWriterFeature;
@@ -59,6 +62,16 @@ public class Fastjson2UndoLogParser implements UndoLogParser, Initialize {
             JSONWriter.Feature.WriteNameAsSymbol
         };
 
+        Fastjson2ObjectReaderWarmup.warmup(
+                Object.class,
+                ArrayList.class,
+                BranchUndoLog.class,
+                SQLUndoLog.class,
+                SQLType.class,
+                TableRecords.class,
+                Row.class,
+                Field.class);
+
         // SerialArray support: Fastjson2 with FieldBased and SupportAutoType features
         // can handle SerialArray serialization automatically through field access
     }
@@ -80,13 +93,6 @@ public class Fastjson2UndoLogParser implements UndoLogParser, Initialize {
 
     @Override
     public BranchUndoLog decode(byte[] bytes) {
-        // JSONB initializes readers in the shared provider lazily. The lock prevents $ref fields from being lost
-        // when fastjson2 initializes readers concurrently.
-        PARSE_LOCK.lock();
-        try {
-            return JSONB.parseObject(bytes, BranchUndoLog.class, jsonReaderFeature);
-        } finally {
-            PARSE_LOCK.unlock();
-        }
+        return JSONB.parseObject(bytes, BranchUndoLog.class, jsonReaderFeature);
     }
 }

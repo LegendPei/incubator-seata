@@ -16,46 +16,44 @@
  */
 package org.apache.seata.serializer.fastjson2;
 
-import com.alibaba.fastjson2.JSONFactory;
-import com.alibaba.fastjson2.reader.ObjectReaderProvider;
+import org.apache.seata.common.executor.Initialize;
 import org.apache.seata.core.protocol.AbstractMessage;
 import org.apache.seata.core.protocol.BatchResultMessage;
 import org.apache.seata.core.protocol.MergedWarpMessage;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Field;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.assertj.core.api.Assertions.assertThat;
-
 public class Fastjson2ConcurrentRefDeserializationTest {
 
     private static final long CONCURRENT_TEST_TIMEOUT_SECONDS = 30;
 
-    private final Fastjson2Serializer serializer = new Fastjson2Serializer();
-
-    @Test
-    public void deserializeReferenceHeavyProtocolMessageDoesNotDropRefFields() {
-        byte[] bytes = serializer.serialize(referenceHeavyMessage());
-
-        assertThat(countNullRefFields(serializer.deserialize(bytes))).isZero();
-    }
-
     @Test
     public void concurrentDeserializeReferenceHeavyProtocolMessageDoesNotDropRefFields() throws Exception {
+        int rounds = Integer.getInteger("seata.fastjson2.concurrentRef.rounds", 3);
+        for (int round = 0; round < rounds; round++) {
+            assertChildProcessSucceeds();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Fastjson2Serializer serializer = new Fastjson2Serializer();
+        ((Initialize) serializer).init();
         byte[] bytes = serializer.serialize(referenceHeavyMessage());
-        assertThat(countNullRefFields(serializer.deserialize(bytes))).isZero();
 
-        int nullTasks = runConcurrentStress(() -> countNullRefFields(serializer.deserialize(bytes)));
-
-        assertThat(nullTasks).isZero();
+        int nullTasks = runConcurrentStress(
+                serializer, bytes, Integer.getInteger("seata.fastjson2.concurrentRef.threads", 200));
+        if (nullTasks > 0) {
+            throw new AssertionError("Concurrent deserialization dropped $ref fields: " + nullTasks);
+        }
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -93,68 +91,64 @@ public class Fastjson2ConcurrentRefDeserializationTest {
         return nullCount;
     }
 
-    private static int runConcurrentStress(NullCounter nullCounter) throws Exception {
-        int rounds = Integer.getInteger("seata.fastjson2.concurrentRef.rounds", 3);
-        int threadCount = Integer.getInteger("seata.fastjson2.concurrentRef.threads", 50);
-        AtomicInteger totalNullTasks = new AtomicInteger();
+    private static int runConcurrentStress(Fastjson2Serializer serializer, byte[] bytes, int threadCount)
+            throws Exception {
         AtomicReference<Throwable> failure = new AtomicReference<>();
 
-        for (int round = 0; round < rounds; round++) {
-            clearObjectReaderCache();
-            CyclicBarrier barrier = new CyclicBarrier(threadCount);
-            CountDownLatch endLatch = new CountDownLatch(threadCount);
-            AtomicInteger roundNullTasks = new AtomicInteger();
-            for (int i = 0; i < threadCount; i++) {
-                Thread thread = new Thread(
-                        () -> {
-                            try {
-                                barrier.await(CONCURRENT_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-                                if (nullCounter.countNulls() > 0) {
-                                    roundNullTasks.incrementAndGet();
-                                }
-                            } catch (Throwable throwable) {
-                                failure.compareAndSet(null, throwable);
-                            } finally {
-                                endLatch.countDown();
+        CyclicBarrier barrier = new CyclicBarrier(threadCount);
+        CountDownLatch endLatch = new CountDownLatch(threadCount);
+        AtomicInteger nullTasks = new AtomicInteger();
+        for (int i = 0; i < threadCount; i++) {
+            Thread thread = new Thread(
+                    () -> {
+                        try {
+                            barrier.await(CONCURRENT_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                            if (countNullRefFields((MergedWarpMessage) serializer.deserialize(bytes)) > 0) {
+                                nullTasks.incrementAndGet();
                             }
-                        },
-                        "fastjson2-rpc-ref-" + i);
-                thread.start();
-            }
-            if (!endLatch.await(CONCURRENT_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                throw new AssertionError("Timed out waiting for concurrent deserialization");
-            }
-            if (failure.get() != null) {
-                throw new AssertionError("Concurrent deserialization failed", failure.get());
-            }
-            totalNullTasks.addAndGet(roundNullTasks.get());
+                        } catch (Throwable throwable) {
+                            failure.compareAndSet(null, throwable);
+                        } finally {
+                            endLatch.countDown();
+                        }
+                    },
+                    "fastjson2-rpc-ref-" + i);
+            thread.start();
+        }
+        if (!endLatch.await(CONCURRENT_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            throw new AssertionError("Timed out waiting for concurrent deserialization");
+        }
+        if (failure.get() != null) {
+            throw new AssertionError("Concurrent deserialization failed", failure.get());
         }
 
-        return totalNullTasks.get();
+        return nullTasks.get();
     }
 
-    @SuppressWarnings("unchecked")
-    private static void clearObjectReaderCache() throws Exception {
-        ObjectReaderProvider provider = JSONFactory.getDefaultObjectReaderProvider();
-        for (String fieldName : new String[] {"cache", "cacheFieldBased"}) {
-            Field field = ObjectReaderProvider.class.getDeclaredField(fieldName);
-            field.setAccessible(true);
-            Object cache = field.get(provider);
-            if (cache instanceof Map) {
-                ((Map<?, ?>) cache).clear();
-            }
+    private static void assertChildProcessSucceeds() throws Exception {
+        Process process = new ProcessBuilder(
+                        System.getProperty("java.home") + "/bin/java",
+                        "-cp",
+                        System.getProperty("java.class.path"),
+                        Fastjson2ConcurrentRefDeserializationTest.class.getName())
+                .redirectErrorStream(true)
+                .start();
+        if (!process.waitFor(CONCURRENT_TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            process.destroyForcibly();
+            throw new AssertionError("Timed out waiting for child process");
         }
-
-        try {
-            Field readerCacheField = ObjectReaderProvider.class.getDeclaredField("readerCache");
-            readerCacheField.setAccessible(true);
-            readerCacheField.set(null, null);
-        } catch (NoSuchFieldException ignored) {
-            // fastjson2 versions differ in internal cache fields.
+        if (process.exitValue() != 0) {
+            throw new AssertionError("Child process failed: " + readOutput(process.getInputStream()));
         }
     }
 
-    private interface NullCounter {
-        int countNulls() throws Exception;
+    private static String readOutput(InputStream inputStream) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[1024];
+        int length;
+        while ((length = inputStream.read(buffer)) != -1) {
+            output.write(buffer, 0, length);
+        }
+        return output.toString("UTF-8");
     }
 }

@@ -17,16 +17,19 @@
 package org.apache.seata.serializer.fastjson2;
 
 import com.alibaba.fastjson2.JSONB;
+import org.apache.seata.common.executor.Initialize;
+import org.apache.seata.common.json.Fastjson2ObjectReaderWarmup;
 import org.apache.seata.common.loader.LoadLevel;
 import org.apache.seata.core.serializer.Serializer;
-
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import org.apache.seata.core.serializer.SerializerSecurityRegistry;
 
 @LoadLevel(name = "FASTJSON2")
-public class Fastjson2Serializer implements Serializer {
+public class Fastjson2Serializer implements Serializer, Initialize {
 
-    private static final Lock PARSE_LOCK = new ReentrantLock();
+    @Override
+    public void init() {
+        Fastjson2ObjectReaderWarmup.warmup(SerializerSecurityRegistry.getAllowClassType());
+    }
 
     @Override
     public <T> byte[] serialize(T t) {
@@ -35,17 +38,10 @@ public class Fastjson2Serializer implements Serializer {
 
     @Override
     public <T> T deserialize(byte[] bytes) {
-        // JSONB initializes readers in the shared provider lazily. The lock prevents $ref fields from being lost
-        // when fastjson2 initializes readers concurrently.
-        PARSE_LOCK.lock();
-        try {
-            return (T) JSONB.parseObject(
-                    bytes,
-                    Object.class,
-                    Fastjson2SerializerFactory.getInstance().getFilter(),
-                    Fastjson2SerializerFactory.getInstance().getJsonReaderFeatureList());
-        } finally {
-            PARSE_LOCK.unlock();
-        }
+        return (T) JSONB.parseObject(
+                bytes,
+                Object.class,
+                Fastjson2SerializerFactory.getInstance().getFilter(),
+                Fastjson2SerializerFactory.getInstance().getJsonReaderFeatureList());
     }
 }
