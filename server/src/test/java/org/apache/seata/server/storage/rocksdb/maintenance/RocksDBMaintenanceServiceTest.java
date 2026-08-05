@@ -50,6 +50,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -1063,6 +1064,7 @@ class RocksDBMaintenanceServiceTest {
                     lockIndexRepairOptions("lock-run-stopped", 1, 1));
 
             Assertions.assertEquals(RocksDBRepairReport.State.STOPPED, stopped.getState());
+            Assertions.assertEquals(0, stopped.getExecutedActionCount());
             Assertions.assertArrayEquals(
                     fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
             Assertions.assertArrayEquals(
@@ -1073,6 +1075,67 @@ class RocksDBMaintenanceServiceTest {
                     () -> service.executeRepair(
                             service.planRepair(RocksDBRepairOptions.defaults()),
                             lockIndexRepairOptions("lock-run-stopped", 1, 1)));
+        }
+    }
+
+    @Test
+    void testLockIndexRepairStopsWhenFinalFullVerifyWorsens() throws Exception {
+        try (RocksDBStoreEngine engine = open("repair-lock-index-final-verify")) {
+            LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-final-verify", 1L);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
+                    fixture.global.getXid(), 0L, fixture.lockKey);
+            engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
+            RocksDBMaintenanceService service = new FinalVerifyWorseningMaintenanceService(engine);
+
+            RocksDBRepairReport report = service.executeRepair(
+                    service.planRepair(RocksDBRepairOptions.defaults()),
+                    lockIndexRepairOptions("lock-run-final-verify", 10, 1));
+
+            Assertions.assertEquals(RocksDBRepairReport.State.STOPPED, report.getState());
+            Assertions.assertEquals(1, report.getDeletedLockIndexCount());
+            Assertions.assertEquals(2, report.getAfterVerifyReport().getInconsistentCount());
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            service.planRepair(RocksDBRepairOptions.defaults()),
+                            lockIndexRepairOptions("lock-run-final-verify", 10, 1)));
+        }
+    }
+
+    @Test
+    void testLockIndexRepairSerializesConcurrentRuns() throws Exception {
+        try (RocksDBStoreEngine engine = open("repair-lock-index-concurrent")) {
+            LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-concurrent", 1L);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
+                    fixture.global.getXid(), 0L, fixture.lockKey);
+            engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
+            CountDownLatch firstVerifyEntered = new CountDownLatch(1);
+            CountDownLatch releaseFirstVerify = new CountDownLatch(1);
+            CountDownLatch secondVerifyEntered = new CountDownLatch(1);
+            RocksDBMaintenanceService first =
+                    new BlockingVerifyMaintenanceService(engine, firstVerifyEntered, releaseFirstVerify);
+            RocksDBMaintenanceService second = new ObservingVerifyMaintenanceService(engine, secondVerifyEntered);
+            RocksDBRepairPlan plan = first.planRepair(RocksDBRepairOptions.defaults());
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            try {
+                Future<RocksDBRepairReport> firstRun = executor.submit(
+                        () -> first.executeRepair(plan, lockIndexRepairOptions("lock-run-concurrent", 1, 1)));
+                Assertions.assertTrue(firstVerifyEntered.await(5, TimeUnit.SECONDS));
+                Future<RocksDBRepairReport> secondRun = executor.submit(
+                        () -> second.executeRepair(
+                                second.planRepair(RocksDBRepairOptions.defaults()),
+                                lockIndexRepairOptions("lock-run-concurrent", 1, 1)));
+
+                boolean secondEnteredBeforeFirstReleased = secondVerifyEntered.await(200, TimeUnit.MILLISECONDS);
+                releaseFirstVerify.countDown();
+                Assertions.assertEquals(RocksDBRepairReport.State.PAUSED, firstRun.get(5, TimeUnit.SECONDS).getState());
+                Assertions.assertTrue(secondVerifyEntered.await(5, TimeUnit.SECONDS));
+                secondRun.get(5, TimeUnit.SECONDS);
+                Assertions.assertFalse(secondEnteredBeforeFirstReleased);
+            } finally {
+                releaseFirstVerify.countDown();
+                executor.shutdownNow();
+            }
         }
     }
 
@@ -1258,7 +1321,7 @@ class RocksDBMaintenanceServiceTest {
         out.write(bytes, 0, bytes.length);
     }
 
-    private void await(CountDownLatch latch) {
+    private static void await(CountDownLatch latch) {
         try {
             if (!latch.await(5, TimeUnit.SECONDS)) {
                 throw new AssertionError("timed out waiting for maintenance operation release");
@@ -1280,6 +1343,61 @@ class RocksDBMaintenanceServiceTest {
             this.lockKey = lockKey;
             this.lockValue = lockValue;
             this.canonicalIndexKey = canonicalIndexKey;
+        }
+    }
+
+    private static final class FinalVerifyWorseningMaintenanceService extends RocksDBMaintenanceService {
+        private final AtomicInteger fullVerifyCount = new AtomicInteger();
+
+        private FinalVerifyWorseningMaintenanceService(RocksDBStoreEngine storeEngine) {
+            super(storeEngine);
+        }
+
+        @Override
+        public RocksDBVerifyReport verifyCurrentState() {
+            RocksDBVerifyReport report = super.verifyCurrentState();
+            if (fullVerifyCount.getAndIncrement() == 1) {
+                RocksDBVerifyReport.Builder builder = RocksDBVerifyReport.builder(RocksDBVerifyOptions.full());
+                builder.staleLockIndex("injected final verify violation 1");
+                builder.staleLockIndex("injected final verify violation 2");
+                builder.complete(true);
+                return builder.build();
+            }
+            return report;
+        }
+    }
+
+    private static final class BlockingVerifyMaintenanceService extends RocksDBMaintenanceService {
+        private final CountDownLatch verifyEntered;
+        private final CountDownLatch releaseVerify;
+
+        private BlockingVerifyMaintenanceService(
+                RocksDBStoreEngine storeEngine, CountDownLatch verifyEntered, CountDownLatch releaseVerify) {
+            super(storeEngine);
+            this.verifyEntered = verifyEntered;
+            this.releaseVerify = releaseVerify;
+        }
+
+        @Override
+        public RocksDBVerifyReport verifyCurrentState() {
+            verifyEntered.countDown();
+            await(releaseVerify);
+            return super.verifyCurrentState();
+        }
+    }
+
+    private static final class ObservingVerifyMaintenanceService extends RocksDBMaintenanceService {
+        private final CountDownLatch verifyEntered;
+
+        private ObservingVerifyMaintenanceService(RocksDBStoreEngine storeEngine, CountDownLatch verifyEntered) {
+            super(storeEngine);
+            this.verifyEntered = verifyEntered;
+        }
+
+        @Override
+        public RocksDBVerifyReport verifyCurrentState() {
+            verifyEntered.countDown();
+            return super.verifyCurrentState();
         }
     }
 

@@ -50,12 +50,13 @@ public final class RocksDBRepairReport {
     }
     RocksDBRepairReport(
             State state,
+            int executedActionCount,
             int deletedLockIndexCount,
             byte[] nextSeekKey,
             RocksDBVerifyReport beforeVerifyReport,
             RocksDBVerifyReport afterVerifyReport) {
         this.dryRun = false;
-        this.executedActionCount = state == State.DRY_RUN ? 0 : 1;
+        this.executedActionCount = executedActionCount;
         this.beforeVerifyReport = beforeVerifyReport;
         this.afterVerifyReport = afterVerifyReport;
         this.state = state;

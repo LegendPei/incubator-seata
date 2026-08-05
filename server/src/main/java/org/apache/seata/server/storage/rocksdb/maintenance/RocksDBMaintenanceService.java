@@ -563,6 +563,10 @@ public class RocksDBMaintenanceService {
         if (!plan.isVerificationComplete()) {
             throw new StoreException("RocksDB repair requires a complete verification plan");
         }
+        return storeEngine.withMaintenanceRunLock(() -> executeRepairInRunLock(plan, options));
+    }
+
+    private RocksDBRepairReport executeRepairInRunLock(RocksDBRepairPlan plan, RocksDBRepairOptions options) {
         boolean hasLockIndexRepairProgress = hasLockIndexRepairProgress();
         if (plan.hasAction(RocksDBRepairPlan.Action.DELETE_STALE_LOCK_BRANCH_INDEXES) || hasLockIndexRepairProgress) {
             if (plan.hasAction(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES)) {
@@ -589,7 +593,7 @@ public class RocksDBMaintenanceService {
                         options.getLockIndexRunId(), stoppedCursor == null ? EMPTY_PREFIX : stoppedCursor, stoppedDeleted);
                 return null;
             });
-            return new RocksDBRepairReport(RocksDBRepairReport.State.STOPPED, deleted, cursor, before, before);
+            return new RocksDBRepairReport(RocksDBRepairReport.State.STOPPED, 0, deleted, cursor, before, before);
         }
         for (int i = 0; i < options.getMaxLockIndexBatches(); i++) {
             final byte[] batchCursor = cursor;
@@ -604,18 +608,36 @@ public class RocksDBMaintenanceService {
             cursor = result.cursor;
             deleted = result.deleted;
             if (result.stopped) {
-                return new RocksDBRepairReport(
-                        RocksDBRepairReport.State.STOPPED, deleted, cursor, before, verifyCurrentState());
+                return finishLockIndexRepair(
+                        RocksDBRepairReport.State.STOPPED, options.getLockIndexRunId(), deleted, cursor, before);
             }
             if (cursor == null) {
-                return new RocksDBRepairReport(
-                        RocksDBRepairReport.State.COMPLETED, deleted, null, before, verifyCurrentState());
+                return finishLockIndexRepair(
+                        RocksDBRepairReport.State.COMPLETED, options.getLockIndexRunId(), deleted, null, before);
             }
             if (i + 1 < options.getMaxLockIndexBatches()) {
                 sleepBetweenLockIndexBatches(options.getLockIndexRoundSleepMillis());
             }
         }
-        return new RocksDBRepairReport(RocksDBRepairReport.State.PAUSED, deleted, cursor, before, verifyCurrentState());
+        return finishLockIndexRepair(
+                RocksDBRepairReport.State.PAUSED, options.getLockIndexRunId(), deleted, cursor, before);
+    }
+
+    private RocksDBRepairReport finishLockIndexRepair(
+            RocksDBRepairReport.State requestedState,
+            String runId,
+            int deleted,
+            byte[] cursor,
+            RocksDBVerifyReport before) {
+        return storeEngine.withMaintenanceLock(() -> {
+            RocksDBVerifyReport after = verifyCurrentState();
+            RocksDBRepairReport.State state = requestedState;
+            if (!after.isComplete() || after.getInconsistentCount() > before.getInconsistentCount()) {
+                stopLockIndexRepair(runId, cursor, deleted);
+                state = RocksDBRepairReport.State.STOPPED;
+            }
+            return new RocksDBRepairReport(state, 1, deleted, cursor, before, after);
+        });
     }
 
     private RocksDBLockIndexRepairProgress loadLockIndexProgress(String runId) {
