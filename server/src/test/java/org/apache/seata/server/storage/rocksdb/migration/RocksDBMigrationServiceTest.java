@@ -53,6 +53,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Map;
 
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.spy;
+
 class RocksDBMigrationServiceTest {
 
     @TempDir
@@ -168,6 +171,20 @@ class RocksDBMigrationServiceTest {
             StoreException exception = Assertions.assertThrows(
                     StoreException.class, () -> new RocksDBMigrationService().migrate(fileLog, engine));
             Assertions.assertTrue(exception.getMessage().contains("already migrated"));
+        }
+    }
+
+    @Test
+    void testDoesNotMarkMigrationWhenFlushBarrierFails() throws Exception {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        appendLog(fileLog, globalSession("tx-active", GlobalStatus.Begin), LogOperation.GLOBAL_ADD);
+
+        try (RocksDBStoreEngine engine = spy(open("rocksdb-flush-failure"))) {
+            doThrow(new StoreException("flush failed")).when(engine).flush();
+
+            Assertions.assertThrows(StoreException.class, () -> new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertFalse(Files.exists(migrationMarker(fileLog)));
         }
     }
 

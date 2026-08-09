@@ -246,7 +246,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public void flush() {
         try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
-            db.flush(flushOptions);
+            db.flush(flushOptions, new ArrayList<>(handles.values()));
         } catch (RocksDBException e) {
             throw new StoreException(e, "flush RocksDB failed");
         }

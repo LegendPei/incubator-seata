@@ -22,7 +22,10 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
@@ -122,6 +125,26 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testFlushPersistsEveryOpenedColumnFamily() throws Exception {
+        try (RocksDBStoreEngine engine = open("flush-all-column-families", true)) {
+            for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
+                engine.put(
+                        columnFamily,
+                        ("key-" + columnFamily.getName()).getBytes(StandardCharsets.UTF_8),
+                        "value".getBytes(StandardCharsets.UTF_8));
+            }
+
+            engine.flush();
+
+            for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
+                Assertions.assertTrue(
+                        getLongProperty(engine, columnFamily, "rocksdb.total-sst-files-size") > 0,
+                        () -> "column family was not flushed: " + columnFamily.getName());
+            }
+        }
+    }
+
+    @Test
     void testOpenRejectsUnsupportedFormatVersion() {
         RocksDBStoreConfig config = config("metadata-unsupported", true);
         try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
@@ -186,5 +209,13 @@ class RocksDBStoreEngineTest {
 
     private RocksDBStoreConfig config(String name, boolean syncWrite) {
         return new RocksDBStoreConfig(tempDir.resolve(name).toString(), syncWrite);
+    }
+
+    private long getLongProperty(RocksDBStoreEngine engine, RocksDBColumnFamily columnFamily, String property)
+            throws ReflectiveOperationException, RocksDBException {
+        Field dbField = RocksDBStoreEngine.class.getDeclaredField("db");
+        dbField.setAccessible(true);
+        RocksDB db = (RocksDB) dbField.get(engine);
+        return db.getLongProperty(engine.handle(columnFamily), property);
     }
 }
