@@ -27,6 +27,7 @@ import org.rocksdb.WriteBatch;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -144,6 +145,60 @@ class RocksDBStoreEngineTest {
             Assertions.assertEquals(2, stats.getRowsReturned());
             Assertions.assertFalse(stats.isLimitReached());
         }
+    }
+
+    @Test
+    void testBoundedScanFilterRejectsMaintenanceLockUpgrade() {
+        StoreException exception = Assertions.assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            try (RocksDBStoreEngine engine = open("bounded-scan-lock-upgrade", false)) {
+                byte[] prefix = "bounded-upgrade".getBytes(StandardCharsets.UTF_8);
+                engine.put(
+                        RocksDBColumnFamily.DEFAULT,
+                        "bounded-upgrade-key".getBytes(StandardCharsets.UTF_8),
+                        "value".getBytes(StandardCharsets.UTF_8));
+
+                StoreException failure = Assertions.assertThrows(
+                        StoreException.class,
+                        () -> engine.scanByPrefix(
+                                RocksDBColumnFamily.DEFAULT,
+                                prefix,
+                                prefix,
+                                1,
+                                (key, value) -> {
+                                    engine.withMaintenanceLock(() -> null);
+                                    return true;
+                                },
+                                (key, value) -> {}));
+
+                Assertions.assertFalse(engine.isClosed());
+                return failure;
+            }
+        });
+
+        Assertions.assertTrue(exception.getMessage().contains("read-to-write lock upgrade is not allowed"));
+    }
+
+    @Test
+    void testStreamingScanConsumerRejectsCloseUpgrade() {
+        StoreException exception = Assertions.assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            try (RocksDBStoreEngine engine = open("streaming-scan-close-upgrade", false)) {
+                byte[] prefix = "streaming-upgrade".getBytes(StandardCharsets.UTF_8);
+                byte[] key = "streaming-upgrade-key".getBytes(StandardCharsets.UTF_8);
+                byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+                engine.put(RocksDBColumnFamily.DEFAULT, key, value);
+
+                StoreException failure = Assertions.assertThrows(
+                        StoreException.class,
+                        () -> engine.scanByPrefix(RocksDBColumnFamily.DEFAULT, prefix, (entryKey, entryValue) ->
+                                engine.close()));
+
+                Assertions.assertFalse(engine.isClosed());
+                Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.DEFAULT, key));
+                return failure;
+            }
+        });
+
+        Assertions.assertTrue(exception.getMessage().contains("read-to-write lock upgrade is not allowed"));
     }
 
     @Test
@@ -340,6 +395,66 @@ class RocksDBStoreEngineTest {
 
         Assertions.assertSame(first, second);
         Assertions.assertTrue(first.isSyncWrite());
+    }
+
+    @Test
+    void testLifecycleWriteLockGuardRejectsReadToWriteUpgrade() throws Exception {
+        try (RocksDBStoreEngine engine = open("lifecycle-lock-upgrade-guard", false)) {
+            ReentrantReadWriteLock lifecycleLock = maintenanceLock(engine);
+            lifecycleLock.readLock().lock();
+            try {
+                StoreException exception = Assertions.assertThrows(
+                        StoreException.class, engine::ensureLifecycleWriteLockAcquisitionAllowed);
+
+                Assertions.assertTrue(
+                        exception.getMessage().contains("read-to-write lock upgrade is not allowed"));
+            } finally {
+                lifecycleLock.readLock().unlock();
+            }
+        }
+    }
+
+    @Test
+    void testWriteOwnerCanReenterLifecycleWriteLockFromScan() {
+        Assertions.assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            try (RocksDBStoreEngine engine = open("lifecycle-write-lock-reentry", false)) {
+                byte[] prefix = "write-owner-reentry".getBytes(StandardCharsets.UTF_8);
+                engine.put(
+                        RocksDBColumnFamily.DEFAULT,
+                        "write-owner-reentry-key".getBytes(StandardCharsets.UTF_8),
+                        "value".getBytes(StandardCharsets.UTF_8));
+
+                engine.withMaintenanceLock(() -> {
+                    engine.scanByPrefix(RocksDBColumnFamily.DEFAULT, prefix, (key, value) ->
+                            engine.withMaintenanceLock(() -> null));
+                    return null;
+                });
+            }
+        });
+    }
+
+    @Test
+    void testFactoryDestroyRejectedFromScanPreservesOpenEngine() {
+        StoreException exception = Assertions.assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            RocksDBStoreConfig config = config("factory-destroy-lock-upgrade", false);
+            RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance(config);
+            byte[] prefix = "factory-upgrade".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "factory-upgrade-key".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+            engine.put(RocksDBColumnFamily.DEFAULT, key, value);
+
+            StoreException failure = Assertions.assertThrows(
+                    StoreException.class,
+                    () -> engine.scanByPrefix(RocksDBColumnFamily.DEFAULT, prefix, (entryKey, entryValue) ->
+                            RocksDBStoreEngineFactory.destroy()));
+
+            Assertions.assertFalse(engine.isClosed());
+            Assertions.assertSame(engine, RocksDBStoreEngineFactory.getInstance(config));
+            Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.DEFAULT, key));
+            return failure;
+        });
+
+        Assertions.assertTrue(exception.getMessage().contains("read-to-write lock upgrade is not allowed"));
     }
 
     @Test

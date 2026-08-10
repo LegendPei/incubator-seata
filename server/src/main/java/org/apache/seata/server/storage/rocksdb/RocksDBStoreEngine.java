@@ -413,12 +413,19 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public <T> T withMaintenanceLock(Supplier<T> action) {
         Objects.requireNonNull(action, "maintenance action must not be null");
+        ensureLifecycleWriteLockAcquisitionAllowed();
         maintenanceLock.writeLock().lock();
         try {
             ensureOpen();
             return action.get();
         } finally {
             maintenanceLock.writeLock().unlock();
+        }
+    }
+
+    void ensureLifecycleWriteLockAcquisitionAllowed() {
+        if (maintenanceLock.getReadHoldCount() > 0 && !maintenanceLock.isWriteLockedByCurrentThread()) {
+            throw new StoreException("RocksDB lifecycle read-to-write lock upgrade is not allowed");
         }
     }
 
@@ -717,6 +724,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     @Override
     public void close() {
+        ensureLifecycleWriteLockAcquisitionAllowed();
         maintenanceLock.writeLock().lock();
         try {
             if (closed) {

@@ -59,7 +59,9 @@ public final class RocksDBStoreEngineFactory {
         try {
             engine.close();
         } finally {
-            ENGINE = null;
+            if (engine.isClosed()) {
+                ENGINE = null;
+            }
         }
     }
 }
