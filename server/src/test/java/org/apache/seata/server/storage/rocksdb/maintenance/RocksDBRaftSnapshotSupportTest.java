@@ -309,6 +309,79 @@ class RocksDBRaftSnapshotSupportTest {
         }
     }
 
+    @Test
+    void testLoadSnapshotRejectsSameSourceAndTargetWithoutChangingTarget() {
+        Path targetDir = tempDir.resolve("load-overlap-same");
+        byte[] key = "original-key".getBytes(StandardCharsets.UTF_8);
+        byte[] originalValue = "original-value".getBytes(StandardCharsets.UTF_8);
+
+        try (RocksDBStoreEngine engine = open("load-overlap-same-source")) {
+            RocksDBRaftSnapshotSupport support = new RocksDBRaftSnapshotSupport(engine);
+            support.saveSnapshot(targetDir, true);
+            putMetadata(targetDir, key, originalValue);
+
+            Assertions.assertThrows(StoreException.class, () -> support.loadSnapshot(targetDir, targetDir));
+        }
+
+        assertMetadataValue(targetDir, key, originalValue);
+    }
+
+    @Test
+    void testLoadSnapshotRejectsSourceContainingTargetWithoutChangingTarget() {
+        Path snapshotDir = tempDir.resolve("load-source-parent");
+        Path targetDir = snapshotDir.resolve("target");
+        byte[] key = "original-key".getBytes(StandardCharsets.UTF_8);
+        byte[] originalValue = "original-value".getBytes(StandardCharsets.UTF_8);
+        putMetadata(targetDir, key, originalValue);
+
+        try (RocksDBStoreEngine engine = open("load-source-parent-source")) {
+            RocksDBRaftSnapshotSupport support = new RocksDBRaftSnapshotSupport(engine);
+
+            StoreException exception =
+                    Assertions.assertThrows(StoreException.class, () -> support.loadSnapshot(snapshotDir, targetDir));
+            Assertions.assertTrue(exception.getMessage().contains("overlap"));
+        }
+
+        assertMetadataValue(targetDir, key, originalValue);
+    }
+
+    @Test
+    void testLoadSnapshotRejectsTargetContainingSourceWithoutChangingTarget() {
+        Path targetDir = tempDir.resolve("load-target-parent");
+        Path snapshotDir = targetDir.resolve("snapshot");
+        byte[] key = "original-key".getBytes(StandardCharsets.UTF_8);
+        byte[] originalValue = "original-value".getBytes(StandardCharsets.UTF_8);
+        putMetadata(targetDir, key, originalValue);
+
+        try (RocksDBStoreEngine engine = open("load-target-parent-source")) {
+            RocksDBRaftSnapshotSupport support = new RocksDBRaftSnapshotSupport(engine);
+            support.saveSnapshot(snapshotDir, true);
+
+            Assertions.assertThrows(StoreException.class, () -> support.loadSnapshot(snapshotDir, targetDir));
+        }
+
+        assertMetadataValue(targetDir, key, originalValue);
+    }
+
+    @Test
+    void testLoadSnapshotValidatesStagingBeforeChangingTarget() throws IOException {
+        Path snapshotDir = tempDir.resolve("load-invalid-snapshot");
+        Path targetDir = tempDir.resolve("load-invalid-target");
+        byte[] key = "original-key".getBytes(StandardCharsets.UTF_8);
+        byte[] originalValue = "original-value".getBytes(StandardCharsets.UTF_8);
+        putMetadata(targetDir, key, originalValue);
+
+        try (RocksDBStoreEngine engine = open("load-invalid-source")) {
+            RocksDBRaftSnapshotSupport support = new RocksDBRaftSnapshotSupport(engine);
+            support.saveSnapshot(snapshotDir, true);
+            Files.delete(snapshotDir.resolve("CURRENT"));
+
+            Assertions.assertThrows(StoreException.class, () -> support.loadSnapshot(snapshotDir, targetDir));
+        }
+
+        assertMetadataValue(targetDir, key, originalValue);
+    }
+
     // ---- Engine read-only access API tests ----
 
     @Test
@@ -360,6 +433,18 @@ class RocksDBRaftSnapshotSupportTest {
         RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
         storeManager.writeSession(LogOperation.GLOBAL_ADD, global);
         return global;
+    }
+
+    private void putMetadata(Path dbDir, byte[] key, byte[] value) {
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(new RocksDBStoreConfig(dbDir.toString(), true))) {
+            engine.put(RocksDBColumnFamily.METADATA, key, value);
+        }
+    }
+
+    private void assertMetadataValue(Path dbDir, byte[] key, byte[] expectedValue) {
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(new RocksDBStoreConfig(dbDir.toString(), true))) {
+            Assertions.assertArrayEquals(expectedValue, engine.get(RocksDBColumnFamily.METADATA, key));
+        }
     }
 
     @SuppressWarnings("unchecked")

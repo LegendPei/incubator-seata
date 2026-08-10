@@ -49,6 +49,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -103,6 +105,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final Cache blockCache;
     private final Statistics statistics;
     private final RocksDB db;
+    private final ReentrantReadWriteLock maintenanceLock = new ReentrantReadWriteLock(true);
 
     private volatile boolean closed;
 
@@ -310,26 +313,45 @@ public class RocksDBStoreEngine implements AutoCloseable {
     }
 
     public void put(RocksDBColumnFamily columnFamily, byte[] key, byte[] value) {
+        maintenanceLock.readLock().lock();
         try {
             db.put(handle(columnFamily), writeOptions, key, value);
         } catch (RocksDBException e) {
             throw new StoreException(e, "write RocksDB failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
     public void delete(RocksDBColumnFamily columnFamily, byte[] key) {
+        maintenanceLock.readLock().lock();
         try {
             db.delete(handle(columnFamily), writeOptions, key);
         } catch (RocksDBException e) {
             throw new StoreException(e, "delete RocksDB failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
     public void write(WriteBatch batch) {
+        maintenanceLock.readLock().lock();
         try {
             db.write(writeOptions, batch);
         } catch (RocksDBException e) {
             throw new StoreException(e, "write RocksDB batch failed");
+        } finally {
+            maintenanceLock.readLock().unlock();
+        }
+    }
+
+    public <T> T withMaintenanceLock(Supplier<T> action) {
+        Objects.requireNonNull(action, "maintenance action must not be null");
+        maintenanceLock.writeLock().lock();
+        try {
+            return action.get();
+        } finally {
+            maintenanceLock.writeLock().unlock();
         }
     }
 
@@ -381,10 +403,15 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public void deleteByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
         Objects.requireNonNull(prefix, "prefix must not be null");
-        if (config.isEnableRangeDelete() && deleteRangeByPrefix(columnFamily, prefix)) {
-            return;
+        maintenanceLock.readLock().lock();
+        try {
+            if (config.isEnableRangeDelete() && deleteRangeByPrefix(columnFamily, prefix)) {
+                return;
+            }
+            scanDeleteByPrefix(columnFamily, prefix);
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
-        scanDeleteByPrefix(columnFamily, prefix);
     }
 
     public boolean deleteByPrefix(WriteBatch batch, RocksDBColumnFamily columnFamily, byte[] prefix)
@@ -414,6 +441,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         if (end == null) {
             return false;
         }
+        maintenanceLock.readLock().lock();
         try {
             db.deleteRange(handle(columnFamily), writeOptions, prefix, end);
             if (config.isRangeDeleteCompactAfterDelete()) {
@@ -422,6 +450,8 @@ public class RocksDBStoreEngine implements AutoCloseable {
             return true;
         } catch (RocksDBException e) {
             throw new StoreException(e, "delete RocksDB range failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 

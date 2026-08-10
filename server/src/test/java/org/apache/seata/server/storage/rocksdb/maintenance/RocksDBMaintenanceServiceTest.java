@@ -42,6 +42,19 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 class RocksDBMaintenanceServiceTest {
 
@@ -128,6 +141,24 @@ class RocksDBMaintenanceServiceTest {
         }
     }
 
+    @Test
+    void testCheckpointDoesNotFlushWhenDisabled() {
+        try (RocksDBStoreEngine engine = spy(open("checkpoint-no-flush"))) {
+            new RocksDBMaintenanceService(engine).createCheckpoint(tempDir.resolve("checkpoint-no-flush-out"), false);
+
+            verify(engine, never()).flush();
+        }
+    }
+
+    @Test
+    void testCheckpointFlushesOnceWhenEnabled() {
+        try (RocksDBStoreEngine engine = spy(open("checkpoint-flush"))) {
+            new RocksDBMaintenanceService(engine).createCheckpoint(tempDir.resolve("checkpoint-flush-out"), true);
+
+            verify(engine, times(1)).flush();
+        }
+    }
+
     // ---- Verify tests ----
 
     @Test
@@ -190,6 +221,31 @@ class RocksDBMaintenanceServiceTest {
 
             Assertions.assertFalse(report.isClean());
             Assertions.assertEquals(1, report.getStaleTransactionIdIndexCount());
+        }
+    }
+
+    @Test
+    void testVerifyDetectsMissingGlobalIndexes() {
+        try (RocksDBStoreEngine engine = open("verify-missing-global-indexes")) {
+            GlobalSession global = globalSession("tx-missing-indexes", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            engine.delete(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(
+                            global.getStatus(), global.getBeginTime(), global.getXid()));
+            engine.delete(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId()));
+
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
+
+            Assertions.assertFalse(report.isClean());
+            Assertions.assertEquals(1, report.getStaleStatusIndexCount());
+            Assertions.assertEquals(1, report.getStaleTransactionIdIndexCount());
+            Assertions.assertTrue(report.getErrorMessages().stream()
+                    .anyMatch(message -> message.contains("missing global status index")));
+            Assertions.assertTrue(report.getErrorMessages().stream()
+                    .anyMatch(message -> message.contains("missing transaction id index")));
         }
     }
 
@@ -326,6 +382,53 @@ class RocksDBMaintenanceServiceTest {
         }
     }
 
+    @Test
+    void testRepairIndexesSerializesConcurrentGlobalUpdate() throws Exception {
+        try (RocksDBStoreEngine engine = spy(open("repair-concurrent-update"))) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession global = globalSession("tx-repair-concurrent", GlobalStatus.Begin);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, global);
+
+            CountDownLatch repairEntered = new CountDownLatch(1);
+            CountDownLatch releaseRepair = new CountDownLatch(1);
+            CountDownLatch writerStarted = new CountDownLatch(1);
+            CountDownLatch writerCompleted = new CountDownLatch(1);
+            doAnswer(invocation -> {
+                        repairEntered.countDown();
+                        await(releaseRepair);
+                        invocation.callRealMethod();
+                        return null;
+                    })
+                    .when(engine)
+                    .deleteByPrefix(eq(RocksDBColumnFamily.GLOBAL_STATUS_INDEX), any(byte[].class));
+
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            try {
+                Future<?> repair = executor.submit(() -> new RocksDBMaintenanceService(engine).repairIndexes());
+                Assertions.assertTrue(repairEntered.await(5, TimeUnit.SECONDS));
+
+                global.setStatus(GlobalStatus.Committing);
+                Future<?> writer = executor.submit(() -> {
+                    writerStarted.countDown();
+                    storeManager.writeSession(LogOperation.GLOBAL_UPDATE, global);
+                    writerCompleted.countDown();
+                });
+                Assertions.assertTrue(writerStarted.await(5, TimeUnit.SECONDS));
+                Assertions.assertFalse(writerCompleted.await(200, TimeUnit.MILLISECONDS));
+
+                releaseRepair.countDown();
+                repair.get(5, TimeUnit.SECONDS);
+                writer.get(5, TimeUnit.SECONDS);
+                Assertions.assertTrue(new RocksDBMaintenanceService(engine)
+                        .verifyCurrentState()
+                        .isClean());
+            } finally {
+                releaseRepair.countDown();
+                executor.shutdownNow();
+            }
+        }
+    }
+
     // ---- Report toString test ----
 
     @Test
@@ -387,6 +490,17 @@ class RocksDBMaintenanceServiceTest {
     private void writeLockInt(ByteArrayOutputStream out, int value) {
         byte[] bytes = ByteBuffer.allocate(Integer.BYTES).putInt(value).array();
         out.write(bytes, 0, bytes.length);
+    }
+
+    private void await(CountDownLatch latch) {
+        try {
+            if (!latch.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting for repair release");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
     }
 
     @SuppressWarnings("unchecked")

@@ -93,6 +93,9 @@ public class RocksDBMaintenanceService {
                 throw new StoreException(e, "create checkpoint parent directory failed:" + parent);
             }
         }
+        if (flush) {
+            storeEngine.flush();
+        }
         try (Checkpoint checkpoint = Checkpoint.create(storeEngine.getDB())) {
             checkpoint.createCheckpoint(checkpointPath.toString());
         } catch (RocksDBException e) {
@@ -153,6 +156,16 @@ public class RocksDBMaintenanceService {
 
         // Step 3: Verify GLOBAL_STATUS_INDEX
         int staleStatusIndex = 0;
+        for (Map.Entry<String, GlobalVerifyEntry> entry : globalSessions.entrySet()) {
+            String xid = entry.getKey();
+            GlobalVerifyEntry globalEntry = entry.getValue();
+            byte[] expectedKey =
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(globalEntry.status, globalEntry.beginTime, xid);
+            if (storeEngine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, expectedKey) == null) {
+                staleStatusIndex++;
+                report.addError("missing global status index, xid:" + xid);
+            }
+        }
         for (RocksDBStoreEngine.RocksDBEntry entry :
                 storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, EMPTY_PREFIX)) {
             String xid = RocksDBKeyCodec.extractXidFromStatusIndexKey(entry.getKey());
@@ -182,6 +195,14 @@ public class RocksDBMaintenanceService {
 
         // Step 4: Verify TRANSACTION_ID_INDEX
         int staleTxnIdIndex = 0;
+        for (Map.Entry<String, GlobalVerifyEntry> entry : globalSessions.entrySet()) {
+            String xid = entry.getKey();
+            byte[] expectedKey = RocksDBKeyCodec.encodeTransactionIdIndex(entry.getValue().transactionId);
+            if (storeEngine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, expectedKey) == null) {
+                staleTxnIdIndex++;
+                report.addError("missing transaction id index, xid:" + xid);
+            }
+        }
         for (RocksDBStoreEngine.RocksDBEntry entry :
                 storeEngine.prefixScan(RocksDBColumnFamily.TRANSACTION_ID_INDEX, EMPTY_PREFIX)) {
             String xid = new String(entry.getValue(), StandardCharsets.UTF_8);
@@ -259,9 +280,12 @@ public class RocksDBMaintenanceService {
      * {@code GLOBAL_STATUS_INDEX} and {@code TRANSACTION_ID_INDEX} column families.
      */
     public void repairIndexes() {
-        LOGGER.info("Rebuilding RocksDB secondary indexes");
-        indexManager.rebuildFromGlobalSessions();
-        LOGGER.info("RocksDB secondary indexes rebuilt");
+        storeEngine.withMaintenanceLock(() -> {
+            LOGGER.info("Rebuilding RocksDB secondary indexes");
+            indexManager.rebuildFromGlobalSessions();
+            LOGGER.info("RocksDB secondary indexes rebuilt");
+            return null;
+        });
     }
 
     private void writeCheckpointMetadata(Path checkpointPath) throws IOException {

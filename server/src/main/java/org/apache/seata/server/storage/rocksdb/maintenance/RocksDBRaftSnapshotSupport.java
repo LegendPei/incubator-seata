@@ -26,6 +26,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -38,6 +39,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -181,36 +183,58 @@ public class RocksDBRaftSnapshotSupport {
      * @throws StoreException if any file operation fails
      */
     public void replaceLocalDbFromSnapshot(Path snapshotDir, Path targetDbDir) {
-        if (!Files.isDirectory(snapshotDir)) {
-            throw new StoreException("snapshot directory does not exist:" + snapshotDir);
+        Path normalizedSnapshotDir = normalizePath(snapshotDir, "snapshot");
+        Path normalizedTargetDbDir = normalizePath(targetDbDir, "target db");
+        rejectOverlappingPaths(normalizedSnapshotDir, normalizedTargetDbDir);
+        if (!Files.isDirectory(normalizedSnapshotDir)) {
+            throw new StoreException("snapshot directory does not exist:" + normalizedSnapshotDir);
         }
-        if (!Files.isDirectory(targetDbDir)) {
-            throw new StoreException("target db directory does not exist:" + targetDbDir);
+        if (!Files.isDirectory(normalizedTargetDbDir)) {
+            throw new StoreException("target db directory does not exist:" + normalizedTargetDbDir);
         }
 
-        clearDirectory(targetDbDir);
+        Path targetName = normalizedTargetDbDir.getFileName();
+        if (targetName == null) {
+            throw new StoreException("target db directory must have a file name:" + normalizedTargetDbDir);
+        }
+        Path stagingDir = normalizedTargetDbDir.resolveSibling(targetName + ".staging-" + UUID.randomUUID());
+        Path backupDir = normalizedTargetDbDir.resolveSibling(targetName + ".backup-" + UUID.randomUUID());
+        boolean targetMovedToBackup = false;
 
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(snapshotDir)) {
-            for (Path sourceFile : stream) {
-                String fileName = sourceFile.getFileName().toString();
-                if (SKIP_FILES.contains(fileName)) {
-                    continue;
+        try {
+            Files.createDirectory(stagingDir);
+            copyDirectoryContents(normalizedSnapshotDir, stagingDir);
+            try (RocksDBStoreEngine ignored = openFromSnapshot(stagingDir, true)) {
+                // Opening every column family is the snapshot integrity check before replacement.
+            }
+
+            moveDirectory(normalizedTargetDbDir, backupDir);
+            targetMovedToBackup = true;
+            try {
+                moveDirectory(stagingDir, normalizedTargetDbDir);
+                targetMovedToBackup = false;
+            } catch (IOException moveFailure) {
+                try {
+                    moveDirectory(backupDir, normalizedTargetDbDir);
+                    targetMovedToBackup = false;
+                } catch (IOException rollbackFailure) {
+                    moveFailure.addSuppressed(rollbackFailure);
                 }
-                Path targetFile = targetDbDir.resolve(sourceFile.getFileName());
-                if (Files.isDirectory(sourceFile)) {
-                    copyDirectoryRecursively(sourceFile, targetFile);
-                } else if (Files.isRegularFile(sourceFile)) {
-                    Files.copy(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
-                }
+                throw moveFailure;
             }
         } catch (IOException e) {
-            throw new StoreException(e, "copy snapshot files to target db directory failed");
+            throw new StoreException(e, "replace target db directory from snapshot failed");
+        } finally {
+            deleteDirectoryQuietly(stagingDir);
+            if (!targetMovedToBackup && Files.isDirectory(normalizedTargetDbDir)) {
+                deleteDirectoryQuietly(backupDir);
+            }
         }
 
         LOGGER.info(
                 "Local RocksDB directory replaced from snapshot, snapshotDir:{}, targetDbDir:{}",
-                snapshotDir,
-                targetDbDir);
+                normalizedSnapshotDir,
+                normalizedTargetDbDir);
     }
 
     /**
@@ -237,9 +261,12 @@ public class RocksDBRaftSnapshotSupport {
      * @param targetDbDir target RocksDB directory to replace
      */
     public void loadSnapshot(Path snapshotDir, Path targetDbDir) {
-        validateSnapshotCompatibility(snapshotDir);
-        replaceLocalDbFromSnapshot(snapshotDir, targetDbDir);
-        LOGGER.info("Snapshot loaded from {} into {}", snapshotDir, targetDbDir);
+        Path normalizedSnapshotDir = normalizePath(snapshotDir, "snapshot");
+        Path normalizedTargetDbDir = normalizePath(targetDbDir, "target db");
+        rejectOverlappingPaths(normalizedSnapshotDir, normalizedTargetDbDir);
+        validateSnapshotCompatibility(normalizedSnapshotDir);
+        replaceLocalDbFromSnapshot(normalizedSnapshotDir, normalizedTargetDbDir);
+        LOGGER.info("Snapshot loaded from {} into {}", normalizedSnapshotDir, normalizedTargetDbDir);
     }
 
     private static Map<String, String> parseMetadataFile(Path metadataFile) throws IOException {
@@ -258,7 +285,48 @@ public class RocksDBRaftSnapshotSupport {
         return result;
     }
 
-    private static void clearDirectory(Path dir) {
+    private static Path normalizePath(Path path, String description) {
+        if (path == null) {
+            throw new StoreException(description + " path must not be null");
+        }
+        return path.toAbsolutePath().normalize();
+    }
+
+    private static void rejectOverlappingPaths(Path snapshotDir, Path targetDbDir) {
+        if (snapshotDir.equals(targetDbDir)
+                || snapshotDir.startsWith(targetDbDir)
+                || targetDbDir.startsWith(snapshotDir)) {
+            throw new StoreException("snapshot and target db directories must not overlap, snapshot:" + snapshotDir
+                    + ", target:" + targetDbDir);
+        }
+    }
+
+    private static void copyDirectoryContents(Path sourceDir, Path targetDir) throws IOException {
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(sourceDir)) {
+            for (Path sourceFile : stream) {
+                String fileName = sourceFile.getFileName().toString();
+                if (SKIP_FILES.contains(fileName)) {
+                    continue;
+                }
+                Path targetFile = targetDir.resolve(sourceFile.getFileName());
+                if (Files.isDirectory(sourceFile)) {
+                    copyDirectoryRecursively(sourceFile, targetFile);
+                } else if (Files.isRegularFile(sourceFile)) {
+                    Files.copy(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+    }
+
+    private static void moveDirectory(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, target);
+        }
+    }
+
+    private static void deleteDirectoryQuietly(Path dir) {
         try {
             if (!Files.isDirectory(dir)) {
                 return;
@@ -270,12 +338,14 @@ public class RocksDBRaftSnapshotSupport {
                             try {
                                 Files.deleteIfExists(p);
                             } catch (IOException e) {
-                                LOGGER.warn("delete file failed: {}, message: {}", p, e.getMessage());
+                                LOGGER.warn(
+                                        "delete temporary snapshot file failed: {}, message: {}", p, e.getMessage());
                             }
                         });
             }
+            Files.deleteIfExists(dir);
         } catch (IOException e) {
-            throw new StoreException(e, "clear target db directory failed:" + dir);
+            LOGGER.warn("delete temporary snapshot directory failed: {}, message: {}", dir, e.getMessage());
         }
     }
 
