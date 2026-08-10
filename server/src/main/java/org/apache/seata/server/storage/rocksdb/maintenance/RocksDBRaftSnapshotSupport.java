@@ -20,7 +20,9 @@ import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,9 +38,11 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -192,30 +196,34 @@ public class RocksDBRaftSnapshotSupport {
         if (!Files.isDirectory(normalizedTargetDbDir)) {
             throw new StoreException("target db directory does not exist:" + normalizedTargetDbDir);
         }
+        Path realSnapshotDir = toRealDirectoryPath(normalizedSnapshotDir, "snapshot");
+        Path realTargetDbDir = toRealDirectoryPath(normalizedTargetDbDir, "target db");
+        rejectOverlappingPaths(realSnapshotDir, realTargetDbDir);
 
-        Path targetName = normalizedTargetDbDir.getFileName();
+        Path targetName = realTargetDbDir.getFileName();
         if (targetName == null) {
-            throw new StoreException("target db directory must have a file name:" + normalizedTargetDbDir);
+            throw new StoreException("target db directory must have a file name:" + realTargetDbDir);
         }
-        Path stagingDir = normalizedTargetDbDir.resolveSibling(targetName + ".staging-" + UUID.randomUUID());
-        Path backupDir = normalizedTargetDbDir.resolveSibling(targetName + ".backup-" + UUID.randomUUID());
+        Path stagingDir = realTargetDbDir.resolveSibling(targetName + ".staging-" + UUID.randomUUID());
+        Path backupDir = realTargetDbDir.resolveSibling(targetName + ".backup-" + UUID.randomUUID());
         boolean targetMovedToBackup = false;
 
         try {
             Files.createDirectory(stagingDir);
-            copyDirectoryContents(normalizedSnapshotDir, stagingDir);
+            copyDirectoryContents(realSnapshotDir, stagingDir);
+            validateRequiredColumnFamilies(stagingDir);
             try (RocksDBStoreEngine ignored = openFromSnapshot(stagingDir, true)) {
                 // Opening every column family is the snapshot integrity check before replacement.
             }
 
-            moveDirectory(normalizedTargetDbDir, backupDir);
+            moveDirectory(realTargetDbDir, backupDir);
             targetMovedToBackup = true;
             try {
-                moveDirectory(stagingDir, normalizedTargetDbDir);
+                moveDirectory(stagingDir, realTargetDbDir);
                 targetMovedToBackup = false;
             } catch (IOException moveFailure) {
                 try {
-                    moveDirectory(backupDir, normalizedTargetDbDir);
+                    moveDirectory(backupDir, realTargetDbDir);
                     targetMovedToBackup = false;
                 } catch (IOException rollbackFailure) {
                     moveFailure.addSuppressed(rollbackFailure);
@@ -226,15 +234,15 @@ public class RocksDBRaftSnapshotSupport {
             throw new StoreException(e, "replace target db directory from snapshot failed");
         } finally {
             deleteDirectoryQuietly(stagingDir);
-            if (!targetMovedToBackup && Files.isDirectory(normalizedTargetDbDir)) {
+            if (!targetMovedToBackup && Files.isDirectory(realTargetDbDir)) {
                 deleteDirectoryQuietly(backupDir);
             }
         }
 
         LOGGER.info(
                 "Local RocksDB directory replaced from snapshot, snapshotDir:{}, targetDbDir:{}",
-                normalizedSnapshotDir,
-                normalizedTargetDbDir);
+                realSnapshotDir,
+                realTargetDbDir);
     }
 
     /**
@@ -298,6 +306,32 @@ public class RocksDBRaftSnapshotSupport {
                 || targetDbDir.startsWith(snapshotDir)) {
             throw new StoreException("snapshot and target db directories must not overlap, snapshot:" + snapshotDir
                     + ", target:" + targetDbDir);
+        }
+    }
+
+    private static Path toRealDirectoryPath(Path path, String description) {
+        try {
+            return path.toRealPath();
+        } catch (IOException e) {
+            throw new StoreException(e, "resolve " + description + " directory failed:" + path);
+        }
+    }
+
+    private static void validateRequiredColumnFamilies(Path snapshotDir) {
+        try (Options options = new Options()) {
+            Set<String> existingFamilies = new HashSet<>();
+            for (byte[] family : RocksDB.listColumnFamilies(options, snapshotDir.toString())) {
+                existingFamilies.add(new String(family, StandardCharsets.UTF_8));
+            }
+            List<String> missingFamilies = Arrays.stream(RocksDBColumnFamily.values())
+                    .map(RocksDBColumnFamily::getName)
+                    .filter(name -> !existingFamilies.contains(name))
+                    .collect(Collectors.toList());
+            if (!missingFamilies.isEmpty()) {
+                throw new StoreException("snapshot is missing required column families:" + missingFamilies);
+            }
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "list snapshot column families failed:" + snapshotDir);
         }
     }
 

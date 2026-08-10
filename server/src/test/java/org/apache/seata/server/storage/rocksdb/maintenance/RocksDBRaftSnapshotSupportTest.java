@@ -30,16 +30,22 @@ import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreMana
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.Options;
+import org.rocksdb.RocksDB;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 class RocksDBRaftSnapshotSupportTest {
 
@@ -377,6 +383,60 @@ class RocksDBRaftSnapshotSupportTest {
             Files.delete(snapshotDir.resolve("CURRENT"));
 
             Assertions.assertThrows(StoreException.class, () -> support.loadSnapshot(snapshotDir, targetDir));
+        }
+
+        assertMetadataValue(targetDir, key, originalValue);
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void testLoadSnapshotRejectsRealPathAliasWithoutChangingTarget() throws IOException {
+        Path targetDir = tempDir.resolve("load-alias-target");
+        Path snapshotAlias = tempDir.resolve("load-alias-snapshot");
+        byte[] key = "original-key".getBytes(StandardCharsets.UTF_8);
+        byte[] originalValue = "original-value".getBytes(StandardCharsets.UTF_8);
+
+        try (RocksDBStoreEngine engine = open("load-alias-source")) {
+            RocksDBRaftSnapshotSupport support = new RocksDBRaftSnapshotSupport(engine);
+            support.saveSnapshot(targetDir, true);
+            putMetadata(targetDir, key, originalValue);
+            try {
+                Files.createSymbolicLink(snapshotAlias, targetDir);
+            } catch (IOException | UnsupportedOperationException | SecurityException e) {
+                Assumptions.assumeTrue(false, "symbolic links are not available: " + e.getMessage());
+            }
+
+            Assertions.assertThrows(StoreException.class, () -> support.loadSnapshot(snapshotAlias, targetDir));
+        }
+
+        assertMetadataValue(targetDir, key, originalValue);
+    }
+
+    @Test
+    void testLoadSnapshotRejectsMissingColumnFamilyWithoutChangingTarget() throws IOException {
+        Path validSnapshotDir = tempDir.resolve("load-valid-cf-snapshot");
+        Path incompleteSnapshotDir = tempDir.resolve("load-missing-cf-snapshot");
+        Path targetDir = tempDir.resolve("load-missing-cf-target");
+        byte[] key = "original-key".getBytes(StandardCharsets.UTF_8);
+        byte[] originalValue = "original-value".getBytes(StandardCharsets.UTF_8);
+        putMetadata(targetDir, key, originalValue);
+
+        try (RocksDBStoreEngine engine = open("load-missing-cf-source")) {
+            RocksDBRaftSnapshotSupport support = new RocksDBRaftSnapshotSupport(engine);
+            support.saveSnapshot(validSnapshotDir, false);
+            try (Options options = new Options().setCreateIfMissing(true);
+                    RocksDB ignored = RocksDB.open(options, incompleteSnapshotDir.toString())) {
+                // A raw RocksDB contains only the default column family.
+            } catch (org.rocksdb.RocksDBException e) {
+                Assertions.fail(e);
+            }
+            Files.copy(
+                    validSnapshotDir.resolve("seata-checkpoint-metadata.txt"),
+                    incompleteSnapshotDir.resolve("seata-checkpoint-metadata.txt"),
+                    StandardCopyOption.REPLACE_EXISTING);
+
+            Assertions.assertThrows(
+                    StoreException.class, () -> support.loadSnapshot(incompleteSnapshotDir, targetDir));
         }
 
         assertMetadataValue(targetDir, key, originalValue);
