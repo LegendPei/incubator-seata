@@ -56,9 +56,10 @@ public final class RocksDBStoreEngineFactory {
 
     public static void destroy() {
         synchronized (RocksDBStoreEngineFactory.class) {
-            if (ENGINE != null) {
-                ENGINE.close();
-                ENGINE = null;
+            RocksDBStoreEngine engine = ENGINE;
+            ENGINE = null;
+            if (engine != null) {
+                engine.close();
             }
         }
     }

@@ -201,7 +201,7 @@ final class RocksDBWalSyncController implements AutoCloseable {
                 LOGGER.debug("skip RocksDB WAL sync request because executor is shutting down, reason:{}", reason, e);
                 return;
             }
-            throw e;
+            LOGGER.warn("defer RocksDB WAL sync because background scheduling was rejected, reason:{}", reason, e);
         }
     }
 

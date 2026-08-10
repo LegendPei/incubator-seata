@@ -147,6 +147,24 @@ class RocksDBWalSyncControllerTest {
     }
 
     @Test
+    void testAfterWriteDoesNotThrowWhenBackgroundSchedulingIsRejected() {
+        AtomicLong nowMillis = new AtomicLong(1000L);
+        AtomicLong nowNanos = new AtomicLong(10_000L);
+        FakeWalSyncer syncer = new FakeWalSyncer();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
+        RocksDBWalSyncController controller = controller(syncer, executor, nowMillis, nowNanos, 1000L, 1L, false);
+        executor.reject = true;
+
+        Assertions.assertDoesNotThrow(controller::afterWrite);
+        Assertions.assertEquals(1L, controller.stats().getUnsyncedWriteRequests());
+
+        executor.reject = false;
+        controller.requestSync("retry-after-rejection");
+        Assertions.assertEquals(1, syncer.flushCount);
+        Assertions.assertEquals(0L, controller.stats().getUnsyncedWriteRequests());
+    }
+
+    @Test
     void testAfterWriteDoesNotThrowWhenExecutorRejectsDuringShutdown() {
         AtomicLong nowMillis = new AtomicLong(1000L);
         AtomicLong nowNanos = new AtomicLong(10_000L);
@@ -215,6 +233,7 @@ class RocksDBWalSyncControllerTest {
 
     private static final class ManualScheduledExecutor extends AbstractExecutorService
             implements ScheduledExecutorService {
+        private boolean reject;
         private boolean shutdown;
         private Runnable fixedDelayTask;
 
@@ -246,8 +265,8 @@ class RocksDBWalSyncControllerTest {
 
         @Override
         public void execute(Runnable command) {
-            if (shutdown) {
-                throw new RejectedExecutionException("executor shutdown");
+            if (reject || shutdown) {
+                throw new RejectedExecutionException(shutdown ? "executor shutdown" : "executor rejected task");
             }
             command.run();
         }

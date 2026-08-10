@@ -33,10 +33,18 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongSupplier;
 
 class RocksDBStoreEngineTest {
 
@@ -398,9 +406,91 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
-    void testCloseReleasesResourcesWhenFinalWalSyncFails() throws Exception {
-        RocksDBStoreConfig config = config("wal-sync-close-failure-reopen", false);
+    void testCloseWaitsForAfterWriteBeforeFinalWalSync() throws Exception {
+        RocksDBStoreConfig config = config("close-waits-for-after-write", false);
         RocksDBStoreEngine engine = RocksDBStoreEngine.open(config);
+        BlockingAfterWriteClock currentTime = new BlockingAfterWriteClock();
+        FailingWalSyncer syncer = new FailingWalSyncer();
+        DirectScheduledExecutor walExecutor = new DirectScheduledExecutor();
+        replaceWalSyncController(
+                engine,
+                new RocksDBWalSyncController(
+                        RocksDBWalSyncMode.PERIODIC,
+                        syncer,
+                        1000L,
+                        100L,
+                        true,
+                        1000L,
+                        walExecutor,
+                        true,
+                        currentTime,
+                        System::nanoTime));
+        ReentrantReadWriteLock lifecycleLock = maintenanceLock(engine);
+        ExecutorService lifecycleExecutor = Executors.newFixedThreadPool(2);
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        AtomicReference<Thread> closeThread = new AtomicReference<>();
+        byte[] key = RocksDBKeyCodec.encodeXid("xid-close-race");
+        byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+
+        try {
+            Future<?> write = lifecycleExecutor.submit(() -> engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value));
+            Assertions.assertTrue(currentTime.awaitAfterWrite(5, TimeUnit.SECONDS));
+            Future<?> close = lifecycleExecutor.submit(() -> {
+                closeThread.set(Thread.currentThread());
+                closeStarted.countDown();
+                engine.close();
+            });
+            Assertions.assertTrue(closeStarted.await(5, TimeUnit.SECONDS));
+            waitUntil(() -> lifecycleLock.hasQueuedThread(closeThread.get()));
+
+            Assertions.assertFalse(close.isDone());
+            currentTime.releaseAfterWrite();
+
+            write.get(5, TimeUnit.SECONDS);
+            close.get(5, TimeUnit.SECONDS);
+            Assertions.assertEquals(1, syncer.flushCount);
+            Assertions.assertTrue(walExecutor.isShutdown());
+            try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
+                Assertions.assertArrayEquals(value, reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+            }
+        } finally {
+            currentTime.releaseAfterWrite();
+            lifecycleExecutor.shutdownNow();
+            lifecycleExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            if (!engine.isClosed()) {
+                engine.close();
+            }
+        }
+    }
+
+    @Test
+    void testMutatingOperationsThrowStoreExceptionAfterClose() throws Exception {
+        RocksDBStoreEngine engine = open("writes-after-close", false, true);
+        byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+        byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+        byte[] prefix = "prefix".getBytes(StandardCharsets.UTF_8);
+        try (WriteBatch batch = new WriteBatch()) {
+            batch.put(engine.handle(RocksDBColumnFamily.DEFAULT), key, value);
+            engine.close();
+
+            Assertions.assertThrows(
+                    StoreException.class, () -> engine.put(RocksDBColumnFamily.DEFAULT, key, value));
+            Assertions.assertThrows(StoreException.class, () -> engine.delete(RocksDBColumnFamily.DEFAULT, key));
+            Assertions.assertThrows(StoreException.class, () -> engine.write(batch));
+            Assertions.assertThrows(
+                    StoreException.class, () -> engine.deleteByPrefix(RocksDBColumnFamily.DEFAULT, prefix));
+            Assertions.assertThrows(
+                    StoreException.class, () -> engine.deleteRangeByPrefix(RocksDBColumnFamily.DEFAULT, prefix));
+            Assertions.assertThrows(StoreException.class, engine::flush);
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    void testFactoryCanRecreateEngineAfterFinalWalSyncFailure() throws Exception {
+        RocksDBStoreConfig config = config("wal-sync-close-failure-reopen", false);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance(config);
         FailingWalSyncer syncer = new FailingWalSyncer();
         DirectScheduledExecutor executor = new DirectScheduledExecutor();
         replaceWalSyncController(engine, newFailingShutdownSyncController(syncer, executor));
@@ -411,14 +501,15 @@ class RocksDBStoreEngineTest {
                 "value".getBytes(StandardCharsets.UTF_8));
         syncer.fail = true;
 
-        StoreException exception = Assertions.assertThrows(StoreException.class, engine::close);
+        StoreException exception = Assertions.assertThrows(StoreException.class, RocksDBStoreEngineFactory::destroy);
 
         Assertions.assertTrue(exception.getMessage().contains("shutdown"));
+        Assertions.assertTrue(engine.isClosed());
         Assertions.assertTrue(executor.isShutdown());
-        try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
-            Assertions.assertNotNull(
-                    reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid("xid-close-failure")));
-        }
+        RocksDBStoreEngine reopened = RocksDBStoreEngineFactory.getInstance(config);
+        Assertions.assertNotSame(engine, reopened);
+        Assertions.assertNotNull(
+                reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid("xid-close-failure")));
     }
 
     @Test
@@ -596,6 +687,12 @@ class RocksDBStoreEngineTest {
         field.set(engine, controller);
     }
 
+    private ReentrantReadWriteLock maintenanceLock(RocksDBStoreEngine engine) throws ReflectiveOperationException {
+        Field field = RocksDBStoreEngine.class.getDeclaredField("maintenanceLock");
+        field.setAccessible(true);
+        return (ReentrantReadWriteLock) field.get(engine);
+    }
+
     private void waitUntil(Condition condition) throws Exception {
         long deadline = System.currentTimeMillis() + 3000L;
         while (System.currentTimeMillis() < deadline) {
@@ -613,11 +710,13 @@ class RocksDBStoreEngineTest {
     }
 
     private static final class FailingWalSyncer implements RocksDBWalSyncController.WalSyncer {
+        private int flushCount;
         private long sequence;
         private boolean fail;
 
         @Override
         public void flushWal(boolean sync) throws Exception {
+            flushCount++;
             if (fail) {
                 throw new Exception("boom");
             }
@@ -627,6 +726,36 @@ class RocksDBStoreEngineTest {
         @Override
         public long latestSequenceNumber() {
             return sequence;
+        }
+    }
+
+    private static final class BlockingAfterWriteClock implements LongSupplier {
+        private final AtomicInteger calls = new AtomicInteger();
+        private final CountDownLatch afterWriteEntered = new CountDownLatch(1);
+        private final CountDownLatch releaseAfterWrite = new CountDownLatch(1);
+
+        @Override
+        public long getAsLong() {
+            if (calls.incrementAndGet() == 2) {
+                afterWriteEntered.countDown();
+                try {
+                    if (!releaseAfterWrite.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("afterWrite barrier was not released");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while waiting at afterWrite barrier", e);
+                }
+            }
+            return 1000L;
+        }
+
+        private boolean awaitAfterWrite(long timeout, TimeUnit unit) throws InterruptedException {
+            return afterWriteEntered.await(timeout, unit);
+        }
+
+        private void releaseAfterWrite() {
+            releaseAfterWrite.countDown();
         }
     }
 

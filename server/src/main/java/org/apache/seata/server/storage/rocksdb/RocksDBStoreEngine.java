@@ -331,6 +331,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void put(RocksDBColumnFamily columnFamily, byte[] key, byte[] value) {
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             db.put(handle(columnFamily), writeOptions, key, value);
             afterWrite();
         } catch (RocksDBException e) {
@@ -343,6 +344,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void delete(RocksDBColumnFamily columnFamily, byte[] key) {
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             db.delete(handle(columnFamily), writeOptions, key);
             afterWrite();
         } catch (RocksDBException e) {
@@ -355,6 +357,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void write(WriteBatch batch) {
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             db.write(writeOptions, batch);
             afterWrite();
         } catch (RocksDBException e) {
@@ -466,6 +469,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         Objects.requireNonNull(prefix, "prefix must not be null");
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             if (config.isEnableRangeDelete() && deleteRangeByPrefix(columnFamily, prefix)) {
                 return;
             }
@@ -479,11 +483,17 @@ public class RocksDBStoreEngine implements AutoCloseable {
             throws RocksDBException {
         Objects.requireNonNull(batch, "batch must not be null");
         Objects.requireNonNull(prefix, "prefix must not be null");
-        if (config.isEnableRangeDelete() && deleteRangeByPrefix(batch, columnFamily, prefix)) {
-            return true;
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            if (config.isEnableRangeDelete() && deleteRangeByPrefix(batch, columnFamily, prefix)) {
+                return true;
+            }
+            scanDeleteByPrefix(batch, columnFamily, prefix);
+            return false;
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
-        scanDeleteByPrefix(batch, columnFamily, prefix);
-        return false;
     }
 
     /**
@@ -498,12 +508,13 @@ public class RocksDBStoreEngine implements AutoCloseable {
      */
     public boolean deleteRangeByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
         Objects.requireNonNull(prefix, "prefix must not be null");
-        byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
-        if (end == null) {
-            return false;
-        }
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
+            byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
+            if (end == null) {
+                return false;
+            }
             db.deleteRange(handle(columnFamily), writeOptions, prefix, end);
             afterWrite();
             if (config.isRangeDeleteCompactAfterDelete()) {
@@ -521,12 +532,18 @@ public class RocksDBStoreEngine implements AutoCloseable {
             throws RocksDBException {
         Objects.requireNonNull(batch, "batch must not be null");
         Objects.requireNonNull(prefix, "prefix must not be null");
-        byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
-        if (end == null) {
-            return false;
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
+            if (end == null) {
+                return false;
+            }
+            batch.deleteRange(handle(columnFamily), prefix, end);
+            return true;
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
-        batch.deleteRange(handle(columnFamily), prefix, end);
-        return true;
     }
 
     private void scanDeleteByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
@@ -567,10 +584,16 @@ public class RocksDBStoreEngine implements AutoCloseable {
     }
 
     public void flush() {
-        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
-            db.flush(flushOptions, new ArrayList<>(handles.values()));
-        } catch (RocksDBException e) {
-            throw new StoreException(e, "flush RocksDB failed");
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+                db.flush(flushOptions, new ArrayList<>(handles.values()));
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "flush RocksDB failed");
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -584,29 +607,40 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     @Override
     public void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
-        RocksDBStoreMetrics.unregister(this);
-        RuntimeException syncFailure = null;
+        maintenanceLock.writeLock().lock();
         try {
-            walSyncController.close();
-        } catch (RuntimeException e) {
-            syncFailure = e;
+            if (closed) {
+                return;
+            }
+            closed = true;
+            RocksDBStoreMetrics.unregister(this);
+            RuntimeException syncFailure = null;
+            try {
+                walSyncController.close();
+            } catch (RuntimeException e) {
+                syncFailure = e;
+            } finally {
+                closeQuietly(
+                        new ArrayList<>(handles.values()),
+                        db,
+                        writeOptions,
+                        readOptions,
+                        columnFamilyOptions,
+                        dbOptions,
+                        blockCache,
+                        statistics);
+            }
+            if (syncFailure != null) {
+                throw syncFailure;
+            }
         } finally {
-            closeQuietly(
-                    new ArrayList<>(handles.values()),
-                    db,
-                    writeOptions,
-                    readOptions,
-                    columnFamilyOptions,
-                    dbOptions,
-                    blockCache,
-                    statistics);
+            maintenanceLock.writeLock().unlock();
         }
-        if (syncFailure != null) {
-            throw syncFailure;
+    }
+
+    private void ensureOpen() {
+        if (closed) {
+            throw new StoreException("RocksDB store engine is closed");
         }
     }
 
