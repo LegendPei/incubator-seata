@@ -138,9 +138,10 @@ public class RocksDBLocker extends AbstractLocker {
                     continue;
                 }
                 byte[] lockKey = encodeLockKey(lockDO);
-                batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
-                batch.delete(
-                        storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX),
+                storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
+                storeEngine.delete(
+                        batch,
+                        RocksDBColumnFamily.LOCK_BRANCH_INDEX,
                         RocksDBKeyCodec.encodeLockBranchIndex(lockDO.getXid(), lockDO.getBranchId(), lockKey));
             }
             storeEngine.write(batch);
@@ -217,7 +218,7 @@ public class RocksDBLocker extends AbstractLocker {
                             continue;
                         }
                         lockDO.setStatus(lockStatus.getCode());
-                        batch.put(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey, encodeLock(lockDO));
+                        storeEngine.put(batch, RocksDBColumnFamily.LOCK, lockKey, encodeLock(lockDO));
                     }
                     storeEngine.write(batch);
                 }
@@ -264,7 +265,7 @@ public class RocksDBLocker extends AbstractLocker {
                 byte[] lockKey = indexEntry.getValue();
                 byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
                 if (lockValue == null) {
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     cleaned++;
                     continue;
                 }
@@ -273,7 +274,7 @@ public class RocksDBLocker extends AbstractLocker {
                 byte[] expectedIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
                         existingLock.getXid(), existingLock.getBranchId(), lockKey);
                 if (!Arrays.equals(expectedIndexKey, indexEntry.getKey())) {
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     cleaned++;
                     continue;
                 }
@@ -282,8 +283,8 @@ public class RocksDBLocker extends AbstractLocker {
                                 RocksDBColumnFamily.BRANCH_SESSION,
                                 RocksDBKeyCodec.encodeBranch(existingLock.getXid(), existingLock.getBranchId()))
                         == null) {
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     cleaned++;
                 }
             }
@@ -359,9 +360,10 @@ public class RocksDBLocker extends AbstractLocker {
         try (WriteBatch batch = new WriteBatch()) {
             for (LockDO lockDO : lockDOs) {
                 byte[] lockKey = encodeLockKey(lockDO);
-                batch.put(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey, encodeLock(lockDO));
-                batch.put(
-                        storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX),
+                storeEngine.put(batch, RocksDBColumnFamily.LOCK, lockKey, encodeLock(lockDO));
+                storeEngine.put(
+                        batch,
+                        RocksDBColumnFamily.LOCK_BRANCH_INDEX,
                         RocksDBKeyCodec.encodeLockBranchIndex(lockDO.getXid(), lockDO.getBranchId(), lockKey),
                         lockKey);
             }
@@ -390,10 +392,10 @@ public class RocksDBLocker extends AbstractLocker {
                             LockDO existingLock = decodeLock(lockValue);
                             if (StringUtils.equals(existingLock.getXid(), xid)
                                     && (branchId == null || branchId.equals(existingLock.getBranchId()))) {
-                                batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
+                                storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
                             }
                         }
-                        batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                        storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     }
                     storeEngine.write(batch);
                 }

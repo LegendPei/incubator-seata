@@ -25,9 +25,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.RocksDBValueCodec;
 import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
-import org.rocksdb.Checkpoint;
 import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -96,11 +94,7 @@ public class RocksDBMaintenanceService {
         if (flush) {
             storeEngine.flush();
         }
-        try (Checkpoint checkpoint = Checkpoint.create(storeEngine.getDB())) {
-            checkpoint.createCheckpoint(checkpointPath.toString());
-        } catch (RocksDBException e) {
-            throw new StoreException(e, "create RocksDB checkpoint failed, path:" + checkpointPath);
-        }
+        storeEngine.createCheckpoint(checkpointPath.toString());
         try {
             writeCheckpointMetadata(checkpointPath);
             LOGGER.info(

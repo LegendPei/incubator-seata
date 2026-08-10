@@ -207,7 +207,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (oldValue != null) {
                 indexManager.deleteGlobalIndexes(batch, decodeGlobalSession(oldValue, true));
             }
-            batch.put(storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION), key, encodeGlobalSession(session));
+            storeEngine.put(batch, RocksDBColumnFamily.GLOBAL_SESSION, key, encodeGlobalSession(session));
             indexManager.putGlobalIndexes(batch, session);
             storeEngine.write(batch);
         } catch (RocksDBException e) {
@@ -222,9 +222,8 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (oldValue != null) {
                 indexManager.deleteGlobalIndexes(batch, decodeGlobalSession(oldValue, true));
             }
-            batch.delete(
-                    storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION),
-                    RocksDBKeyCodec.encodeXid(session.getXid()));
+            storeEngine.delete(
+                    batch, RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(session.getXid()));
             storeEngine.deleteByPrefix(
                     batch, RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(session.getXid()));
             storeEngine.write(batch);

@@ -22,8 +22,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
 import org.rocksdb.WriteBatch;
 
 import java.lang.reflect.Field;
@@ -69,6 +67,26 @@ class RocksDBStoreEngineTest {
 
             engine.delete(RocksDBColumnFamily.GLOBAL_SESSION, key);
             Assertions.assertNull(engine.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+        }
+    }
+
+    @Test
+    void testBatchPutAndDelete() throws Exception {
+        try (RocksDBStoreEngine engine = open("batch-put-delete", true)) {
+            byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+
+            try (WriteBatch batch = new WriteBatch()) {
+                engine.put(batch, RocksDBColumnFamily.DEFAULT, key, value);
+                engine.write(batch);
+            }
+            Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.DEFAULT, key));
+
+            try (WriteBatch batch = new WriteBatch()) {
+                engine.delete(batch, RocksDBColumnFamily.DEFAULT, key);
+                engine.write(batch);
+            }
+            Assertions.assertNull(engine.get(RocksDBColumnFamily.DEFAULT, key));
         }
     }
 
@@ -277,7 +295,7 @@ class RocksDBStoreEngineTest {
 
             for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
                 Assertions.assertTrue(
-                        getLongProperty(engine, columnFamily, "rocksdb.total-sst-files-size") > 0,
+                        engine.getLongProperty(columnFamily, "rocksdb.total-sst-files-size") > 0,
                         () -> "column family was not flushed: " + columnFamily.getName());
             }
         }
@@ -322,6 +340,52 @@ class RocksDBStoreEngineTest {
 
         Assertions.assertSame(first, second);
         Assertions.assertTrue(first.isSyncWrite());
+    }
+
+    @Test
+    void testFactoryGetAndDestroyUseSingleSynchronizationProtocol() throws Exception {
+        RocksDBStoreConfig config = config("factory-lifecycle", true);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance(config);
+        ReentrantReadWriteLock lifecycleLock = maintenanceLock(engine);
+        BlockingPathConfig requestedConfig = new BlockingPathConfig(config);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        AtomicReference<Thread> destroyThread = new AtomicReference<>();
+        CountDownLatch destroyStarted = new CountDownLatch(1);
+        Future<RocksDBStoreEngine> get = null;
+        Future<?> destroy = null;
+
+        lifecycleLock.readLock().lock();
+        try {
+            get = executor.submit(() -> RocksDBStoreEngineFactory.getInstance(requestedConfig));
+            Assertions.assertTrue(requestedConfig.awaitPathRead(5, TimeUnit.SECONDS));
+            destroy = executor.submit(() -> {
+                destroyThread.set(Thread.currentThread());
+                destroyStarted.countDown();
+                RocksDBStoreEngineFactory.destroy();
+            });
+            Assertions.assertTrue(destroyStarted.await(5, TimeUnit.SECONDS));
+            Future<?> destroyFuture = destroy;
+            waitUntil(() -> destroyFuture.isDone()
+                    || lifecycleLock.hasQueuedThread(destroyThread.get())
+                    || destroyThread.get().getState() == Thread.State.BLOCKED);
+
+            requestedConfig.releasePathRead();
+            Future<RocksDBStoreEngine> getFuture = get;
+            RocksDBStoreEngine returned =
+                    Assertions.assertDoesNotThrow(() -> getFuture.get(5, TimeUnit.SECONDS));
+
+            Assertions.assertSame(engine, returned);
+            Assertions.assertFalse(returned.isClosed());
+            Assertions.assertEquals(config, returned.getConfig());
+        } finally {
+            requestedConfig.releasePathRead();
+            lifecycleLock.readLock().unlock();
+            if (destroy != null) {
+                destroy.get(5, TimeUnit.SECONDS);
+            }
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test
@@ -464,23 +528,118 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testCloseWaitsForActiveRead() throws Exception {
+        RocksDBStoreEngine engine = open("close-waits-for-read", false);
+        ReentrantReadWriteLock lifecycleLock = maintenanceLock(engine);
+        ExecutorService lifecycleExecutor = Executors.newFixedThreadPool(2);
+        CountDownLatch readEntered = new CountDownLatch(1);
+        CountDownLatch releaseRead = new CountDownLatch(1);
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        AtomicReference<Thread> closeThread = new AtomicReference<>();
+        byte[] key = "read-key".getBytes(StandardCharsets.UTF_8);
+        byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+        engine.put(RocksDBColumnFamily.DEFAULT, key, value);
+
+        try {
+            Future<?> read = lifecycleExecutor.submit(() -> {
+                try {
+                    engine.scanByPrefix(RocksDBColumnFamily.DEFAULT, new byte[0], (entryKey, entryValue) -> {
+                        readEntered.countDown();
+                        awaitLatch(releaseRead, "active read was not released");
+                        throw StopReadAfterCloseException.INSTANCE;
+                    });
+                } catch (StopReadAfterCloseException ignored) {
+                    // Stop before the iterator advances if the old implementation already closed native resources.
+                }
+            });
+            Assertions.assertTrue(readEntered.await(5, TimeUnit.SECONDS));
+            Future<?> close = lifecycleExecutor.submit(() -> {
+                closeThread.set(Thread.currentThread());
+                closeStarted.countDown();
+                engine.close();
+            });
+            Assertions.assertTrue(closeStarted.await(5, TimeUnit.SECONDS));
+            waitUntil(() -> close.isDone() || lifecycleLock.hasQueuedThread(closeThread.get()));
+
+            Assertions.assertFalse(close.isDone());
+            Assertions.assertTrue(lifecycleLock.hasQueuedThread(closeThread.get()));
+            releaseRead.countDown();
+
+            read.get(5, TimeUnit.SECONDS);
+            close.get(5, TimeUnit.SECONDS);
+        } finally {
+            releaseRead.countDown();
+            lifecycleExecutor.shutdownNow();
+            lifecycleExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            if (!engine.isClosed()) {
+                engine.close();
+            }
+        }
+    }
+
+    @Test
+    void testReadOperationsUseStableClosedSemantics() {
+        RocksDBStoreEngine engine = RocksDBStoreEngine.open(tunedConfig("reads-after-close", false));
+        byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+        byte[] prefix = new byte[0];
+        engine.close();
+
+        Assertions.assertThrows(StoreException.class, () -> engine.get(RocksDBColumnFamily.DEFAULT, key));
+        Assertions.assertThrows(
+                StoreException.class, () -> engine.prefixScan(RocksDBColumnFamily.DEFAULT, prefix));
+        Assertions.assertThrows(
+                StoreException.class,
+                () -> engine.scanByPrefix(
+                        RocksDBColumnFamily.DEFAULT, prefix, prefix, 1, null, (entryKey, value) -> {}));
+        Assertions.assertThrows(
+                StoreException.class,
+                () -> engine.scanByPrefix(RocksDBColumnFamily.DEFAULT, prefix, (entryKey, value) -> {}));
+        Assertions.assertThrows(
+                StoreException.class, () -> engine.prefixExists(RocksDBColumnFamily.DEFAULT, prefix));
+
+        RocksDBStoreDiagnostics diagnostics = engine.diagnostics();
+        Assertions.assertTrue(diagnostics.isClosed());
+        Assertions.assertEquals(0L, engine.getLongProperty(RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
+        Assertions.assertEquals(
+                0L,
+                engine.getLongProperty(
+                        RocksDBColumnFamily.DEFAULT, RocksDBStoreDiagnostics.CUR_SIZE_ACTIVE_MEM_TABLE));
+        Assertions.assertNull(engine.getProperty("rocksdb.stats"));
+        Assertions.assertNull(engine.getProperty(RocksDBColumnFamily.DEFAULT, "rocksdb.stats"));
+        Assertions.assertEquals(0L, engine.getBlockCacheUsage());
+        Assertions.assertEquals(0L, engine.getBlockCachePinnedUsage());
+        Assertions.assertEquals(0L, engine.getBlockCacheCapacity());
+    }
+
+    @Test
     void testMutatingOperationsThrowStoreExceptionAfterClose() throws Exception {
         RocksDBStoreEngine engine = open("writes-after-close", false, true);
         byte[] key = "key".getBytes(StandardCharsets.UTF_8);
         byte[] value = "value".getBytes(StandardCharsets.UTF_8);
         byte[] prefix = "prefix".getBytes(StandardCharsets.UTF_8);
         try (WriteBatch batch = new WriteBatch()) {
-            batch.put(engine.handle(RocksDBColumnFamily.DEFAULT), key, value);
+            engine.put(batch, RocksDBColumnFamily.DEFAULT, key, value);
             engine.close();
 
             Assertions.assertThrows(
                     StoreException.class, () -> engine.put(RocksDBColumnFamily.DEFAULT, key, value));
             Assertions.assertThrows(StoreException.class, () -> engine.delete(RocksDBColumnFamily.DEFAULT, key));
+            Assertions.assertThrows(
+                    StoreException.class, () -> engine.put(batch, RocksDBColumnFamily.DEFAULT, key, value));
+            Assertions.assertThrows(
+                    StoreException.class, () -> engine.delete(batch, RocksDBColumnFamily.DEFAULT, key));
             Assertions.assertThrows(StoreException.class, () -> engine.write(batch));
             Assertions.assertThrows(
                     StoreException.class, () -> engine.deleteByPrefix(RocksDBColumnFamily.DEFAULT, prefix));
             Assertions.assertThrows(
                     StoreException.class, () -> engine.deleteRangeByPrefix(RocksDBColumnFamily.DEFAULT, prefix));
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> engine.deleteByPrefix(batch, RocksDBColumnFamily.DEFAULT, prefix));
+            Assertions.assertThrows(
+                    StoreException.class,
+                    () -> engine.deleteRangeByPrefix(batch, RocksDBColumnFamily.DEFAULT, prefix));
+            Assertions.assertThrows(StoreException.class, () -> engine.withMaintenanceLock(() -> null));
             Assertions.assertThrows(StoreException.class, engine::flush);
         } finally {
             engine.close();
@@ -608,14 +767,6 @@ class RocksDBStoreEngineTest {
         return new RocksDBStoreConfig(tempDir.resolve(name).toString(), syncWrite);
     }
 
-    private long getLongProperty(RocksDBStoreEngine engine, RocksDBColumnFamily columnFamily, String property)
-            throws ReflectiveOperationException, RocksDBException {
-        Field dbField = RocksDBStoreEngine.class.getDeclaredField("db");
-        dbField.setAccessible(true);
-        RocksDB db = (RocksDB) dbField.get(engine);
-        return db.getLongProperty(engine.handle(columnFamily), property);
-    }
-
     private RocksDBStoreConfig tunedConfig(String name, boolean syncWrite) {
         return tunedConfig(name, syncWrite, "no");
     }
@@ -704,6 +855,17 @@ class RocksDBStoreEngineTest {
         Assertions.fail("condition was not satisfied before timeout");
     }
 
+    private static void awaitLatch(CountDownLatch latch, String failureMessage) {
+        try {
+            if (!latch.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError(failureMessage);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting for test barrier", e);
+        }
+    }
+
     @FunctionalInterface
     private interface Condition {
         boolean evaluate();
@@ -756,6 +918,38 @@ class RocksDBStoreEngineTest {
 
         private void releaseAfterWrite() {
             releaseAfterWrite.countDown();
+        }
+    }
+
+    private static final class BlockingPathConfig extends RocksDBStoreConfig {
+        private final CountDownLatch pathRead = new CountDownLatch(1);
+        private final CountDownLatch releasePathRead = new CountDownLatch(1);
+
+        private BlockingPathConfig(RocksDBStoreConfig config) {
+            super(config.getDbPath(), config.isSyncWrite());
+        }
+
+        @Override
+        public String getDbPath() {
+            pathRead.countDown();
+            awaitLatch(releasePathRead, "factory config validation was not released");
+            return super.getDbPath();
+        }
+
+        private boolean awaitPathRead(long timeout, TimeUnit unit) throws InterruptedException {
+            return pathRead.await(timeout, unit);
+        }
+
+        private void releasePathRead() {
+            releasePathRead.countDown();
+        }
+    }
+
+    private static final class StopReadAfterCloseException extends RuntimeException {
+        private static final StopReadAfterCloseException INSTANCE = new StopReadAfterCloseException();
+
+        private StopReadAfterCloseException() {
+            super(null, null, false, false);
         }
     }
 

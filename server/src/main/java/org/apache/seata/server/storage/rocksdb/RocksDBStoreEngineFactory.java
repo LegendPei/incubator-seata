@@ -23,44 +23,43 @@ import org.apache.seata.common.exception.StoreException;
  */
 public final class RocksDBStoreEngineFactory {
 
-    private static volatile RocksDBStoreEngine ENGINE;
+    private static RocksDBStoreEngine ENGINE;
 
     private RocksDBStoreEngineFactory() {}
 
-    public static RocksDBStoreEngine getInstance() {
+    public static synchronized RocksDBStoreEngine getInstance() {
         return getInstance(RocksDBStoreConfig.fromConfiguration());
     }
 
-    public static RocksDBStoreEngine getInstance(RocksDBStoreConfig config) {
+    public static synchronized RocksDBStoreEngine getInstance(RocksDBStoreConfig config) {
         if (ENGINE == null) {
-            synchronized (RocksDBStoreEngineFactory.class) {
-                if (ENGINE == null) {
-                    ENGINE = RocksDBStoreEngine.open(config);
-                }
-            }
+            ENGINE = RocksDBStoreEngine.open(config);
         }
-        if (!ENGINE.getConfig().getDbPath().equals(config.getDbPath())) {
+        RocksDBStoreEngine engine = ENGINE;
+        if (!engine.getConfig().getDbPath().equals(config.getDbPath())) {
             throw new StoreException("RocksDB file store engine already opened with path:"
-                    + ENGINE.getConfig().getDbPath() + ", requested path:" + config.getDbPath());
+                    + engine.getConfig().getDbPath() + ", requested path:" + config.getDbPath());
         }
-        if (ENGINE.getConfig().isSyncWrite() != config.isSyncWrite()) {
+        if (engine.getConfig().isSyncWrite() != config.isSyncWrite()) {
             throw new StoreException("RocksDB file store engine already opened with syncWrite:"
-                    + ENGINE.getConfig().isSyncWrite() + ", requested syncWrite:" + config.isSyncWrite());
+                    + engine.getConfig().isSyncWrite() + ", requested syncWrite:" + config.isSyncWrite());
         }
-        if (!ENGINE.getConfig().equals(config)) {
+        if (!engine.getConfig().equals(config)) {
             throw new StoreException("RocksDB file store engine already opened with options:"
-                    + ENGINE.getConfig().tuningSummary() + ", requested options:" + config.tuningSummary());
+                    + engine.getConfig().tuningSummary() + ", requested options:" + config.tuningSummary());
         }
-        return ENGINE;
+        return engine;
     }
 
-    public static void destroy() {
-        synchronized (RocksDBStoreEngineFactory.class) {
-            RocksDBStoreEngine engine = ENGINE;
+    public static synchronized void destroy() {
+        RocksDBStoreEngine engine = ENGINE;
+        if (engine == null) {
+            return;
+        }
+        try {
+            engine.close();
+        } finally {
             ENGINE = null;
-            if (engine != null) {
-                engine.close();
-            }
         }
     }
 }

@@ -23,12 +23,18 @@ import org.junit.jupiter.api.Test;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 class RocksDBWalSyncControllerTest {
 
@@ -147,6 +153,49 @@ class RocksDBWalSyncControllerTest {
     }
 
     @Test
+    void testCloseWaitsForInFlightBackgroundSyncWhenFinalSyncIsDisabled() throws Exception {
+        BlockingWalSyncer syncer = new BlockingWalSyncer();
+        TrackingScheduledExecutor executor = new TrackingScheduledExecutor();
+        RocksDBWalSyncController controller = new RocksDBWalSyncController(
+                RocksDBWalSyncMode.PERIODIC,
+                syncer,
+                25L,
+                1L,
+                false,
+                1000L,
+                executor,
+                true,
+                System::currentTimeMillis,
+                System::nanoTime);
+        ExecutorService closeExecutor = Executors.newSingleThreadExecutor();
+        AtomicReference<Thread> closeThread = new AtomicReference<>();
+
+        try {
+            controller.afterWrite();
+            Assertions.assertTrue(syncer.awaitSyncStarted(5, TimeUnit.SECONDS));
+            Future<?> close = closeExecutor.submit(() -> {
+                closeThread.set(Thread.currentThread());
+                controller.close();
+            });
+            Assertions.assertTrue(executor.awaitShutdownNow(5, TimeUnit.SECONDS));
+            waitUntil(() -> close.isDone() || closeThread.get().getState() == Thread.State.BLOCKED);
+
+            Assertions.assertFalse(close.isDone());
+            syncer.releaseSync();
+
+            close.get(5, TimeUnit.SECONDS);
+            Assertions.assertTrue(executor.isTerminated());
+        } finally {
+            syncer.releaseSync();
+            controller.close();
+            closeExecutor.shutdownNow();
+            closeExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void testAfterWriteDoesNotThrowWhenBackgroundSchedulingIsRejected() {
         AtomicLong nowMillis = new AtomicLong(1000L);
         AtomicLong nowNanos = new AtomicLong(10_000L);
@@ -211,6 +260,22 @@ class RocksDBWalSyncControllerTest {
                 nowNanos::get);
     }
 
+    private void waitUntil(Condition condition) throws Exception {
+        long deadline = System.currentTimeMillis() + 3000L;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.evaluate()) {
+                return;
+            }
+            Thread.sleep(20L);
+        }
+        Assertions.fail("condition was not satisfied before timeout");
+    }
+
+    @FunctionalInterface
+    private interface Condition {
+        boolean evaluate();
+    }
+
     private static final class FakeWalSyncer implements RocksDBWalSyncController.WalSyncer {
         private int flushCount;
         private long sequence;
@@ -228,6 +293,61 @@ class RocksDBWalSyncControllerTest {
         @Override
         public long latestSequenceNumber() {
             return sequence;
+        }
+    }
+
+    private static final class BlockingWalSyncer implements RocksDBWalSyncController.WalSyncer {
+        private final CountDownLatch syncStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseSync = new CountDownLatch(1);
+        private long sequence;
+
+        @Override
+        public void flushWal(boolean sync) {
+            syncStarted.countDown();
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    releaseSync.await();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            sequence++;
+        }
+
+        @Override
+        public long latestSequenceNumber() {
+            return sequence;
+        }
+
+        private boolean awaitSyncStarted(long timeout, TimeUnit unit) throws InterruptedException {
+            return syncStarted.await(timeout, unit);
+        }
+
+        private void releaseSync() {
+            releaseSync.countDown();
+        }
+    }
+
+    private static final class TrackingScheduledExecutor extends ScheduledThreadPoolExecutor {
+        private final CountDownLatch shutdownNowCalled = new CountDownLatch(1);
+
+        private TrackingScheduledExecutor() {
+            super(1);
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            shutdownNowCalled.countDown();
+            return super.shutdownNow();
+        }
+
+        private boolean awaitShutdownNow(long timeout, TimeUnit unit) throws InterruptedException {
+            return shutdownNowCalled.await(timeout, unit);
         }
     }
 

@@ -232,6 +232,9 @@ final class RocksDBWalSyncController implements AutoCloseable {
             return;
         }
         try {
+            if (closed.get() && !strict) {
+                return;
+            }
             long writes = writeRequests.get();
             if (writes <= lastSyncedWriteRequests.get()) {
                 return;
@@ -308,28 +311,44 @@ final class RocksDBWalSyncController implements AutoCloseable {
         if (!isPeriodic() || !closed.compareAndSet(false, true)) {
             return;
         }
+        if (shutdownExecutor) {
+            executor.shutdownNow();
+        }
         RuntimeException syncFailure = null;
         try {
             if (syncOnShutdown) {
                 syncIfNeeded("shutdown", true);
+            } else {
+                awaitInFlightSync();
             }
         } catch (RuntimeException e) {
             syncFailure = e;
         } finally {
             if (shutdownExecutor) {
-                executor.shutdown();
-                try {
-                    if (!executor.awaitTermination(intervalMillis, TimeUnit.MILLISECONDS)) {
-                        executor.shutdownNow();
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    executor.shutdownNow();
-                }
+                awaitExecutorTermination();
             }
         }
         if (syncFailure != null) {
             throw syncFailure;
+        }
+    }
+
+    private synchronized void awaitInFlightSync() {
+        // Acquiring the sync monitor is the shutdown barrier for an active native flushWal call.
+    }
+
+    private void awaitExecutorTermination() {
+        boolean interrupted = false;
+        while (!executor.isTerminated()) {
+            try {
+                executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                interrupted = true;
+                executor.shutdownNow();
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 
