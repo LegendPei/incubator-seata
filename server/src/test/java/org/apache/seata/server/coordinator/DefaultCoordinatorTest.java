@@ -359,6 +359,48 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     }
 
     @Test
+    public void retryBackgroundScanReachesSession1025AfterFullFailingPage() throws Exception {
+        int firstPageSize = 1024;
+        Assertions.assertEquals(firstPageSize, DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        List<GlobalSession> failingFirstPage = new ArrayList<>(firstPageSize);
+        for (int i = 0; i < firstPageSize; i++) {
+            failingFirstPage.add(mock(GlobalSession.class));
+        }
+        GlobalSession session1025 = mock(GlobalSession.class);
+        byte[] nextCursor = new byte[] {1, 2, 3};
+        List<byte[]> observedCursors = new ArrayList<>();
+        SessionManager sessionManager = mock(SessionManager.class);
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            observedCursors.add(condition.getStatusScanCursor());
+            Assertions.assertEquals(firstPageSize, condition.getScanLimit());
+            if (condition.getStatusScanCursor() == null) {
+                condition.setNextStatusScanCursor(nextCursor);
+                return failingFirstPage;
+            }
+            Assertions.assertArrayEquals(nextCursor, condition.getStatusScanCursor());
+            condition.setNextStatusScanCursor(null);
+            return Collections.singletonList(session1025);
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+
+            List<GlobalSession> firstRound =
+                    invokeFindBackgroundSessions(new GlobalStatus[] {GlobalStatus.CommitRetrying}, true);
+            List<GlobalSession> secondRound =
+                    invokeFindBackgroundSessions(new GlobalStatus[] {GlobalStatus.CommitRetrying}, true);
+
+            Assertions.assertEquals(firstPageSize, firstRound.size());
+            Assertions.assertSame(session1025, secondRound.get(0));
+        }
+
+        Assertions.assertEquals(2, observedCursors.size());
+        Assertions.assertNull(observedCursors.get(0));
+        Assertions.assertArrayEquals(nextCursor, observedCursors.get(1));
+    }
+
+    @Test
     public void scheduledBackgroundTasksSetSessionQueryLimit() {
         List<SessionCondition> conditions = captureBackgroundSessionConditions(() -> {
             defaultCoordinator.handleRollbackingByScheduled();
@@ -1325,10 +1367,20 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         return conditions;
     }
 
+    @SuppressWarnings("unchecked")
+    private List<GlobalSession> invokeFindBackgroundSessions(GlobalStatus[] statuses, boolean lazyLoadBranch)
+            throws Exception {
+        java.lang.reflect.Method method = DefaultCoordinator.class.getDeclaredMethod(
+                "findBackgroundSessions", GlobalStatus[].class, boolean.class);
+        method.setAccessible(true);
+        return (List<GlobalSession>) method.invoke(defaultCoordinator, statuses, lazyLoadBranch);
+    }
+
     private void assertBackgroundSessionQueryConditions(List<SessionCondition> conditions) {
         Assertions.assertFalse(conditions.isEmpty());
         for (SessionCondition condition : conditions) {
             Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, condition.getLimit());
+            Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, condition.getScanLimit());
             Assertions.assertNotNull(condition.getStatuses());
             Assertions.assertEquals(1, condition.getStatuses().length);
         }

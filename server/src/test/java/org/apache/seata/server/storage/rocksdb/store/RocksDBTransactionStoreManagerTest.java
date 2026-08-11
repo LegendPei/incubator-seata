@@ -499,6 +499,53 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByStatusScanLimitCountsStaleEntriesAndResumesExactly() {
+        int scanLimit = 4;
+        try (RocksDBStoreEngine engine = open("condition-status-stale-scan-limit")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            for (int i = 0; i <= scanLimit; i++) {
+                String staleXid = "tx-stale-scan-limit-" + i;
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                        RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 100L + i, staleXid),
+                        staleXid.getBytes(StandardCharsets.UTF_8));
+            }
+            GlobalSession valid = globalSession("tx-valid-after-stale-scan-limit", GlobalStatus.Begin);
+            valid.setBeginTime(100L + scanLimit + 1L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, valid);
+
+            SessionCondition firstPage = new SessionCondition(GlobalStatus.Begin);
+            firstPage.setLazyLoadBranch(true);
+            firstPage.setLimit(1);
+            firstPage.setScanLimit(scanLimit);
+            List<GlobalSession> firstActual = storeManager.readSession(firstPage);
+
+            Assertions.assertTrue(firstActual.isEmpty());
+            Assertions.assertNotNull(firstPage.getNextStatusScanCursor());
+
+            SessionCondition secondPage = new SessionCondition(GlobalStatus.Begin);
+            secondPage.setLazyLoadBranch(true);
+            secondPage.setLimit(1);
+            secondPage.setScanLimit(scanLimit);
+            secondPage.setStatusScanCursor(firstPage.getNextStatusScanCursor());
+            List<GlobalSession> secondActual = storeManager.readSession(secondPage);
+
+            Assertions.assertEquals(1, secondActual.size());
+            Assertions.assertEquals(valid.getXid(), secondActual.get(0).getXid());
+            Assertions.assertNotNull(secondPage.getNextStatusScanCursor());
+
+            SessionCondition finalPage = new SessionCondition(GlobalStatus.Begin);
+            finalPage.setLazyLoadBranch(true);
+            finalPage.setLimit(1);
+            finalPage.setScanLimit(scanLimit);
+            finalPage.setStatusScanCursor(secondPage.getNextStatusScanCursor());
+
+            Assertions.assertTrue(storeManager.readSession(finalPage).isEmpty());
+            Assertions.assertNull(finalPage.getNextStatusScanCursor());
+        }
+    }
+
+    @Test
     void testReadByEmptySessionConditionScansAll() {
         try (RocksDBStoreEngine engine = open("condition-all")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);

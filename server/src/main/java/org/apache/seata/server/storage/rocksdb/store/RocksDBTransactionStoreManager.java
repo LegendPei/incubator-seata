@@ -284,37 +284,42 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     }
 
     private List<GlobalSession> readByStatuses(SessionCondition sessionCondition) {
+        StatusScanBudget scanBudget = new StatusScanBudget(sessionCondition.getScanLimit());
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
+        sessionCondition.setNextStatusScanCursor(null);
         Long overTimeAliveMills = sessionCondition.getOverTimeAliveMills();
         Integer limit = sessionCondition.getLimit();
         Long maxBeginTime = overTimeAliveMills != null && overTimeAliveMills > 0
                 ? System.currentTimeMillis() - overTimeAliveMills
                 : null;
         if (sessionCondition.getStatuses().length > 1) {
-            return readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit);
+            return readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit, scanBudget);
         }
-        statusLoop:
         for (GlobalStatus status : sessionCondition.getStatuses()) {
             if (maxBeginTime == null) {
-                if (limit == null || limit <= 0) {
+                if ((limit == null || limit <= 0) && !scanBudget.isBounded()) {
                     for (String xid : indexManager.scanXidsByStatus(status)) {
                         if (appendMatchingSession(sessionCondition, seenXids, result, xid, status, null)
                                 && isLimitReached(limit, result)) {
-                            break statusLoop;
+                            break;
                         }
                     }
                     continue;
                 }
             }
-            byte[] cursor = null;
+            byte[] cursor = sessionCondition.getStatusScanCursor();
             do {
+                if (scanBudget.isExhausted()) {
+                    break;
+                }
                 RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
                         status,
                         0L,
                         maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime,
                         cursor,
-                        nextPageLimit(limit, result));
+                        scanBudget.clamp(nextPageLimit(limit, result)));
+                scanBudget.record(scanResult.getRowsScanned());
                 for (RocksDBIndexManager.StatusIndexEntry entry : scanResult.getEntries()) {
                     if (appendMatchingSession(
                                     sessionCondition,
@@ -324,17 +329,18 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                                     entry.getStatus(),
                                     entry.getBeginTime())
                             && isLimitReached(limit, result)) {
-                        break statusLoop;
+                        break;
                     }
                 }
                 cursor = scanResult.getNextCursor();
-            } while (cursor != null && !isLimitReached(limit, result));
+            } while (cursor != null && !isLimitReached(limit, result) && !scanBudget.isExhausted());
+            sessionCondition.setNextStatusScanCursor(cursor);
         }
         return result;
     }
 
     private List<GlobalSession> readByStatusesWithKWayMerge(
-            SessionCondition sessionCondition, Long maxBeginTime, Integer limit) {
+            SessionCondition sessionCondition, Long maxBeginTime, Integer limit, StatusScanBudget scanBudget) {
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
         PriorityQueue<StatusScanCursor> queue =
@@ -342,7 +348,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                         .thenComparingInt(StatusScanCursor::statusCode)
                         .thenComparing(StatusScanCursor::xid));
         for (GlobalStatus status : sessionCondition.getStatuses()) {
-            StatusScanCursor cursor = new StatusScanCursor(status, maxBeginTime, limit);
+            StatusScanCursor cursor = new StatusScanCursor(status, maxBeginTime, limit, scanBudget);
             if (cursor.hasCurrent()) {
                 queue.offer(cursor);
             }
@@ -396,17 +402,44 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return limit != null && limit > 0 && result.size() >= limit;
     }
 
+    private static class StatusScanBudget {
+        private final int limit;
+        private int examined;
+
+        StatusScanBudget(Integer limit) {
+            this.limit = limit == null || limit <= 0 ? 0 : limit;
+        }
+
+        boolean isBounded() {
+            return limit > 0;
+        }
+
+        boolean isExhausted() {
+            return isBounded() && examined >= limit;
+        }
+
+        int clamp(int requested) {
+            return isBounded() ? Math.min(requested, limit - examined) : requested;
+        }
+
+        void record(int rowsScanned) {
+            examined += rowsScanned;
+        }
+    }
+
     private class StatusScanCursor {
         private final GlobalStatus status;
         private final Long maxBeginTime;
+        private final StatusScanBudget scanBudget;
         private List<RocksDBIndexManager.StatusIndexEntry> entries = Collections.emptyList();
         private byte[] nextCursor;
         private int index;
         private boolean exhausted;
 
-        StatusScanCursor(GlobalStatus status, Long maxBeginTime, Integer limit) {
+        StatusScanCursor(GlobalStatus status, Long maxBeginTime, Integer limit, StatusScanBudget scanBudget) {
             this.status = status;
             this.maxBeginTime = maxBeginTime;
+            this.scanBudget = scanBudget;
             loadNextPage(limit, Collections.emptyList());
         }
 
@@ -438,17 +471,19 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
 
         private void loadNextPage(Integer limit, List<GlobalSession> result) {
-            if (exhausted) {
+            if (exhausted || scanBudget.isExhausted()) {
                 entries = Collections.emptyList();
                 index = 0;
                 return;
             }
+            int requested = scanBudget.isBounded() ? 1 : nextPageLimit(limit, result);
             RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
                     status,
                     0L,
                     maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime,
                     nextCursor,
-                    nextPageLimit(limit, result));
+                    scanBudget.clamp(requested));
+            scanBudget.record(scanResult.getRowsScanned());
             entries = scanResult.getEntries();
             index = 0;
             nextCursor = scanResult.getNextCursor();

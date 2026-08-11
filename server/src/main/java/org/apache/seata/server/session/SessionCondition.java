@@ -18,6 +18,8 @@ package org.apache.seata.server.session;
 
 import org.apache.seata.core.model.GlobalStatus;
 
+import java.util.Arrays;
+
 /**
  * The type Session condition.
  *
@@ -29,7 +31,10 @@ public class SessionCondition {
     private GlobalStatus[] statuses;
     private Long overTimeAliveMills;
     private Integer limit;
+    private Integer scanLimit;
     private boolean lazyLoadBranch;
+    private byte[] statusScanCursor;
+    private byte[] nextStatusScanCursor;
 
     /**
      * Instantiates a new Session condition.
@@ -142,11 +147,37 @@ public class SessionCondition {
         this.limit = limit;
     }
 
+    public Integer getScanLimit() {
+        return scanLimit;
+    }
+
+    public void setScanLimit(Integer scanLimit) {
+        this.scanLimit = scanLimit;
+    }
+
     public boolean isLazyLoadBranch() {
         return lazyLoadBranch;
     }
 
     public void setLazyLoadBranch(boolean lazyLoadBranch) {
         this.lazyLoadBranch = lazyLoadBranch;
+    }
+
+    public byte[] getStatusScanCursor() {
+        return statusScanCursor == null ? null : Arrays.copyOf(statusScanCursor, statusScanCursor.length);
+    }
+
+    public void setStatusScanCursor(byte[] statusScanCursor) {
+        this.statusScanCursor =
+                statusScanCursor == null ? null : Arrays.copyOf(statusScanCursor, statusScanCursor.length);
+    }
+
+    public byte[] getNextStatusScanCursor() {
+        return nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
+    }
+
+    public void setNextStatusScanCursor(byte[] nextStatusScanCursor) {
+        this.nextStatusScanCursor =
+                nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
     }
 }
