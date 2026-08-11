@@ -516,17 +516,27 @@ public class SessionHolder {
         return lock;
     }
 
-    public static void destroy() {
+    public static synchronized void destroy() {
         RaftServerManager.destroy();
-        RocksDBOrphanLockCleanupController orphanLockCleanupController = ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER;
-        if (orphanLockCleanupController != null) {
-            orphanLockCleanupController.close();
-            ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER = null;
+        boolean rocksDBCleanupClosed = closeRocksDBOrphanLockCleanupController();
+        if (rocksDBCleanupClosed) {
+            LockerManagerFactory.destroy();
+            EnhancedServiceLoader.unload(LockManager.class);
         }
         if (ROOT_SESSION_MANAGER != null) {
             ROOT_SESSION_MANAGER.destroy();
         }
         SESSION_MANAGER_MAP = null;
+    }
+
+    private static boolean closeRocksDBOrphanLockCleanupController() {
+        RocksDBOrphanLockCleanupController orphanLockCleanupController = ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER;
+        if (orphanLockCleanupController == null) {
+            return false;
+        }
+        orphanLockCleanupController.close();
+        ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER = null;
+        return true;
     }
 
     @FunctionalInterface

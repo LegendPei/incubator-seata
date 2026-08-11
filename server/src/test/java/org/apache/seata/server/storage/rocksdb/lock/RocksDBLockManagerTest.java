@@ -21,31 +21,44 @@ import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.exception.BranchTransactionException;
+import org.apache.seata.core.exception.TransactionException;
 import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
+import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.core.model.LockStatus;
+import org.apache.seata.core.rpc.RemotingServer;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
+import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionManager;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
+import org.apache.seata.server.transaction.at.ATCore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 class RocksDBLockManagerTest {
 
@@ -53,16 +66,27 @@ class RocksDBLockManagerTest {
     Path tempDir;
 
     private Object originalEnvironment;
+    private SessionManager originalRootSessionManager;
+    private Map<String, SessionManager> originalSessionManagerMap;
 
     @BeforeEach
-    void beforeEach() {
+    void beforeEach() throws Exception {
         originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
         ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
         ConfigurationCache.clear();
+        originalRootSessionManager = rootSessionManagerField().get(null) instanceof SessionManager
+                ? (SessionManager) rootSessionManagerField().get(null)
+                : null;
+        @SuppressWarnings("unchecked")
+        Map<String, SessionManager> sessionManagerMap =
+                (Map<String, SessionManager>) sessionManagerMapField().get(null);
+        originalSessionManagerMap = sessionManagerMap;
     }
 
     @AfterEach
     void afterEach() throws Exception {
+        rootSessionManagerField().set(null, originalRootSessionManager);
+        sessionManagerMapField().set(null, originalSessionManagerMap);
         ConfigurationCache.clear();
         restoreEnvironment();
     }
@@ -432,6 +456,103 @@ class RocksDBLockManagerTest {
     }
 
     @Test
+    void testCleanOrphanLocksDoesNotDeleteLockDuringBranchRegistration() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-registration-race")) {
+            RocksDBLockManager registrationLockManager = new RocksDBLockManager(engine);
+            CountDownLatch lockAcquired = new CountDownLatch(1);
+            CountDownLatch continueRegistration = new CountDownLatch(1);
+            CompletableFuture<Void> cleanupEnteredSessionLock = new CompletableFuture<>();
+            AtomicReference<Thread> cleanupThread = new AtomicReference<>();
+            RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine) {
+                @Override
+                public <T> T lockAndExecute(GlobalSession globalSession, GlobalSession.LockCallable<T> lockCallable)
+                        throws TransactionException {
+                    if (Thread.currentThread() == cleanupThread.get()) {
+                        cleanupEnteredSessionLock.complete(null);
+                    }
+                    return super.lockAndExecute(globalSession, lockCallable);
+                }
+            };
+            setRootSessionManager(sessionManager);
+            Field lockManagerField = lockerManagerField();
+            Object originalLockManager = lockManagerField.get(null);
+            lockManagerField.set(null, registrationLockManager);
+
+            GlobalSession globalSession = new GlobalSession("app", "group", "registration-race", 60_000);
+            globalSession.setStatus(GlobalStatus.Begin);
+            globalSession.setBeginTime(System.currentTimeMillis());
+            sessionManager.addGlobalSession(globalSession);
+            String resourceId = "jdbc:mysql://127.0.0.1/db";
+            BranchSession branchSession = branchSession(globalSession, 1L, "t_order:1");
+            byte[] lockKey = RocksDBKeyCodec.encodeRowLock(resourceId, "t_order", "1");
+            class PausingATCore extends ATCore {
+                private PausingATCore() {
+                    super(Mockito.mock(RemotingServer.class));
+                }
+
+                private Long register(GlobalSession registeringGlobal, BranchSession registeringBranch)
+                        throws TransactionException {
+                    return SessionHolder.lockAndExecute(registeringGlobal, () -> {
+                        branchSessionLock(registeringGlobal, registeringBranch);
+                        registeringGlobal.addBranch(registeringBranch);
+                        return registeringBranch.getBranchId();
+                    });
+                }
+
+                @Override
+                protected void branchSessionLock(GlobalSession registeringGlobal, BranchSession branchSession)
+                        throws TransactionException {
+                    super.branchSessionLock(registeringGlobal, branchSession);
+                    lockAcquired.countDown();
+                    try {
+                        if (!continueRegistration.await(5, TimeUnit.SECONDS)) {
+                            throw new TransactionException("registration test latch timed out");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new TransactionException(e);
+                    }
+                }
+            }
+            PausingATCore registrationCore = new PausingATCore();
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            CompletableFuture<Long> registration = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return registrationCore.register(globalSession, branchSession);
+                } catch (TransactionException e) {
+                    throw new CompletionException(e);
+                }
+            }, executor);
+            CompletableFuture<RocksDBLockManager.CleanOrphanLocksResult> cleanup = null;
+            try {
+                Assertions.assertTrue(lockAcquired.await(5, TimeUnit.SECONDS));
+                cleanup = CompletableFuture.supplyAsync(() -> {
+                    cleanupThread.set(Thread.currentThread());
+                    return registrationLockManager.cleanOrphanLocks(1);
+                }, executor);
+
+                CompletableFuture.anyOf(cleanupEnteredSessionLock, cleanup).get(5, TimeUnit.SECONDS);
+                Assertions.assertNotNull(
+                        engine.get(RocksDBColumnFamily.LOCK, lockKey),
+                        "orphan cleanup must not delete a lock owned by an in-flight registration");
+
+                continueRegistration.countDown();
+                Assertions.assertNotNull(registration.get(5, TimeUnit.SECONDS));
+                Assertions.assertEquals(0, cleanup.get(5, TimeUnit.SECONDS).getCleaned());
+                Assertions.assertEquals(0, registrationLockManager.cleanOrphanLocks());
+                Assertions.assertNotNull(engine.get(RocksDBColumnFamily.LOCK, lockKey));
+            } finally {
+                continueRegistration.countDown();
+                awaitCompletion(registration);
+                awaitCompletion(cleanup);
+                executor.shutdownNow();
+                Assertions.assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+                lockManagerField.set(null, originalLockManager);
+            }
+        }
+    }
+
+    @Test
     void testCleanOrphanLocksDeletesStaleIndexWithoutLockValue() throws Exception {
         try (RocksDBStoreEngine engine = open("clean-stale-index")) {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
@@ -467,6 +588,46 @@ class RocksDBLockManagerTest {
         branchSession.setResourceId("jdbc:mysql://127.0.0.1/db");
         branchSession.setLockKey(lockKey);
         return branchSession;
+    }
+
+    private BranchSession branchSession(GlobalSession globalSession, long branchId, String lockKey) {
+        BranchSession branchSession = branchSession(globalSession.getTransactionId(), branchId, lockKey);
+        branchSession.setXid(globalSession.getXid());
+        return branchSession;
+    }
+
+    private void setRootSessionManager(SessionManager sessionManager) throws Exception {
+        rootSessionManagerField().set(null, sessionManager);
+        sessionManagerMapField().set(null, null);
+    }
+
+    private Field rootSessionManagerField() throws Exception {
+        Field field = SessionHolder.class.getDeclaredField("ROOT_SESSION_MANAGER");
+        field.setAccessible(true);
+        return field;
+    }
+
+    private Field sessionManagerMapField() throws Exception {
+        Field field = SessionHolder.class.getDeclaredField("SESSION_MANAGER_MAP");
+        field.setAccessible(true);
+        return field;
+    }
+
+    private Field lockerManagerField() throws Exception {
+        Field field = org.apache.seata.server.lock.LockerManagerFactory.class.getDeclaredField("LOCK_MANAGER");
+        field.setAccessible(true);
+        return field;
+    }
+
+    private void awaitCompletion(CompletableFuture<?> future) {
+        if (future == null) {
+            return;
+        }
+        try {
+            future.get(5, TimeUnit.SECONDS);
+        } catch (Exception ignored) {
+            // The test assertion reports the primary failure; cleanup only prevents leaked workers.
+        }
     }
 
     private String xid(long transactionId) {

@@ -20,10 +20,14 @@ import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.util.CollectionUtils;
 import org.apache.seata.common.util.StringUtils;
 import org.apache.seata.core.exception.BranchTransactionException;
+import org.apache.seata.core.exception.TransactionException;
 import org.apache.seata.core.lock.AbstractLocker;
 import org.apache.seata.core.lock.RowLock;
 import org.apache.seata.core.model.LockStatus;
 import org.apache.seata.core.store.LockDO;
+import org.apache.seata.server.session.GlobalSession;
+import org.apache.seata.server.session.SessionHolder;
+import org.apache.seata.server.session.SessionManager;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBLocalLocks;
@@ -263,6 +267,7 @@ public class RocksDBLocker extends AbstractLocker {
                     0, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
         }
         int cleaned = 0;
+        Map<String, List<OrphanLockCandidate>> candidatesByXid = new LinkedHashMap<>();
         try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
                 WriteBatch batch = new WriteBatch()) {
             for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
@@ -287,17 +292,96 @@ public class RocksDBLocker extends AbstractLocker {
                                 RocksDBColumnFamily.BRANCH_SESSION,
                                 RocksDBKeyCodec.encodeBranch(existingLock.getXid(), existingLock.getBranchId()))
                         == null) {
-                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
-                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
-                    cleaned++;
+                    candidatesByXid
+                            .computeIfAbsent(existingLock.getXid(), ignoredXid -> new ArrayList<>())
+                            .add(new OrphanLockCandidate(indexEntry.getKey(), lockKey));
                 }
             }
             storeEngine.write(batch);
-            return new RocksDBLockManager.CleanOrphanLocksResult(
-                    cleaned, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
         } catch (RocksDBException e) {
             throw new StoreException(e, "clean RocksDB orphan locks failed");
         }
+        SessionManager sessionManager = SessionHolder.getRootSessionManager();
+        for (Map.Entry<String, List<OrphanLockCandidate>> entry : candidatesByXid.entrySet()) {
+            cleaned += cleanOrphanCandidates(sessionManager, entry.getKey(), entry.getValue());
+        }
+        return new RocksDBLockManager.CleanOrphanLocksResult(
+                cleaned, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
+    }
+
+    private int cleanOrphanCandidates(
+            SessionManager sessionManager, String xid, List<OrphanLockCandidate> candidates) {
+        if (!persistentGlobalSessionExists(xid)) {
+            return deleteConfirmedOrphans(xid, candidates, true);
+        }
+        if (sessionManager == null) {
+            return 0;
+        }
+        GlobalSession globalSession = new GlobalSession();
+        globalSession.setXid(xid);
+        try {
+            return sessionManager.lockAndExecute(globalSession, () -> deleteConfirmedOrphans(xid, candidates, false));
+        } catch (TransactionException e) {
+            throw new StoreException(e, "coordinate RocksDB orphan lock cleanup failed, xid:" + xid);
+        }
+    }
+
+    private boolean persistentGlobalSessionExists(String xid) {
+        return storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid)) != null;
+    }
+
+    private int deleteConfirmedOrphans(
+            String xid, List<OrphanLockCandidate> candidates, boolean requireMissingGlobalSession) {
+        try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(candidateLockKeys(candidates));
+                WriteBatch batch = new WriteBatch()) {
+            if (requireMissingGlobalSession
+                    && storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid)) != null) {
+                return 0;
+            }
+            int cleaned = 0;
+            for (OrphanLockCandidate candidate : candidates) {
+                byte[] indexedLockKey =
+                        storeEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
+                if (!Arrays.equals(indexedLockKey, candidate.lockKey)) {
+                    continue;
+                }
+                byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, candidate.lockKey);
+                if (lockValue == null) {
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
+                    cleaned++;
+                    continue;
+                }
+                LockDO currentLock = decodeLock(lockValue);
+                byte[] expectedIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
+                        currentLock.getXid(), currentLock.getBranchId(), candidate.lockKey);
+                if (!Arrays.equals(expectedIndexKey, candidate.indexKey)) {
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
+                    cleaned++;
+                    continue;
+                }
+                if (storeEngine.get(
+                                RocksDBColumnFamily.BRANCH_SESSION,
+                                RocksDBKeyCodec.encodeBranch(currentLock.getXid(), currentLock.getBranchId()))
+                        != null) {
+                    continue;
+                }
+                storeEngine.delete(batch, RocksDBColumnFamily.LOCK, candidate.lockKey);
+                storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
+                cleaned++;
+            }
+            storeEngine.write(batch);
+            return cleaned;
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "delete confirmed RocksDB orphan locks failed, xid:" + xid);
+        }
+    }
+
+    private List<byte[]> candidateLockKeys(List<OrphanLockCandidate> candidates) {
+        List<byte[]> lockKeys = new ArrayList<>(candidates.size());
+        for (OrphanLockCandidate candidate : candidates) {
+            lockKeys.add(candidate.lockKey);
+        }
+        return lockKeys;
     }
 
     private List<RocksDBStoreEngine.RocksDBEntry> scanLockBranchIndex(byte[] prefix, int limit) {
@@ -339,6 +423,16 @@ public class RocksDBLocker extends AbstractLocker {
             return null;
         }
         return nextSeekKey;
+    }
+
+    private static final class OrphanLockCandidate {
+        private final byte[] indexKey;
+        private final byte[] lockKey;
+
+        private OrphanLockCandidate(byte[] indexKey, byte[] lockKey) {
+            this.indexKey = Arrays.copyOf(indexKey, indexKey.length);
+            this.lockKey = Arrays.copyOf(lockKey, lockKey.length);
+        }
     }
 
     private static final class LockBranchIndexScanResult {

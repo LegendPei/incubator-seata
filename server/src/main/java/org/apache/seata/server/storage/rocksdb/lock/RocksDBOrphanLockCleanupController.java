@@ -75,6 +75,8 @@ public class RocksDBOrphanLockCleanupController implements AutoCloseable {
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean cycleRunning = new AtomicBoolean();
+    private final Object closeMonitor = new Object();
+    private volatile StoreException closeFailure;
 
     private final AtomicLong completedCycles = new AtomicLong();
     private final AtomicLong completedPasses = new AtomicLong();
@@ -317,28 +319,15 @@ public class RocksDBOrphanLockCleanupController implements AutoCloseable {
     }
 
     byte[] loadPersistedCursor() {
-        try {
-            return storeEngine.get(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY);
-        } catch (Exception e) {
-            LOGGER.warn("failed to load persisted orphan lock cleanup cursor, starting from the beginning", e);
-            return null;
-        }
+        return storeEngine.get(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY);
     }
 
     private void savePersistedCursor(byte[] cursor) {
-        try {
-            storeEngine.put(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY, cursor);
-        } catch (Exception e) {
-            LOGGER.warn("failed to persist orphan lock cleanup cursor, the next cycle restarts from the beginning", e);
-        }
+        storeEngine.put(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY, cursor);
     }
 
     private void clearPersistedCursor() {
-        try {
-            storeEngine.delete(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY);
-        } catch (Exception e) {
-            LOGGER.warn("failed to clear persisted orphan lock cleanup cursor", e);
-        }
+        storeEngine.delete(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY);
     }
 
     private void scheduledCycle() {
@@ -388,22 +377,70 @@ public class RocksDBOrphanLockCleanupController implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!isEnabled() || !closed.compareAndSet(false, true)) {
+        if (!isEnabled()) {
             return;
         }
-        if (!shutdownExecutor) {
-            return;
-        }
-        executor.shutdown();
-        try {
-            long waitMillis = Math.min(5000L, Math.max(1000L, roundSleepMillis * 2 + 1000L));
-            if (!executor.awaitTermination(waitMillis, TimeUnit.MILLISECONDS)) {
-                executor.shutdownNow();
+        synchronized (closeMonitor) {
+            if (closeFailure != null) {
+                throw closeFailure;
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            executor.shutdownNow();
+            if (!closed.compareAndSet(false, true) || !shutdownExecutor) {
+                return;
+            }
+            try {
+                shutdownExecutorAndAwaitTermination();
+            } catch (StoreException e) {
+                closeFailure = e;
+                throw e;
+            } catch (RuntimeException e) {
+                StoreException failure = new StoreException(e, "shut down RocksDB orphan lock cleanup failed");
+                closeFailure = failure;
+                throw failure;
+            }
         }
+    }
+
+    private void shutdownExecutorAndAwaitTermination() {
+        long waitMillis = Math.min(5000L, Math.max(1000L, roundSleepMillis * 2 + 1000L));
+        executor.shutdown();
+        InterruptedException interruption = null;
+        boolean terminated = false;
+        try {
+            try {
+                terminated = awaitExecutorTermination(waitMillis);
+            } catch (InterruptedException e) {
+                interruption = e;
+            }
+            if (!terminated) {
+                executor.shutdownNow();
+                try {
+                    terminated = awaitExecutorTermination(waitMillis);
+                } catch (InterruptedException e) {
+                    if (interruption == null) {
+                        interruption = e;
+                    } else {
+                        interruption.addSuppressed(e);
+                    }
+                }
+            }
+            if (interruption != null) {
+                String message = terminated
+                        ? "interrupted while shutting down RocksDB orphan lock cleanup"
+                        : "interrupted before RocksDB orphan lock cleanup executor termination was confirmed";
+                throw new StoreException(interruption, message);
+            }
+            if (!terminated) {
+                throw new StoreException("RocksDB orphan lock cleanup executor did not terminate");
+            }
+        } finally {
+            if (interruption != null) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private boolean awaitExecutorTermination(long waitMillis) throws InterruptedException {
+        return executor.awaitTermination(waitMillis, TimeUnit.MILLISECONDS) && executor.isTerminated();
     }
 
     private static long positive(long value, String key) {
