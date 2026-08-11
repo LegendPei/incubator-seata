@@ -369,6 +369,60 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadSessionResetsContinuationOutputsWithoutClearingInputCursors() {
+        try (RocksDBStoreEngine engine = open("reused-condition-continuations")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("tx-reused-condition-first", GlobalStatus.Begin, 100);
+            first.setBeginTime(100L);
+            GlobalSession second = globalSession("tx-reused-condition-second", GlobalStatus.Begin, 100);
+            second.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(1);
+            condition.setScanLimit(1);
+            condition.setNextTimeoutScanCursor(new byte[] {9});
+
+            Assertions.assertEquals(1, storeManager.readSession(condition).size());
+            Assertions.assertEquals(
+                    SessionCondition.ScanContinuation.RESUMABLE, condition.getStatusScanContinuation());
+            Assertions.assertEquals(
+                    SessionCondition.ScanContinuation.UNSET, condition.getTimeoutScanContinuation());
+            byte[] statusInputCursor = condition.getNextStatusScanCursor();
+            Assertions.assertNotNull(statusInputCursor);
+            condition.setStatusScanCursor(statusInputCursor);
+
+            condition.setMaxTimeoutDeadlineMillis(1_000L);
+            Assertions.assertEquals(1, storeManager.readSession(condition).size());
+            Assertions.assertEquals(
+                    SessionCondition.ScanContinuation.UNSET, condition.getStatusScanContinuation());
+            Assertions.assertEquals(
+                    SessionCondition.ScanContinuation.RESUMABLE, condition.getTimeoutScanContinuation());
+            Assertions.assertArrayEquals(statusInputCursor, condition.getStatusScanCursor());
+            byte[] timeoutInputCursor = condition.getNextTimeoutScanCursor();
+            Assertions.assertNotNull(timeoutInputCursor);
+            condition.setTimeoutScanCursor(timeoutInputCursor);
+
+            condition.setXid(first.getXid());
+            Assertions.assertEquals(1, storeManager.readSession(condition).size());
+            assertContinuationOutputsUnset(condition);
+            Assertions.assertArrayEquals(statusInputCursor, condition.getStatusScanCursor());
+            Assertions.assertArrayEquals(timeoutInputCursor, condition.getTimeoutScanCursor());
+
+            condition.setXid(null);
+            condition.setTransactionId(first.getTransactionId());
+            condition.setNextStatusScanCursor(new byte[] {7});
+            condition.setNextTimeoutScanCursor(new byte[] {8});
+            Assertions.assertEquals(1, storeManager.readSession(condition).size());
+            assertContinuationOutputsUnset(condition);
+            Assertions.assertArrayEquals(statusInputCursor, condition.getStatusScanCursor());
+            Assertions.assertArrayEquals(timeoutInputCursor, condition.getTimeoutScanCursor());
+        }
+    }
+
+    @Test
     void testGlobalUpdateRemovesTimeoutIndexForNonBeginStatus() {
         try (RocksDBStoreEngine engine = open("timeout-index-status-update")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -795,6 +849,15 @@ class RocksDBTransactionStoreManagerTest {
     private RocksDBStoreEngine open(String name, boolean enableRangeDelete) {
         return RocksDBStoreEngine.open(
                 new RocksDBStoreConfig(tempDir.resolve(name).toString(), true, enableRangeDelete));
+    }
+
+    private void assertContinuationOutputsUnset(SessionCondition condition) {
+        Assertions.assertNull(condition.getNextStatusScanCursor());
+        Assertions.assertEquals(
+                SessionCondition.ScanContinuation.UNSET, condition.getStatusScanContinuation());
+        Assertions.assertNull(condition.getNextTimeoutScanCursor());
+        Assertions.assertEquals(
+                SessionCondition.ScanContinuation.UNSET, condition.getTimeoutScanContinuation());
     }
 
     private GlobalSession globalSession(String name, GlobalStatus status) {

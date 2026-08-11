@@ -180,6 +180,8 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         if (sessionCondition == null) {
             return Collections.emptyList();
         }
+        sessionCondition.clearNextStatusScanCursor();
+        sessionCondition.clearNextTimeoutScanCursor();
         sessionCondition.clearScanStats();
         if (StringUtils.isNotBlank(sessionCondition.getXid())) {
             GlobalSession globalSession = readSession(sessionCondition.getXid(), !sessionCondition.isLazyLoadBranch());
@@ -294,7 +296,6 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         ScanBudget scanBudget = new ScanBudget(sessionCondition.getScanLimit());
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
-        sessionCondition.clearNextTimeoutScanCursor();
         Integer limit = sessionCondition.getLimit();
         byte[] cursor = sessionCondition.getTimeoutScanCursor();
         do {
@@ -325,7 +326,6 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         ScanBudget scanBudget = new ScanBudget(sessionCondition.getScanLimit());
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
-        sessionCondition.clearNextStatusScanCursor();
         Long overTimeAliveMills = sessionCondition.getOverTimeAliveMills();
         Integer limit = sessionCondition.getLimit();
         Long maxBeginTime = overTimeAliveMills != null && overTimeAliveMills > 0

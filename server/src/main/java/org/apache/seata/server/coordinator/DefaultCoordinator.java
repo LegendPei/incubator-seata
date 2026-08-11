@@ -497,12 +497,20 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     }
 
     private void updateTimeoutCheckCursor(SessionCondition sessionCondition) {
-        if (sessionCondition.getTimeoutScanContinuation() != SessionCondition.ScanContinuation.RESUMABLE) {
-            timeoutCheckCursor = null;
-            return;
+        switch (sessionCondition.getTimeoutScanContinuation()) {
+            case RESUMABLE:
+                byte[] nextCursor = sessionCondition.getNextTimeoutScanCursor();
+                timeoutCheckCursor = Arrays.copyOf(nextCursor, nextCursor.length);
+                break;
+            case EXHAUSTED:
+                timeoutCheckCursor = null;
+                break;
+            case UNSET:
+                break;
+            default:
+                throw new IllegalStateException(
+                        "unsupported timeout scan continuation:" + sessionCondition.getTimeoutScanContinuation());
         }
-        byte[] nextCursor = sessionCondition.getNextTimeoutScanCursor();
-        timeoutCheckCursor = Arrays.copyOf(nextCursor, nextCursor.length);
     }
 
     /**
@@ -714,12 +722,21 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     }
 
     private void updateBackgroundSessionCursor(GlobalStatus status, SessionCondition sessionCondition) {
-        if (sessionCondition.getStatusScanContinuation() != SessionCondition.ScanContinuation.RESUMABLE) {
-            backgroundSessionStatusCursors.remove(status);
-            return;
+        switch (sessionCondition.getStatusScanContinuation()) {
+            case RESUMABLE:
+                byte[] nextStatusScanCursor = sessionCondition.getNextStatusScanCursor();
+                backgroundSessionStatusCursors.put(
+                        status, Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length));
+                break;
+            case EXHAUSTED:
+                backgroundSessionStatusCursors.remove(status);
+                break;
+            case UNSET:
+                break;
+            default:
+                throw new IllegalStateException(
+                        "unsupported status scan continuation:" + sessionCondition.getStatusScanContinuation());
         }
-        byte[] nextStatusScanCursor = sessionCondition.getNextStatusScanCursor();
-        backgroundSessionStatusCursors.put(status, Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length));
     }
 
     private List<GlobalSession> limitBackgroundSessions(List<GlobalSession> sessions) {

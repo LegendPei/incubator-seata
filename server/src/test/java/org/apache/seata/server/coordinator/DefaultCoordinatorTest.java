@@ -407,6 +407,8 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
             cursors.add(condition.getTimeoutScanCursor());
             if (cursors.size() == 1) {
                 condition.setNextTimeoutScanCursor(nextCursor);
+            } else if (cursors.size() == 2) {
+                condition.setNextTimeoutScanCursor(null);
             }
             return Collections.emptyList();
         });
@@ -452,6 +454,8 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
             cursors.add(condition.getStatusScanCursor());
             if (cursors.size() == 1) {
                 condition.setNextStatusScanCursor(nextCursor);
+            } else if (cursors.size() == 2) {
+                condition.setNextStatusScanCursor(null);
             }
             return Collections.emptyList();
         });
@@ -467,6 +471,78 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         Assertions.assertNull(cursors.get(0));
         Assertions.assertArrayEquals(nextCursor, cursors.get(1));
         Assertions.assertNull(cursors.get(2));
+    }
+
+    @Test
+    public void retryBackgroundTasksPreserveRetainedCursorWhenContinuationIsUnset() {
+        SessionManager sessionManager = mock(SessionManager.class);
+        byte[] firstCursor = new byte[] {1, 2, 3};
+        byte[] replacementCursor = new byte[] {4, 5, 6};
+        List<byte[]> cursors = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            cursors.add(condition.getStatusScanCursor());
+            if (cursors.size() == 1) {
+                condition.setNextStatusScanCursor(firstCursor);
+            } else if (cursors.size() == 3) {
+                condition.setNextStatusScanCursor(replacementCursor);
+            } else if (cursors.size() == 4) {
+                condition.setNextStatusScanCursor(null);
+            }
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+            defaultCoordinator.handleRetryCommitting();
+        }
+
+        Assertions.assertEquals(5, cursors.size());
+        Assertions.assertNull(cursors.get(0));
+        Assertions.assertArrayEquals(firstCursor, cursors.get(1));
+        Assertions.assertArrayEquals(firstCursor, cursors.get(2));
+        Assertions.assertArrayEquals(replacementCursor, cursors.get(3));
+        Assertions.assertNull(cursors.get(4));
+    }
+
+    @Test
+    public void timeoutCheckPreservesRetainedCursorWhenContinuationIsUnset() {
+        RocksDBSessionManager sessionManager = mock(RocksDBSessionManager.class);
+        byte[] firstCursor = new byte[] {4, 5, 6};
+        byte[] replacementCursor = new byte[] {7, 8, 9};
+        List<byte[]> cursors = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            cursors.add(condition.getTimeoutScanCursor());
+            if (cursors.size() == 1) {
+                condition.setNextTimeoutScanCursor(firstCursor);
+            } else if (cursors.size() == 3) {
+                condition.setNextTimeoutScanCursor(replacementCursor);
+            } else if (cursors.size() == 4) {
+                condition.setNextTimeoutScanCursor(null);
+            }
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            defaultCoordinator.timeoutCheck();
+            defaultCoordinator.timeoutCheck();
+            defaultCoordinator.timeoutCheck();
+            defaultCoordinator.timeoutCheck();
+            defaultCoordinator.timeoutCheck();
+        }
+
+        Assertions.assertEquals(5, cursors.size());
+        Assertions.assertNull(cursors.get(0));
+        Assertions.assertArrayEquals(firstCursor, cursors.get(1));
+        Assertions.assertArrayEquals(firstCursor, cursors.get(2));
+        Assertions.assertArrayEquals(replacementCursor, cursors.get(3));
+        Assertions.assertNull(cursors.get(4));
     }
 
     @Test
