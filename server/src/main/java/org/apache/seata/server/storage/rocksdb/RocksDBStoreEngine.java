@@ -429,6 +429,13 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
     }
 
+    void ensureFactoryAccessAllowed() {
+        if (maintenanceLock.getReadHoldCount() > 0 || maintenanceLock.isWriteLockedByCurrentThread()) {
+            throw new StoreException(
+                    "RocksDB store engine factory access is not allowed while holding a lifecycle lock");
+        }
+    }
+
     public void createCheckpoint(String checkpointPath) {
         Objects.requireNonNull(checkpointPath, "checkpointPath must not be null");
         maintenanceLock.readLock().lock();
