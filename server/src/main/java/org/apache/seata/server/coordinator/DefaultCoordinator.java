@@ -80,6 +80,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.seata.common.Constants.ASYNC_COMMITTING;
 import static org.apache.seata.common.Constants.COMMITTING;
@@ -220,6 +221,11 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
 
     private final Map<GlobalStatus, byte[]> backgroundSessionStatusCursors = new ConcurrentHashMap<>();
 
+    private final Map<List<GlobalStatus>, AtomicInteger> backgroundSessionStatusGroupOffsets =
+            new ConcurrentHashMap<>();
+
+    private final int backgroundSessionQueryLimit;
+
     private final ThreadPoolExecutor branchRemoveExecutor;
 
     private RemotingServer remotingServer;
@@ -234,10 +240,15 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
      * @param remotingServer the remoting server
      */
     protected DefaultCoordinator(RemotingServer remotingServer) {
+        this(remotingServer, SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+    }
+
+    DefaultCoordinator(RemotingServer remotingServer, int backgroundSessionQueryLimit) {
         if (remotingServer == null) {
             throw new IllegalArgumentException("RemotingServer not allowed be null.");
         }
         this.remotingServer = remotingServer;
+        this.backgroundSessionQueryLimit = Math.max(1, backgroundSessionQueryLimit);
         this.core = new DefaultCore(remotingServer);
         boolean enableBranchAsyncRemove =
                 CONFIG.getBoolean(ConfigurationKeys.ENABLE_BRANCH_ASYNC_REMOVE, DEFAULT_ENABLE_BRANCH_ASYNC_REMOVE);
@@ -588,8 +599,17 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
             return findBackgroundSessionsBySingleStatus(statuses[0], lazyLoadBranch);
         }
         List<GlobalSession> sessions = new ArrayList<>();
-        int budgetPerStatus = SESSION_BACKGROUND_TASK_QUERY_LIMIT / statuses.length;
-        int remainder = SESSION_BACKGROUND_TASK_QUERY_LIMIT % statuses.length;
+        if (backgroundSessionQueryLimit < statuses.length) {
+            int startIndex = nextBackgroundSessionStatusStart(statuses, backgroundSessionQueryLimit);
+            for (int i = 0; i < backgroundSessionQueryLimit; i++) {
+                GlobalStatus status = statuses[(startIndex + i) % statuses.length];
+                sessions.addAll(findBackgroundSessionsBySingleStatus(status, lazyLoadBranch, 1));
+            }
+            sessions.sort(Comparator.comparingLong(GlobalSession::getBeginTime));
+            return sessions;
+        }
+        int budgetPerStatus = backgroundSessionQueryLimit / statuses.length;
+        int remainder = backgroundSessionQueryLimit % statuses.length;
         for (int i = 0; i < statuses.length; i++) {
             int statusBudget = budgetPerStatus + (i < remainder ? 1 : 0);
             if (statusBudget == 0) {
@@ -601,9 +621,17 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         return sessions;
     }
 
+    private int nextBackgroundSessionStatusStart(GlobalStatus[] statuses, int statusesPerRound) {
+        List<GlobalStatus> statusGroup =
+                Collections.unmodifiableList(Arrays.asList(Arrays.copyOf(statuses, statuses.length)));
+        AtomicInteger nextStart =
+                backgroundSessionStatusGroupOffsets.computeIfAbsent(statusGroup, ignored -> new AtomicInteger());
+        return nextStart.getAndUpdate(current -> (current + statusesPerRound) % statuses.length);
+    }
+
     private List<GlobalSession> findBackgroundSessionsBySingleStatus(GlobalStatus status, boolean lazyLoadBranch) {
         return limitBackgroundSessions(findBackgroundSessionsBySingleStatus(
-                status, lazyLoadBranch, SESSION_BACKGROUND_TASK_QUERY_LIMIT));
+                status, lazyLoadBranch, backgroundSessionQueryLimit));
     }
 
     private List<GlobalSession> findBackgroundSessionsBySingleStatus(
@@ -634,10 +662,10 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     }
 
     private List<GlobalSession> limitBackgroundSessions(List<GlobalSession> sessions) {
-        if (sessions.size() <= SESSION_BACKGROUND_TASK_QUERY_LIMIT) {
+        if (sessions.size() <= backgroundSessionQueryLimit) {
             return sessions;
         }
-        return new ArrayList<>(sessions.subList(0, SESSION_BACKGROUND_TASK_QUERY_LIMIT));
+        return new ArrayList<>(sessions.subList(0, backgroundSessionQueryLimit));
     }
 
     /**

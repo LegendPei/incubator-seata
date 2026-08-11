@@ -78,6 +78,7 @@ import org.springframework.context.ApplicationContext;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumMap;
@@ -415,6 +416,12 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         assertMultiStatusRoundsShareBudget(new GlobalStatus[] {
             GlobalStatus.Rollbacked, GlobalStatus.TimeoutRollbacked, GlobalStatus.Committed, GlobalStatus.Finished
         });
+    }
+
+    @Test
+    public void smallBackgroundQueryLimitRotatesAcrossRetryAndEndStatusGroups() throws Exception {
+        assertSmallBackgroundQueryLimitRotatesAcrossStatusGroup("retryRollbackingStatuses");
+        assertSmallBackgroundQueryLimitRotatesAcrossStatusGroup("endStatuses");
     }
 
     @Test
@@ -1438,6 +1445,77 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         Assertions.assertEquals(statuses.length * 2, conditions.size());
         assertSharedBackgroundSessionQueryConditions(conditions.subList(0, statuses.length));
         assertSharedBackgroundSessionQueryConditions(conditions.subList(statuses.length, statuses.length * 2));
+    }
+
+    private void assertSmallBackgroundQueryLimitRotatesAcrossStatusGroup(String statusFieldName) throws Exception {
+        int queryLimit = 1;
+        DefaultCoordinator coordinator = new DefaultCoordinator(remotingServer, queryLimit);
+        GlobalStatus[] statuses = coordinatorStatusGroup(coordinator, statusFieldName);
+        Map<GlobalStatus, GlobalSession> sessions = new EnumMap<>(GlobalStatus.class);
+        for (GlobalStatus status : statuses) {
+            GlobalSession session = new GlobalSession();
+            session.setBeginTime(status.ordinal());
+            sessions.put(status, session);
+        }
+
+        List<GlobalStatus> queriedStatuses = new ArrayList<>();
+        List<SessionCondition> conditions = new ArrayList<>();
+        Map<GlobalStatus, byte[]> expectedCursors = new EnumMap<>(GlobalStatus.class);
+        SessionManager sessionManager = mock(SessionManager.class);
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            conditions.add(condition);
+            GlobalStatus status = condition.getStatuses()[0];
+            Assertions.assertArrayEquals(expectedCursors.get(status), condition.getStatusScanCursor());
+            queriedStatuses.add(status);
+            byte[] nextCursor = new byte[] {(byte) status.ordinal(), (byte) queriedStatuses.size()};
+            condition.setNextStatusScanCursor(nextCursor);
+            expectedCursors.put(status, nextCursor);
+            return Collections.singletonList(sessions.get(status));
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+
+            for (int round = 0; round < statuses.length; round++) {
+                int firstCondition = conditions.size();
+                List<GlobalSession> result = invokeFindBackgroundSessions(coordinator, statuses, true);
+                List<SessionCondition> roundConditions = conditions.subList(firstCondition, conditions.size());
+
+                Assertions.assertEquals(1, roundConditions.size());
+                Assertions.assertTrue(
+                        roundConditions.stream().mapToInt(SessionCondition::getLimit).sum() <= queryLimit);
+                Assertions.assertTrue(
+                        roundConditions.stream().mapToInt(SessionCondition::getScanLimit).sum() <= queryLimit);
+                GlobalStatus queriedStatus = roundConditions.get(0).getStatuses()[0];
+                Assertions.assertEquals(Collections.singletonList(sessions.get(queriedStatus)), result);
+                assertBackgroundSessionCursors(coordinator, expectedCursors);
+            }
+        } finally {
+            shutdownCoordinatorExecutors(coordinator);
+        }
+
+        Assertions.assertArrayEquals(statuses, queriedStatuses.toArray(new GlobalStatus[0]));
+    }
+
+    private GlobalStatus[] coordinatorStatusGroup(DefaultCoordinator coordinator, String fieldName)
+            throws ReflectiveOperationException {
+        Field field = DefaultCoordinator.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        GlobalStatus[] statuses = (GlobalStatus[]) field.get(coordinator);
+        return Arrays.copyOf(statuses, statuses.length);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertBackgroundSessionCursors(
+            DefaultCoordinator coordinator, Map<GlobalStatus, byte[]> expectedCursors)
+            throws ReflectiveOperationException {
+        Field field = DefaultCoordinator.class.getDeclaredField("backgroundSessionStatusCursors");
+        field.setAccessible(true);
+        Map<GlobalStatus, byte[]> actualCursors = (Map<GlobalStatus, byte[]>) field.get(coordinator);
+        Assertions.assertEquals(expectedCursors.keySet(), actualCursors.keySet());
+        expectedCursors.forEach(
+                (status, expectedCursor) -> Assertions.assertArrayEquals(expectedCursor, actualCursors.get(status)));
     }
 
     private List<GlobalSession> invokeFindBackgroundSessions(GlobalStatus[] statuses, boolean lazyLoadBranch)
