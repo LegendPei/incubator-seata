@@ -756,15 +756,28 @@ public class RocksDBStoreEngine implements AutoCloseable {
             try {
                 markCleanShutdown(true);
                 walSyncController.afterWrite();
-                walSyncController.close();
             } catch (RuntimeException e) {
                 syncFailure = e;
+            }
+            try {
+                walSyncController.close();
+            } catch (RuntimeException e) {
+                if (syncFailure == null) {
+                    syncFailure = e;
+                } else if (syncFailure != e) {
+                    syncFailure.addSuppressed(e);
+                }
+            }
+            if (syncFailure != null) {
                 try {
                     markDirtyShutdownDurably(db, handle(RocksDBColumnFamily.METADATA), writeOptions);
                 } catch (Exception markerFailure) {
-                    syncFailure.addSuppressed(markerFailure);
+                    if (syncFailure != markerFailure) {
+                        syncFailure.addSuppressed(markerFailure);
+                    }
                 }
-            } finally {
+            }
+            try {
                 closeQuietly(
                         new ArrayList<>(handles.values()),
                         db,
@@ -774,6 +787,12 @@ public class RocksDBStoreEngine implements AutoCloseable {
                         dbOptions,
                         blockCache,
                         statistics);
+            } catch (RuntimeException closeFailure) {
+                if (syncFailure == null) {
+                    syncFailure = closeFailure;
+                } else if (syncFailure != closeFailure) {
+                    syncFailure.addSuppressed(closeFailure);
+                }
             }
             if (syncFailure != null) {
                 throw syncFailure;

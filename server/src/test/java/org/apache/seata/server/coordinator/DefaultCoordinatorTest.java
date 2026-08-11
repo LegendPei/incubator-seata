@@ -80,7 +80,9 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -355,7 +357,8 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         });
 
         Assertions.assertEquals(5, conditions.size());
-        assertBackgroundSessionQueryConditions(conditions);
+        assertSharedBackgroundSessionQueryConditions(conditions.subList(0, 3));
+        assertBackgroundSessionQueryConditions(conditions.subList(3, 5));
     }
 
     @Test
@@ -401,6 +404,20 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     }
 
     @Test
+    public void retryRollbackingStatusesShareRoundBudgetWithoutDroppingLaterSessions() throws Exception {
+        assertMultiStatusRoundsShareBudget(new GlobalStatus[] {
+            GlobalStatus.TimeoutRollbacking, GlobalStatus.TimeoutRollbackRetrying, GlobalStatus.RollbackRetrying
+        });
+    }
+
+    @Test
+    public void endStatusesShareRoundBudgetWithoutDroppingLaterSessions() throws Exception {
+        assertMultiStatusRoundsShareBudget(new GlobalStatus[] {
+            GlobalStatus.Rollbacked, GlobalStatus.TimeoutRollbacked, GlobalStatus.Committed, GlobalStatus.Finished
+        });
+    }
+
+    @Test
     public void scheduledBackgroundTasksSetSessionQueryLimit() {
         List<SessionCondition> conditions = captureBackgroundSessionConditions(() -> {
             defaultCoordinator.handleRollbackingByScheduled();
@@ -409,7 +426,8 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         });
 
         Assertions.assertEquals(6, conditions.size());
-        assertBackgroundSessionQueryConditions(conditions);
+        assertBackgroundSessionQueryConditions(conditions.subList(0, 2));
+        assertSharedBackgroundSessionQueryConditions(conditions.subList(2, 6));
     }
 
     @Test
@@ -1367,13 +1385,73 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         return conditions;
     }
 
-    @SuppressWarnings("unchecked")
+    private void assertMultiStatusRoundsShareBudget(GlobalStatus[] statuses) throws Exception {
+        DefaultCoordinator coordinator = new DefaultCoordinator(remotingServer);
+        GlobalSession earlySession = new GlobalSession();
+        earlySession.setBeginTime(1L);
+        Map<GlobalStatus, List<GlobalSession>> laterSessions = new EnumMap<>(GlobalStatus.class);
+        for (int statusIndex = 1; statusIndex < statuses.length; statusIndex++) {
+            List<GlobalSession> sessions = new ArrayList<>();
+            for (int round = 0; round < 2; round++) {
+                GlobalSession session = new GlobalSession();
+                session.setBeginTime(100L + statusIndex * 10L + round);
+                sessions.add(session);
+            }
+            laterSessions.put(statuses[statusIndex], sessions);
+        }
+
+        List<SessionCondition> conditions = new ArrayList<>();
+        Map<GlobalStatus, Integer> statusRounds = new EnumMap<>(GlobalStatus.class);
+        Map<GlobalStatus, byte[]> expectedCursors = new EnumMap<>(GlobalStatus.class);
+        SessionManager sessionManager = mock(SessionManager.class);
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            SessionCondition condition = invocation.getArgument(0);
+            conditions.add(condition);
+            GlobalStatus status = condition.getStatuses()[0];
+            Assertions.assertArrayEquals(expectedCursors.get(status), condition.getStatusScanCursor());
+            int round = statusRounds.getOrDefault(status, 0);
+            statusRounds.put(status, round + 1);
+            byte[] nextCursor = new byte[] {(byte) status.ordinal(), (byte) (round + 1)};
+            condition.setNextStatusScanCursor(nextCursor);
+            expectedCursors.put(status, nextCursor);
+            if (status == statuses[0]) {
+                return Collections.nCopies(condition.getLimit(), earlySession);
+            }
+            return Collections.singletonList(laterSessions.get(status).get(round));
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+
+            for (int round = 0; round < 2; round++) {
+                List<GlobalSession> result = invokeFindBackgroundSessions(coordinator, statuses, true);
+
+                Assertions.assertTrue(result.size() <= DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+                for (int statusIndex = 1; statusIndex < statuses.length; statusIndex++) {
+                    Assertions.assertTrue(result.contains(laterSessions.get(statuses[statusIndex]).get(round)));
+                }
+            }
+        } finally {
+            shutdownCoordinatorExecutors(coordinator);
+        }
+
+        Assertions.assertEquals(statuses.length * 2, conditions.size());
+        assertSharedBackgroundSessionQueryConditions(conditions.subList(0, statuses.length));
+        assertSharedBackgroundSessionQueryConditions(conditions.subList(statuses.length, statuses.length * 2));
+    }
+
     private List<GlobalSession> invokeFindBackgroundSessions(GlobalStatus[] statuses, boolean lazyLoadBranch)
             throws Exception {
+        return invokeFindBackgroundSessions(defaultCoordinator, statuses, lazyLoadBranch);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<GlobalSession> invokeFindBackgroundSessions(
+            DefaultCoordinator coordinator, GlobalStatus[] statuses, boolean lazyLoadBranch) throws Exception {
         java.lang.reflect.Method method = DefaultCoordinator.class.getDeclaredMethod(
                 "findBackgroundSessions", GlobalStatus[].class, boolean.class);
         method.setAccessible(true);
-        return (List<GlobalSession>) method.invoke(defaultCoordinator, statuses, lazyLoadBranch);
+        return (List<GlobalSession>) method.invoke(coordinator, statuses, lazyLoadBranch);
     }
 
     private void assertBackgroundSessionQueryConditions(List<SessionCondition> conditions) {
@@ -1383,6 +1461,35 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
             Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, condition.getScanLimit());
             Assertions.assertNotNull(condition.getStatuses());
             Assertions.assertEquals(1, condition.getStatuses().length);
+        }
+    }
+
+    private void assertSharedBackgroundSessionQueryConditions(List<SessionCondition> conditions) {
+        Assertions.assertFalse(conditions.isEmpty());
+        int resultBudget = 0;
+        int scanBudget = 0;
+        for (SessionCondition condition : conditions) {
+            Assertions.assertTrue(condition.getLimit() > 0);
+            Assertions.assertEquals(condition.getLimit(), condition.getScanLimit());
+            Assertions.assertNotNull(condition.getStatuses());
+            Assertions.assertEquals(1, condition.getStatuses().length);
+            resultBudget += condition.getLimit();
+            scanBudget += condition.getScanLimit();
+        }
+        Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, resultBudget);
+        Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, scanBudget);
+    }
+
+    private void shutdownCoordinatorExecutors(DefaultCoordinator coordinator) throws IllegalAccessException {
+        for (Field field : DefaultCoordinator.class.getDeclaredFields()) {
+            if (!ExecutorService.class.isAssignableFrom(field.getType())) {
+                continue;
+            }
+            field.setAccessible(true);
+            ExecutorService executor = (ExecutorService) field.get(coordinator);
+            if (executor != null) {
+                executor.shutdownNow();
+            }
         }
     }
 

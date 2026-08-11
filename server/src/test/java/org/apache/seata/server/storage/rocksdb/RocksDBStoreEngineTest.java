@@ -873,6 +873,49 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testFactoryCanRecreateEngineAfterPreControllerCloseFailure() throws Exception {
+        RocksDBStoreConfig config = config("pre-controller-close-failure-reopen", false);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance(config);
+        byte[] key = RocksDBKeyCodec.encodeXid("xid-pre-controller-close-failure");
+        byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+        engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value);
+
+        StoreException preCloseFailure = new StoreException("pre-controller-close failure");
+        StoreException controllerCloseFailure = new StoreException("controller close failure");
+        DirectScheduledExecutor executor = new DirectScheduledExecutor();
+        executor.failShutdownNowWith(controllerCloseFailure);
+        FailingWalSyncer syncer = new FailingWalSyncer();
+        replaceWalSyncController(
+                engine,
+                new RocksDBWalSyncController(
+                        RocksDBWalSyncMode.PERIODIC,
+                        syncer,
+                        1000L,
+                        100L,
+                        true,
+                        1000L,
+                        executor,
+                        true,
+                        new FailingAfterWriteClock(preCloseFailure),
+                        System::nanoTime));
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, RocksDBStoreEngineFactory::destroy);
+
+        Assertions.assertSame(preCloseFailure, exception);
+        Assertions.assertArrayEquals(new Throwable[] {controllerCloseFailure}, exception.getSuppressed());
+        Assertions.assertTrue(engine.isClosed());
+        Assertions.assertTrue(executor.isShutdown());
+        Assertions.assertEquals(1, executor.shutdownNowCalls());
+        engine.close();
+        Assertions.assertEquals(1, executor.shutdownNowCalls());
+
+        RocksDBStoreEngine reopened = RocksDBStoreEngineFactory.getInstance(config);
+        Assertions.assertNotSame(engine, reopened);
+        Assertions.assertFalse(reopened.wasLastShutdownClean());
+        Assertions.assertArrayEquals(value, reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+    }
+
+    @Test
     void testCleanShutdownMarkerTracksPreviousClose() {
         RocksDBStoreConfig config = config("clean-shutdown-marker", false);
 
@@ -1125,6 +1168,23 @@ class RocksDBStoreEngineTest {
         }
     }
 
+    private static final class FailingAfterWriteClock implements LongSupplier {
+        private final RuntimeException failure;
+        private final AtomicInteger calls = new AtomicInteger();
+
+        private FailingAfterWriteClock(RuntimeException failure) {
+            this.failure = failure;
+        }
+
+        @Override
+        public long getAsLong() {
+            if (calls.incrementAndGet() > 1) {
+                throw failure;
+            }
+            return 1L;
+        }
+    }
+
     private static final class BlockingAfterWriteClock implements LongSupplier {
         private final AtomicInteger calls = new AtomicInteger();
         private final CountDownLatch afterWriteEntered = new CountDownLatch(1);
@@ -1190,6 +1250,8 @@ class RocksDBStoreEngineTest {
     private static final class DirectScheduledExecutor extends AbstractExecutorService
             implements ScheduledExecutorService {
         private boolean shutdown;
+        private int shutdownNowCalls;
+        private RuntimeException shutdownNowFailure;
 
         @Override
         public void shutdown() {
@@ -1199,7 +1261,19 @@ class RocksDBStoreEngineTest {
         @Override
         public List<Runnable> shutdownNow() {
             shutdown = true;
+            shutdownNowCalls++;
+            if (shutdownNowFailure != null) {
+                throw shutdownNowFailure;
+            }
             return Collections.emptyList();
+        }
+
+        private void failShutdownNowWith(RuntimeException failure) {
+            shutdownNowFailure = failure;
+        }
+
+        private int shutdownNowCalls() {
+            return shutdownNowCalls;
         }
 
         @Override

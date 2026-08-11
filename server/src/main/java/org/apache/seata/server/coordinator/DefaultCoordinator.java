@@ -588,18 +588,30 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
             return findBackgroundSessionsBySingleStatus(statuses[0], lazyLoadBranch);
         }
         List<GlobalSession> sessions = new ArrayList<>();
-        for (GlobalStatus status : statuses) {
-            sessions.addAll(findBackgroundSessionsBySingleStatus(status, lazyLoadBranch));
+        int budgetPerStatus = SESSION_BACKGROUND_TASK_QUERY_LIMIT / statuses.length;
+        int remainder = SESSION_BACKGROUND_TASK_QUERY_LIMIT % statuses.length;
+        for (int i = 0; i < statuses.length; i++) {
+            int statusBudget = budgetPerStatus + (i < remainder ? 1 : 0);
+            if (statusBudget == 0) {
+                break;
+            }
+            sessions.addAll(findBackgroundSessionsBySingleStatus(statuses[i], lazyLoadBranch, statusBudget));
         }
         sessions.sort(Comparator.comparingLong(GlobalSession::getBeginTime));
-        return limitBackgroundSessions(sessions);
+        return sessions;
     }
 
     private List<GlobalSession> findBackgroundSessionsBySingleStatus(GlobalStatus status, boolean lazyLoadBranch) {
+        return limitBackgroundSessions(findBackgroundSessionsBySingleStatus(
+                status, lazyLoadBranch, SESSION_BACKGROUND_TASK_QUERY_LIMIT));
+    }
+
+    private List<GlobalSession> findBackgroundSessionsBySingleStatus(
+            GlobalStatus status, boolean lazyLoadBranch, int queryBudget) {
         SessionCondition sessionCondition = new SessionCondition(status);
         sessionCondition.setLazyLoadBranch(lazyLoadBranch);
-        sessionCondition.setLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
-        sessionCondition.setScanLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        sessionCondition.setLimit(queryBudget);
+        sessionCondition.setScanLimit(queryBudget);
         byte[] statusScanCursor = backgroundSessionStatusCursors.get(status);
         if (statusScanCursor != null) {
             sessionCondition.setStatusScanCursor(statusScanCursor);
@@ -609,7 +621,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         if (CollectionUtils.isEmpty(sessions)) {
             return Collections.emptyList();
         }
-        return limitBackgroundSessions(sessions);
+        return sessions;
     }
 
     private void updateBackgroundSessionCursor(GlobalStatus status, SessionCondition sessionCondition) {
