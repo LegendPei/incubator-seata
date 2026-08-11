@@ -2677,7 +2677,7 @@ public final class RocksDBFileModeBenchmark {
                     parseSizeOption(values, "indexWriteBufferSize", 0L),
                     parseSizeOption(values, "metadataWriteBufferSize", 0L),
                     parseSizeOption(values, "maxTotalWalSize", 0L));
-            if (options.compare == null) {
+            if (options.compare == null || "explicitR4".equals(options.compare)) {
                 return options.withTuningProfile(options.tuningProfile).withExplicitR4Overrides(values);
             }
             return options;
@@ -2814,9 +2814,23 @@ public final class RocksDBFileModeBenchmark {
 
         private BenchmarkOptions comparisonBaseOptions() {
             if ("explicitR4".equals(compare)) {
-                return withR4Budgets(0L, 0L, 0L, 0L, 0L, 0L, 0L);
+                BenchmarkOptions baseline = withR4Budgets(0L, 0L, 0L, 0L, 0L, 0L, 0L);
+                if (baseline.hasSameR4Budgets(this)) {
+                    throw new IllegalArgumentException("explicitR4 comparison requires different effective R4 budgets");
+                }
+                return baseline;
             }
             return this;
+        }
+
+        private boolean hasSameR4Budgets(BenchmarkOptions other) {
+            return dbWriteBufferSize == other.dbWriteBufferSize
+                    && globalWriteBufferSize == other.globalWriteBufferSize
+                    && branchWriteBufferSize == other.branchWriteBufferSize
+                    && lockWriteBufferSize == other.lockWriteBufferSize
+                    && indexWriteBufferSize == other.indexWriteBufferSize
+                    && metadataWriteBufferSize == other.metadataWriteBufferSize
+                    && maxTotalWalSize == other.maxTotalWalSize;
         }
 
         private BenchmarkOptions flipCompareOption() {

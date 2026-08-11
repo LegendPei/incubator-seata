@@ -28,6 +28,7 @@ import org.springframework.mock.env.MockEnvironment;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -169,6 +170,50 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals(64L * 1024L * 1024L, longField(candidate, "lockWriteBufferSize"));
         Assertions.assertEquals(32L * 1024L * 1024L, longField(candidate, "indexWriteBufferSize"));
         Assertions.assertEquals(8L * 1024L * 1024L, longField(candidate, "metadataWriteBufferSize"));
+    }
+
+    @Test
+    void testExplicitR4ComparisonInheritsBalancedNoR4TuningOnBothSides() throws Exception {
+        Object options = parseOptions(
+                "--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
+
+        assertBalancedNoR4Tuning(comparisonBaseOptions(options));
+        assertBalancedNoR4Tuning(comparisonCandidateOptions(options));
+    }
+
+    @Test
+    void testExplicitR4ComparisonClearsOnlyR4BudgetsOnBase() throws Exception {
+        Object options = parseOptions(
+                "--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
+
+        Object baseline = comparisonBaseOptions(options);
+
+        Assertions.assertEquals(0L, longField(baseline, "dbWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "globalWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "branchWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "lockWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "indexWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "metadataWriteBufferSize"));
+        Assertions.assertEquals(0L, longField(baseline, "maxTotalWalSize"));
+        assertBalancedNoR4Tuning(baseline);
+    }
+
+    @Test
+    void testExplicitR4ComparisonCandidateRetainsResolvedExplicitBudget() throws Exception {
+        Object options = parseOptions(
+                "--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
+
+        Object candidate = comparisonCandidateOptions(options);
+
+        Assertions.assertEquals(268435456L, longField(candidate, "dbWriteBufferSize"));
+        assertBalancedNoR4Tuning(candidate);
+    }
+
+    @Test
+    void testExplicitR4ComparisonRejectsEqualEffectiveBudgets() throws Exception {
+        Object options = parseOptions("--compare=explicitR4", "--tuningProfile=balanced-no-r4");
+
+        Assertions.assertThrows(IllegalArgumentException.class, () -> comparisonBaseOptions(options));
     }
 
     @Test
@@ -570,6 +615,38 @@ class RocksDBFileModeBenchmarkTest {
         Method method = optionsClass.getDeclaredMethod("parse", String[].class);
         method.setAccessible(true);
         return method.invoke(null, (Object) args);
+    }
+
+    private Object comparisonBaseOptions(Object options) throws Exception {
+        return invokeOptionsMethod(options, "comparisonBaseOptions");
+    }
+
+    private Object comparisonCandidateOptions(Object options) throws Exception {
+        return invokeOptionsMethod(options, "flipCompareOption");
+    }
+
+    private Object invokeOptionsMethod(Object options, String name) throws Exception {
+        Method method = options.getClass().getDeclaredMethod(name);
+        method.setAccessible(true);
+        try {
+            return method.invoke(options);
+        } catch (InvocationTargetException e) {
+            if (e.getCause() instanceof IllegalArgumentException) {
+                throw (IllegalArgumentException) e.getCause();
+            }
+            throw e;
+        }
+    }
+
+    private void assertBalancedNoR4Tuning(Object options) throws Exception {
+        Assertions.assertEquals(64L * 1024L * 1024L, longField(options, "writeBufferSize"));
+        Assertions.assertEquals(3, intField(options, "maxWriteBufferNumber"));
+        Assertions.assertEquals(1, intField(options, "minWriteBufferNumberToMerge"));
+        Assertions.assertEquals(4, intField(options, "maxBackgroundJobs"));
+        Assertions.assertEquals(64L * 1024L * 1024L, longField(options, "targetFileSizeBase"));
+        Assertions.assertEquals(8, intField(options, "level0FileNumCompactionTrigger"));
+        Assertions.assertEquals(20, intField(options, "level0SlowdownWritesTrigger"));
+        Assertions.assertEquals(36, intField(options, "level0StopWritesTrigger"));
     }
 
     private int countStatusForFirstIndexes(Object options, GlobalStatus status, int count) throws Exception {
