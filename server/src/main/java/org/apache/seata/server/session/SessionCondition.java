@@ -25,6 +25,12 @@ import java.util.Arrays;
  *
  */
 public class SessionCondition {
+    public enum ScanContinuation {
+        UNSET,
+        RESUMABLE,
+        EXHAUSTED
+    }
+
     private Long transactionId;
     private String xid;
     private GlobalStatus status;
@@ -35,9 +41,11 @@ public class SessionCondition {
     private boolean lazyLoadBranch;
     private byte[] statusScanCursor;
     private byte[] nextStatusScanCursor;
+    private ScanContinuation statusScanContinuation = ScanContinuation.UNSET;
     private Long maxTimeoutDeadlineMillis;
     private byte[] timeoutScanCursor;
     private byte[] nextTimeoutScanCursor;
+    private ScanContinuation timeoutScanContinuation = ScanContinuation.UNSET;
     private SessionScanStats scanStats = SessionScanStats.empty();
 
     /**
@@ -183,6 +191,18 @@ public class SessionCondition {
     public void setNextStatusScanCursor(byte[] nextStatusScanCursor) {
         this.nextStatusScanCursor =
                 nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
+        statusScanContinuation = nextStatusScanCursor == null
+                ? ScanContinuation.EXHAUSTED
+                : ScanContinuation.RESUMABLE;
+    }
+
+    public ScanContinuation getStatusScanContinuation() {
+        return statusScanContinuation;
+    }
+
+    public void clearNextStatusScanCursor() {
+        nextStatusScanCursor = null;
+        statusScanContinuation = ScanContinuation.UNSET;
     }
 
     public Long getMaxTimeoutDeadlineMillis() {
@@ -212,6 +232,18 @@ public class SessionCondition {
         this.nextTimeoutScanCursor = nextTimeoutScanCursor == null
                 ? null
                 : Arrays.copyOf(nextTimeoutScanCursor, nextTimeoutScanCursor.length);
+        timeoutScanContinuation = nextTimeoutScanCursor == null
+                ? ScanContinuation.EXHAUSTED
+                : ScanContinuation.RESUMABLE;
+    }
+
+    public ScanContinuation getTimeoutScanContinuation() {
+        return timeoutScanContinuation;
+    }
+
+    public void clearNextTimeoutScanCursor() {
+        nextTimeoutScanCursor = null;
+        timeoutScanContinuation = ScanContinuation.UNSET;
     }
 
     public SessionScanStats getScanStats() {

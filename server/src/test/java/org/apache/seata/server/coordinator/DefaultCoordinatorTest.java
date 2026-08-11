@@ -58,6 +58,8 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.session.SessionHolder;
 import org.apache.seata.server.session.SessionManager;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.util.StoreUtil;
 import org.junit.jupiter.api.AfterAll;
@@ -69,6 +71,7 @@ import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnJre;
 import org.junit.jupiter.api.condition.JRE;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -78,6 +81,7 @@ import org.springframework.context.ApplicationContext;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -110,6 +114,9 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     private static final String txName = "tx-1";
 
     private static final int timeout = 3000;
+
+    @TempDir
+    Path tempDir;
 
     private static final String resourceId = "tb_1";
 
@@ -362,6 +369,7 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         Assertions.assertEquals(1, conditions.size());
         SessionCondition condition = conditions.get(0);
         Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, condition.getLimit());
+        Assertions.assertEquals(DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT, condition.getScanLimit());
         Assertions.assertEquals(GlobalStatus.Begin, condition.getStatus());
         Assertions.assertTrue(condition.isLazyLoadBranch());
         Assertions.assertNotNull(condition.getMaxTimeoutDeadlineMillis());
@@ -459,6 +467,60 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
         Assertions.assertNull(cursors.get(0));
         Assertions.assertArrayEquals(nextCursor, cursors.get(1));
         Assertions.assertNull(cursors.get(2));
+    }
+
+    @Test
+    public void exhaustedMultiStatusScansRestartBeforeNewEarlierSessions() throws Exception {
+        GlobalStatus[] statuses = new GlobalStatus[] {
+            GlobalStatus.Rollbacked, GlobalStatus.TimeoutRollbacked, GlobalStatus.Committed, GlobalStatus.Finished
+        };
+        DefaultCoordinator coordinator = new DefaultCoordinator(remotingServer, statuses.length);
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(
+                new RocksDBStoreConfig(tempDir.resolve("multi-status-exhausted-cursors").toString(), true))) {
+            RocksDBSessionManager delegate = new RocksDBSessionManager("multi-status-exhausted-cursors", engine);
+            List<SessionCondition> conditions = new ArrayList<>();
+            SessionManager sessionManager = mock(SessionManager.class);
+            when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+                SessionCondition condition = invocation.getArgument(0);
+                List<GlobalSession> sessions = delegate.findGlobalSessions(condition);
+                conditions.add(condition);
+                return sessions;
+            });
+            for (int i = 0; i < statuses.length; i++) {
+                delegate.addGlobalSession(storedBackgroundSession("tx-exhausted-" + i, statuses[i], 100L + i));
+            }
+
+            try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+                sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+
+                List<GlobalSession> firstRound = invokeFindBackgroundSessions(coordinator, statuses, true);
+                Assertions.assertEquals(statuses.length, firstRound.size());
+                conditions.forEach(condition -> Assertions.assertEquals(
+                        SessionCondition.ScanContinuation.RESUMABLE, condition.getStatusScanContinuation()));
+
+                conditions.clear();
+                Assertions.assertTrue(invokeFindBackgroundSessions(coordinator, statuses, true)
+                        .isEmpty());
+                conditions.forEach(condition -> Assertions.assertEquals(
+                        SessionCondition.ScanContinuation.EXHAUSTED, condition.getStatusScanContinuation()));
+                assertBackgroundSessionCursors(coordinator, Collections.emptyMap());
+
+                GlobalSession earlier = storedBackgroundSession("tx-new-earlier", statuses[0], 50L);
+                delegate.addGlobalSession(earlier);
+                conditions.clear();
+                List<GlobalSession> nextRound = invokeFindBackgroundSessions(coordinator, statuses, true);
+
+                Assertions.assertTrue(nextRound.stream()
+                        .anyMatch(session -> earlier.getXid().equals(session.getXid())));
+                SessionCondition restarted = conditions.stream()
+                        .filter(condition -> condition.getStatuses()[0] == statuses[0])
+                        .findFirst()
+                        .orElseThrow(AssertionError::new);
+                Assertions.assertNull(restarted.getStatusScanCursor());
+            }
+        } finally {
+            shutdownCoordinatorExecutors(coordinator);
+        }
     }
 
     @Test
@@ -1620,6 +1682,13 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     private List<GlobalSession> invokeFindBackgroundSessions(GlobalStatus[] statuses, boolean lazyLoadBranch)
             throws Exception {
         return invokeFindBackgroundSessions(defaultCoordinator, statuses, lazyLoadBranch);
+    }
+
+    private GlobalSession storedBackgroundSession(String name, GlobalStatus status, long beginTime) {
+        GlobalSession session = new GlobalSession("app", "group", name, timeout);
+        session.setStatus(status);
+        session.setBeginTime(beginTime);
+        return session;
     }
 
     @SuppressWarnings("unchecked")

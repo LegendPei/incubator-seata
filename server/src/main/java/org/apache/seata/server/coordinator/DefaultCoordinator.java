@@ -482,6 +482,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
             return false;
         }
         sessionCondition.setLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        sessionCondition.setScanLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
         sessionCondition.setMaxTimeoutDeadlineMillis(timeoutDeadlineUpperBound());
         byte[] cursor = timeoutCheckCursor;
         if (cursor != null) {
@@ -496,11 +497,11 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     }
 
     private void updateTimeoutCheckCursor(SessionCondition sessionCondition) {
-        byte[] nextCursor = sessionCondition.getNextTimeoutScanCursor();
-        if (nextCursor == null) {
+        if (sessionCondition.getTimeoutScanContinuation() != SessionCondition.ScanContinuation.RESUMABLE) {
             timeoutCheckCursor = null;
             return;
         }
+        byte[] nextCursor = sessionCondition.getNextTimeoutScanCursor();
         timeoutCheckCursor = Arrays.copyOf(nextCursor, nextCursor.length);
     }
 
@@ -713,11 +714,11 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     }
 
     private void updateBackgroundSessionCursor(GlobalStatus status, SessionCondition sessionCondition) {
-        byte[] nextStatusScanCursor = sessionCondition.getNextStatusScanCursor();
-        if (nextStatusScanCursor == null) {
+        if (sessionCondition.getStatusScanContinuation() != SessionCondition.ScanContinuation.RESUMABLE) {
             backgroundSessionStatusCursors.remove(status);
             return;
         }
+        byte[] nextStatusScanCursor = sessionCondition.getNextStatusScanCursor();
         backgroundSessionStatusCursors.put(status, Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length));
     }
 

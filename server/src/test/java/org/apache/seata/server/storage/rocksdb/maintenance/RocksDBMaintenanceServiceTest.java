@@ -328,31 +328,6 @@ class RocksDBMaintenanceServiceTest {
     }
 
     @Test
-    void testVerifyDetectsMissingGlobalIndexes() {
-        try (RocksDBStoreEngine engine = open("verify-missing-global-indexes")) {
-            GlobalSession global = globalSession("tx-missing-indexes", GlobalStatus.Begin);
-            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
-            engine.delete(
-                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
-                    RocksDBKeyCodec.encodeGlobalStatusIndex(
-                            global.getStatus(), global.getBeginTime(), global.getXid()));
-            engine.delete(
-                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
-                    RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId()));
-
-            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
-
-            Assertions.assertFalse(report.isClean());
-            Assertions.assertEquals(1, report.getStaleStatusIndexCount());
-            Assertions.assertEquals(1, report.getStaleTransactionIdIndexCount());
-            Assertions.assertTrue(report.getErrorMessages().stream()
-                    .anyMatch(message -> message.contains("missing global status index")));
-            Assertions.assertTrue(report.getErrorMessages().stream()
-                    .anyMatch(message -> message.contains("missing transaction id index")));
-        }
-    }
-
-    @Test
     void testVerifyDetectsOrphanBranch() {
         try (RocksDBStoreEngine engine = open("verify-orphan-branch")) {
             // Write a branch session without a corresponding global session

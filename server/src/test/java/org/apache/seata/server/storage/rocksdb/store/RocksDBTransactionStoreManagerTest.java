@@ -321,6 +321,54 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testReadByTimeoutDeadlineScanLimitResumesAfterThreeStaleRounds() {
+        int scanLimit = 2;
+        int staleRounds = 3;
+        try (RocksDBStoreEngine engine = open("timeout-deadline-stale-scan-limit")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            for (int i = 0; i < scanLimit * staleRounds; i++) {
+                String staleXid = "tx-timeout-stale-scan-limit-" + i;
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                        RocksDBKeyCodec.encodeGlobalTimeoutIndex(100L + i, staleXid),
+                        staleXid.getBytes(StandardCharsets.UTF_8));
+            }
+            GlobalSession valid = globalSession("tx-timeout-valid-after-stale-rounds", GlobalStatus.Begin, 100);
+            valid.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, valid);
+
+            byte[] cursor = null;
+            for (int round = 0; round < staleRounds; round++) {
+                SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+                condition.setLazyLoadBranch(true);
+                condition.setMaxTimeoutDeadlineMillis(1_000L);
+                condition.setLimit(1);
+                condition.setScanLimit(scanLimit);
+                condition.setTimeoutScanCursor(cursor);
+
+                Assertions.assertTrue(storeManager.readSession(condition).isEmpty());
+                Assertions.assertEquals(scanLimit, condition.getScanStats().getRowsScanned());
+                Assertions.assertEquals(scanLimit, condition.getScanStats().getPointReads());
+                Assertions.assertNotNull(condition.getNextTimeoutScanCursor());
+                cursor = condition.getNextTimeoutScanCursor();
+            }
+
+            SessionCondition progress = new SessionCondition(GlobalStatus.Begin);
+            progress.setLazyLoadBranch(true);
+            progress.setMaxTimeoutDeadlineMillis(1_000L);
+            progress.setLimit(1);
+            progress.setScanLimit(scanLimit);
+            progress.setTimeoutScanCursor(cursor);
+            List<GlobalSession> actual = storeManager.readSession(progress);
+
+            Assertions.assertEquals(1, actual.size());
+            Assertions.assertEquals(valid.getXid(), actual.get(0).getXid());
+            Assertions.assertEquals(1, progress.getScanStats().getRowsScanned());
+            Assertions.assertEquals(1, progress.getScanStats().getPointReads());
+        }
+    }
+
+    @Test
     void testGlobalUpdateRemovesTimeoutIndexForNonBeginStatus() {
         try (RocksDBStoreEngine engine = open("timeout-index-status-update")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
