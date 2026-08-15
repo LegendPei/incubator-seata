@@ -449,7 +449,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         Map<GlobalStatus, byte[]> initialCursors = sessionCondition.getStatusScanCursors();
         for (GlobalStatus status : sessionCondition.getStatuses()) {
             if (isDeadlineReached(deadlineNanos)) {
-                return multiStatusScanResult(result, cursors, initialCursors, true);
+                return multiStatusScanResult(result, cursors, initialCursors, true, false);
             }
             StatusScanCursor cursor = new StatusScanCursor(
                     status,
@@ -466,7 +466,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
         while (!queue.isEmpty() && !isLimitReached(limit, result)) {
             if (isDeadlineReached(deadlineNanos)) {
-                return multiStatusScanResult(result, cursors, initialCursors, true);
+                return multiStatusScanResult(result, cursors, initialCursors, true, false);
             }
             StatusScanCursor cursor = queue.poll();
             RocksDBIndexManager.StatusIndexEntry entry = cursor.current();
@@ -487,14 +487,21 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 queue.offer(cursor);
             }
         }
-        return multiStatusScanResult(result, cursors, initialCursors, false);
+        return multiStatusScanResult(result, cursors, initialCursors, false, true);
     }
 
     private MultiStatusScanResult multiStatusScanResult(
             List<GlobalSession> sessions,
             List<StatusScanCursor> cursors,
             Map<GlobalStatus, byte[]> initialCursors,
-            boolean deadlineReached) {
+            boolean deadlineReached,
+            boolean passMayBeComplete) {
+        if (passMayBeComplete
+                && sessions.isEmpty()
+                && !cursors.isEmpty()
+                && cursors.stream().allMatch(StatusScanCursor::isFullyExhausted)) {
+            return new MultiStatusScanResult(sessions, Collections.emptyMap(), deadlineReached);
+        }
         Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
         nextCursors.putAll(initialCursors);
         for (StatusScanCursor cursor : cursors) {
@@ -735,6 +742,10 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return current == null
                     ? (nextCursor == null ? resumeCursor : nextCursor)
                     : RocksDBKeyCodec.encodeGlobalStatusIndex(status, current.getBeginTime(), current.getXid());
+        }
+
+        boolean isFullyExhausted() {
+            return exhausted && current() == null;
         }
 
         void advance(

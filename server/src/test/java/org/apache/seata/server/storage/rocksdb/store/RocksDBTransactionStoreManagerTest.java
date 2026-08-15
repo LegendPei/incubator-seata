@@ -46,7 +46,9 @@ import org.springframework.mock.env.MockEnvironment;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
@@ -970,6 +972,55 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertEquals(
                     List.of(rollbackedSecond.getXid()),
                     secondActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesClearsCursorsAfterCombinedPassExhausts() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-combined-pass-exhausted")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committed = globalSession("tx-pass-committed", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            GlobalSession rollbacked = globalSession("tx-pass-rollbacked", GlobalStatus.Rollbacked);
+            rollbacked.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbacked);
+
+            Map<GlobalStatus, byte[]> cursors = Collections.emptyMap();
+            List<String> seenXids = new ArrayList<>();
+            boolean exhausted = false;
+            for (int page = 0; page < 5; page++) {
+                SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+                condition.setLazyLoadBranch(true);
+                condition.setLimit(1);
+                condition.setScanLimit(1);
+                condition.setStatusScanCursors(cursors);
+                List<GlobalSession> actual = storeManager.readSession(condition);
+                cursors = condition.getNextStatusScanCursors();
+                if (actual.isEmpty()) {
+                    exhausted = true;
+                    break;
+                }
+                seenXids.add(actual.get(0).getXid());
+            }
+
+            Assertions.assertTrue(exhausted, "the combined status pass must terminate");
+            Assertions.assertEquals(List.of(committed.getXid(), rollbacked.getXid()), seenXids);
+            Assertions.assertTrue(cursors.isEmpty(), "an exhausted combined pass must clear every status cursor");
+
+            GlobalSession earlier = globalSession("tx-pass-new-earlier", GlobalStatus.Committed);
+            earlier.setBeginTime(50L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, earlier);
+            SessionCondition restarted = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            restarted.setLazyLoadBranch(true);
+            restarted.setLimit(1);
+            restarted.setScanLimit(1);
+            restarted.setStatusScanCursors(cursors);
+
+            List<GlobalSession> restartedActual = storeManager.readSession(restarted);
+
+            Assertions.assertEquals(1, restartedActual.size());
+            Assertions.assertEquals(earlier.getXid(), restartedActual.get(0).getXid());
         }
     }
 
