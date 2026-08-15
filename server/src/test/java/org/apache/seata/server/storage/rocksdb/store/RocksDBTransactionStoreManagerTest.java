@@ -46,6 +46,7 @@ import org.springframework.mock.env.MockEnvironment;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
@@ -632,6 +633,66 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertEquals(middle.getXid(), actual.get(1).getXid());
             Assertions.assertEquals(0, indexManager.fullStatusScanCalls);
             Assertions.assertTrue(indexManager.pagedStatusScanCalls > 0);
+        }
+    }
+
+    @Test
+    void testReadByStatusReturnsCompleteGlobalSessionFields() {
+        try (RocksDBStoreEngine engine = open("condition-status-complete-fields")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession expected =
+                    new GlobalSession("status-application", "status-service-group", "status-transaction", 60_000);
+            expected.setApplicationData("status-application-data");
+            expected.setBeginTime(123_456L);
+            expected.setStatus(GlobalStatus.Committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, expected);
+
+            GlobalSession byXid = storeManager.readSession(expected.getXid(), false);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(10);
+            List<GlobalSession> byStatus = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, byStatus.size());
+            GlobalSession actual = byStatus.get(0);
+            Assertions.assertEquals("status-application", actual.getApplicationId());
+            Assertions.assertEquals("status-service-group", actual.getTransactionServiceGroup());
+            Assertions.assertEquals("status-transaction", actual.getTransactionName());
+            Assertions.assertEquals("status-application-data", actual.getApplicationData());
+            Assertions.assertEquals(byXid.getApplicationId(), actual.getApplicationId());
+            Assertions.assertEquals(byXid.getTransactionServiceGroup(), actual.getTransactionServiceGroup());
+            Assertions.assertEquals(byXid.getTransactionName(), actual.getTransactionName());
+            Assertions.assertEquals(byXid.getApplicationData(), actual.getApplicationData());
+            Assertions.assertEquals(byXid.getXid(), actual.getXid());
+            Assertions.assertEquals(byXid.getTransactionId(), actual.getTransactionId());
+            Assertions.assertEquals(byXid.getBeginTime(), actual.getBeginTime());
+            Assertions.assertEquals(byXid.getStatus(), actual.getStatus());
+        }
+    }
+
+    @Test
+    void testReadByStatusReturnsDuplicateIndexXidOnlyOnce() {
+        try (RocksDBStoreEngine engine = open("condition-status-duplicate-xid")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession session = globalSession("tx-status-duplicate-xid", GlobalStatus.Committed);
+            session.setBeginTime(321L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, session);
+            byte[] canonicalKey = RocksDBKeyCodec.encodeGlobalStatusIndex(
+                    session.getStatus(), session.getBeginTime(), session.getXid());
+            byte[] duplicateKey = Arrays.copyOf(canonicalKey, canonicalKey.length + 1);
+            duplicateKey[duplicateKey.length - 1] = 1;
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    duplicateKey,
+                    session.getXid().getBytes(StandardCharsets.UTF_8));
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(10);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, actual.size());
+            Assertions.assertEquals(session.getXid(), actual.get(0).getXid());
         }
     }
 

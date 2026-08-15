@@ -556,11 +556,10 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return 0;
         }
         // Collect unique xids that we haven't seen yet
-        List<String> newXids = new ArrayList<>();
+        Set<String> newXids = new LinkedHashSet<>();
         List<RocksDBIndexManager.StatusIndexEntry> newEntries = new ArrayList<>();
         for (RocksDBIndexManager.StatusIndexEntry entry : entries) {
-            if (!seenXids.contains(entry.getXid())) {
-                newXids.add(entry.getXid());
+            if (!seenXids.contains(entry.getXid()) && newXids.add(entry.getXid())) {
                 newEntries.add(entry);
             }
         }
@@ -585,16 +584,19 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             }
             // Use lightweight decode for verification (skips applicationId,
             // serviceGroup, transactionName, applicationData allocations)
-            GlobalSession globalSession = decodeGlobalSessionLightweight(value, sessionCondition.isLazyLoadBranch());
-            if (globalSession.getStatus() == entry.getStatus()
-                    && globalSession.getBeginTime() == entry.getBeginTime()
-                    && matches(globalSession, sessionCondition)) {
-                if (withBranches) {
-                    readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
+            GlobalSession lightweightSession =
+                    decodeGlobalSessionLightweight(value, sessionCondition.isLazyLoadBranch());
+            if (lightweightSession.getStatus() == entry.getStatus()
+                    && lightweightSession.getBeginTime() == entry.getBeginTime()
+                    && matches(lightweightSession, sessionCondition)) {
+                GlobalSession globalSession = decodeGlobalSession(value, sessionCondition.isLazyLoadBranch());
+                if (seenXids.add(entry.getXid())) {
+                    if (withBranches) {
+                        readBranchSessions(globalSession.getXid()).forEach(globalSession::add);
+                    }
+                    result.add(globalSession);
+                    added++;
                 }
-                seenXids.add(entry.getXid());
-                result.add(globalSession);
-                added++;
             }
         }
         return added;
