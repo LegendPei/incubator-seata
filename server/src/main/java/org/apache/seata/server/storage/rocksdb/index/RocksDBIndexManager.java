@@ -135,12 +135,14 @@ public class RocksDBIndexManager {
                 }
                 putGlobalIndexes(batch, globalSession);
             });
-            batch.put(
-                    storeEngine.handle(RocksDBColumnFamily.METADATA),
+            storeEngine.put(
+                    batch,
+                    RocksDBColumnFamily.METADATA,
                     bytes(INDEX_VERSION_KEY),
                     bytes(Integer.toString(INDEX_VERSION)));
-            batch.put(
-                    storeEngine.handle(RocksDBColumnFamily.METADATA),
+            storeEngine.put(
+                    batch,
+                    RocksDBColumnFamily.METADATA,
                     bytes(INDEX_BUILD_STATUS_KEY),
                     bytes(INDEX_BUILD_STATUS_COMPLETED));
             storeEngine.write(batch);
