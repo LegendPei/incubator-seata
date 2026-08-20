@@ -47,6 +47,10 @@ public final class RocksDBStoreEngineFactory {
             throw new StoreException("RocksDB file store engine already opened with syncWrite:"
                     + ENGINE.getConfig().isSyncWrite() + ", requested syncWrite:" + config.isSyncWrite());
         }
+        if (!ENGINE.getConfig().equals(config)) {
+            throw new StoreException("RocksDB file store engine already opened with options:"
+                    + ENGINE.getConfig().tuningSummary() + ", requested options:" + config.tuningSummary());
+        }
         return ENGINE;
     }
 

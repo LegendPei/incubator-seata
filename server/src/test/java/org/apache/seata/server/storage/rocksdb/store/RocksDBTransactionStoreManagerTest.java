@@ -137,6 +137,34 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testRangeDeleteGlobalRemoveKeepsOtherGlobalBranches() {
+        try (RocksDBStoreEngine engine = open("range-remove", true)) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession removed = globalSession("tx-range-remove", GlobalStatus.Begin);
+            GlobalSession kept = globalSession("tx-range-keep", GlobalStatus.Begin);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, removed);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 1L));
+            storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 2L));
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, kept);
+            storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(kept, 1L));
+
+            storeManager.writeSession(LogOperation.GLOBAL_REMOVE, removed);
+
+            Assertions.assertNull(storeManager.readSession(removed.getXid(), true));
+            Assertions.assertTrue(engine.prefixScan(
+                            RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(removed.getXid()))
+                    .isEmpty());
+            Assertions.assertEquals(
+                    1,
+                    storeManager
+                            .readSession(kept.getXid(), true)
+                            .getBranchSessions()
+                            .size());
+        }
+    }
+
+    @Test
     void testReadByStatus() {
         try (RocksDBStoreEngine engine = open("status")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -319,8 +347,12 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     private RocksDBStoreEngine open(String name) {
+        return open(name, false);
+    }
+
+    private RocksDBStoreEngine open(String name, boolean enableRangeDelete) {
         return RocksDBStoreEngine.open(
-                new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
+                new RocksDBStoreConfig(tempDir.resolve(name).toString(), true, enableRangeDelete));
     }
 
     private GlobalSession globalSession(String name, GlobalStatus status) {

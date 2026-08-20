@@ -49,6 +49,20 @@ class RocksDBKeyCodecTest {
     }
 
     @Test
+    void testPrefixEndReturnsSmallestExclusiveUpperBound() {
+        Assertions.assertArrayEquals(new byte[] {1, 3}, RocksDBKeyCodec.prefixEnd(new byte[] {1, 2}));
+        Assertions.assertArrayEquals(new byte[] {2}, RocksDBKeyCodec.prefixEnd(new byte[] {1, (byte) 0xff}));
+        Assertions.assertArrayEquals(new byte[] {1, 3}, RocksDBKeyCodec.prefixEnd(new byte[] {1, 2, (byte) 0xff}));
+    }
+
+    @Test
+    void testPrefixEndReturnsNullWhenUpperBoundIsUnavailable() {
+        Assertions.assertNull(RocksDBKeyCodec.prefixEnd(null));
+        Assertions.assertNull(RocksDBKeyCodec.prefixEnd(new byte[0]));
+        Assertions.assertNull(RocksDBKeyCodec.prefixEnd(new byte[] {(byte) 0xff, (byte) 0xff}));
+    }
+
+    @Test
     void testGlobalStatusIndexKeySortsByStatusAndBeginTime() {
         byte[] beginEarly = RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 10L, "xid-b");
         byte[] beginLate = RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 20L, "xid-a");

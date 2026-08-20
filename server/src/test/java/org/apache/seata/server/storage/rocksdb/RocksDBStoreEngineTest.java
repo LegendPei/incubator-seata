@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
 
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
@@ -94,6 +95,88 @@ class RocksDBStoreEngineTest {
                     1,
                     engine.prefixScan(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-2"))
                             .size());
+        }
+    }
+
+    @Test
+    void testRangeDeleteByPrefixDeletesSamePrefixOnly() {
+        try (RocksDBStoreEngine engine = open("delete-range-prefix", false, true)) {
+            byte[] value = "branch".getBytes(StandardCharsets.UTF_8);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-1", 1L), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-1", 2L), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-2", 1L), value);
+
+            engine.deleteByPrefix(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1"));
+
+            Assertions.assertFalse(
+                    engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1")));
+            Assertions.assertTrue(
+                    engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-2")));
+        }
+    }
+
+    @Test
+    void testRangeDeleteByBranchPrefixKeepsSameXidOtherBranches() {
+        try (RocksDBStoreEngine engine = open("delete-range-branch-prefix", false, true)) {
+            byte[] lockKey1 = RocksDBKeyCodec.encodeRowLock("resource", "table", "pk-1");
+            byte[] lockKey2 = RocksDBKeyCodec.encodeRowLock("resource", "table", "pk-2");
+            byte[] value = "lock".getBytes(StandardCharsets.UTF_8);
+            engine.put(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndex("xid-1", 1L, lockKey1),
+                    value);
+            engine.put(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndex("xid-1", 2L, lockKey2),
+                    value);
+
+            engine.deleteByPrefix(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndexBranchPrefix("xid-1", 1L));
+
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndexBranchPrefix("xid-1", 1L)));
+            Assertions.assertTrue(engine.prefixExists(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndexBranchPrefix("xid-1", 2L)));
+        }
+    }
+
+    @Test
+    void testDeleteByPrefixFallsBackToScanWhenRangeUpperBoundUnavailable() {
+        try (RocksDBStoreEngine engine = open("delete-range-fallback", false, true)) {
+            byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+            byte[] matchingKey = new byte[] {(byte) 0xff, 1};
+            byte[] otherKey = new byte[] {0, 1};
+            engine.put(RocksDBColumnFamily.DEFAULT, matchingKey, value);
+            engine.put(RocksDBColumnFamily.DEFAULT, otherKey, value);
+
+            engine.deleteByPrefix(RocksDBColumnFamily.DEFAULT, new byte[] {(byte) 0xff});
+
+            Assertions.assertNull(engine.get(RocksDBColumnFamily.DEFAULT, matchingKey));
+            Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.DEFAULT, otherKey));
+        }
+    }
+
+    @Test
+    void testBatchDeleteByPrefixUsesRangeDeleteWhenEnabled() throws Exception {
+        try (RocksDBStoreEngine engine = open("delete-range-batch", false, true)) {
+            byte[] value = "branch".getBytes(StandardCharsets.UTF_8);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-1", 1L), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-1", 2L), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-2", 1L), value);
+
+            try (WriteBatch batch = new WriteBatch()) {
+                Assertions.assertTrue(engine.deleteByPrefix(
+                        batch, RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1")));
+                engine.write(batch);
+            }
+
+            Assertions.assertFalse(
+                    engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-1")));
+            Assertions.assertTrue(
+                    engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix("xid-2")));
         }
     }
 
@@ -203,8 +286,120 @@ class RocksDBStoreEngineTest {
                 () -> RocksDBStoreEngineFactory.getInstance(new RocksDBStoreConfig(config.getDbPath(), false)));
     }
 
+    @Test
+    void testOpenWithTunedOptions() {
+        RocksDBStoreConfig config = tunedConfig("tuned", true);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            byte[] key = RocksDBKeyCodec.encodeXid("xid-tuned");
+            byte[] value = RocksDBValueCodec.encode(
+                    RocksDBValueCodec.ValueType.GLOBAL_SESSION, "global".getBytes(StandardCharsets.UTF_8));
+
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value);
+
+            Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+        }
+    }
+
+    @Test
+    void testOpenRejectsInvalidCompressionType() {
+        RocksDBStoreConfig config = tunedConfig("invalid-compression", true, "unknown");
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, () -> RocksDBStoreEngine.open(config));
+
+        Assertions.assertTrue(exception.getMessage().contains("unsupported RocksDB compression type"));
+    }
+
+    @Test
+    void testFactoryRejectsDifferentTuningOptions() {
+        RocksDBStoreConfig config = tunedConfig("factory-tuning", true);
+        RocksDBStoreEngineFactory.getInstance(config);
+
+        Assertions.assertThrows(
+                StoreException.class,
+                () -> RocksDBStoreEngineFactory.getInstance(new RocksDBStoreConfig(config.getDbPath(), true)));
+    }
+
+    @Test
+    void testRangeDeleteLeavesNoResidueAfterRestart() {
+        String dbName = "range-delete-restart";
+        RocksDBStoreConfig config =
+                new RocksDBStoreConfig(tempDir.resolve(dbName).toString(), false, true);
+
+        // Phase 1: write data, range delete, close
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            byte[] value = "data".getBytes(StandardCharsets.UTF_8);
+            byte[] xidPrefix = RocksDBKeyCodec.encodeXidPrefix("xid-rd");
+
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid("xid-rd"), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-rd", 1L), value);
+            engine.put(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch("xid-rd", 2L), value);
+            byte[] lockKey = RocksDBKeyCodec.encodeRowLock("res", "tbl", "pk-1");
+            engine.put(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndex("xid-rd", 1L, lockKey),
+                    value);
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, 100L, "xid-rd"),
+                    value);
+            engine.put(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(100L),
+                    "xid-rd".getBytes(StandardCharsets.UTF_8));
+            engine.flush();
+
+            // range delete global + branch sessions + lock index
+            engine.deleteByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, xidPrefix);
+            engine.deleteByPrefix(RocksDBColumnFamily.BRANCH_SESSION, xidPrefix);
+            engine.deleteByPrefix(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX, RocksDBKeyCodec.encodeLockBranchIndexGlobalPrefix("xid-rd"));
+            engine.flush();
+        }
+
+        // Phase 2: reopen and verify no residue
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            byte[] xidPrefix = RocksDBKeyCodec.encodeXidPrefix("xid-rd");
+            Assertions.assertFalse(engine.prefixExists(RocksDBColumnFamily.GLOBAL_SESSION, xidPrefix));
+            Assertions.assertFalse(engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, xidPrefix));
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                    RocksDBKeyCodec.encodeLockBranchIndexGlobalPrefix("xid-rd")));
+            // transaction ID index and global status index were NOT range-deleted, so they should remain
+            Assertions.assertNotNull(engine.get(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX, RocksDBKeyCodec.encodeTransactionIdIndex(100L)));
+        }
+    }
+
+    @Test
+    void testMultipleOpenCloseCyclesDoNotLeakLocks() {
+        String dbName = "open-close-cycles";
+        RocksDBStoreConfig config =
+                new RocksDBStoreConfig(tempDir.resolve(dbName).toString(), false);
+
+        for (int cycle = 0; cycle < 3; cycle++) {
+            try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+                byte[] key = RocksDBKeyCodec.encodeXid("xid-cycle-" + cycle);
+                byte[] value = ("cycle-" + cycle).getBytes(StandardCharsets.UTF_8);
+                engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value);
+                Assertions.assertArrayEquals(value, engine.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+            }
+        }
+
+        // verify final open still works and data from last cycle is readable
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            byte[] key = RocksDBKeyCodec.encodeXid("xid-cycle-2");
+            Assertions.assertNotNull(engine.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+        }
+    }
+
     private RocksDBStoreEngine open(String name, boolean syncWrite) {
         return RocksDBStoreEngine.open(config(name, syncWrite));
+    }
+
+    private RocksDBStoreEngine open(String name, boolean syncWrite, boolean enableRangeDelete) {
+        return RocksDBStoreEngine.open(
+                new RocksDBStoreConfig(tempDir.resolve(name).toString(), syncWrite, enableRangeDelete));
     }
 
     private RocksDBStoreConfig config(String name, boolean syncWrite) {
@@ -217,5 +412,28 @@ class RocksDBStoreEngineTest {
         dbField.setAccessible(true);
         RocksDB db = (RocksDB) dbField.get(engine);
         return db.getLongProperty(engine.handle(columnFamily), property);
+    }
+
+    private RocksDBStoreConfig tunedConfig(String name, boolean syncWrite) {
+        return tunedConfig(name, syncWrite, "no");
+    }
+
+    private RocksDBStoreConfig tunedConfig(String name, boolean syncWrite, String compressionType) {
+        return new RocksDBStoreConfig(
+                tempDir.resolve(name).toString(),
+                syncWrite,
+                1024L * 1024L,
+                1024L * 1024L,
+                2,
+                1,
+                2,
+                64,
+                1024L * 1024L,
+                4,
+                8,
+                12,
+                true,
+                true,
+                compressionType);
     }
 }

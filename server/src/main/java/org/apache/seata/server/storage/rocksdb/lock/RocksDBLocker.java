@@ -212,8 +212,8 @@ public class RocksDBLocker extends AbstractLocker {
     @Override
     public void cleanAllLocks() {
         try (WriteBatch batch = new WriteBatch()) {
-            deleteByPrefix(batch, RocksDBColumnFamily.LOCK, EMPTY_VALUE);
-            deleteByPrefix(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, EMPTY_VALUE);
+            storeEngine.deleteByPrefix(batch, RocksDBColumnFamily.LOCK, EMPTY_VALUE);
+            storeEngine.deleteByPrefix(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, EMPTY_VALUE);
             storeEngine.write(batch);
         } catch (RocksDBException e) {
             throw new StoreException(e, "clean RocksDB locks failed");
@@ -282,6 +282,9 @@ public class RocksDBLocker extends AbstractLocker {
     private boolean releaseByIndex(byte[] indexPrefix, String xid, Long branchId) {
         List<RocksDBStoreEngine.RocksDBEntry> indexEntries =
                 storeEngine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexPrefix);
+        if (CollectionUtils.isEmpty(indexEntries)) {
+            return true;
+        }
         try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
                 WriteBatch batch = new WriteBatch()) {
             for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
@@ -294,8 +297,8 @@ public class RocksDBLocker extends AbstractLocker {
                         batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
                     }
                 }
-                batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
             }
+            storeEngine.deleteByPrefix(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexPrefix);
             storeEngine.write(batch);
             return true;
         } catch (RocksDBException e) {
@@ -306,13 +309,6 @@ public class RocksDBLocker extends AbstractLocker {
     private LockDO readLock(LockDO lockDO) {
         byte[] value = storeEngine.get(RocksDBColumnFamily.LOCK, encodeLockKey(lockDO));
         return value == null ? null : decodeLock(value);
-    }
-
-    private void deleteByPrefix(WriteBatch batch, RocksDBColumnFamily columnFamily, byte[] prefix)
-            throws RocksDBException {
-        for (RocksDBStoreEngine.RocksDBEntry entry : storeEngine.prefixScan(columnFamily, prefix)) {
-            batch.delete(storeEngine.handle(columnFamily), entry.getKey());
-        }
     }
 
     private List<LockDO> distinctByRowKey(List<LockDO> lockDOs) {

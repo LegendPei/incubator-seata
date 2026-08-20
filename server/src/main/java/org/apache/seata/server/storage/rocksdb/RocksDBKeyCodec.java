@@ -21,6 +21,7 @@ import org.apache.seata.core.model.GlobalStatus;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * Stable binary key codec for RocksDB file store engine.
@@ -102,6 +103,83 @@ public final class RocksDBKeyCodec {
             }
         }
         return true;
+    }
+
+    public static byte[] prefixEnd(byte[] prefix) {
+        if (prefix == null || prefix.length == 0) {
+            return null;
+        }
+        byte[] end = Arrays.copyOf(prefix, prefix.length);
+        for (int i = end.length - 1; i >= 0; i--) {
+            int value = end[i] & 0xff;
+            if (value != 0xff) {
+                end[i] = (byte) (value + 1);
+                return Arrays.copyOf(end, i + 1);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Extract xid from a global status index key.
+     *
+     * <p>Status index key layout: {@code status_code(4) | beginTime(8) | xid_component(4 + xidBytes)}.
+     */
+    public static String extractXidFromStatusIndexKey(byte[] key) {
+        if (key == null || key.length < INT_BYTE_SIZE + LONG_BYTE_SIZE + INT_BYTE_SIZE) {
+            return null;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(key);
+        buffer.getInt();
+        buffer.getLong();
+        int xidLength = buffer.getInt();
+        if (xidLength < 0 || buffer.remaining() < xidLength) {
+            return null;
+        }
+        byte[] xidBytes = new byte[xidLength];
+        buffer.get(xidBytes);
+        return new String(xidBytes, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Extract begin time from a global status index key.
+     */
+    public static long extractBeginTimeFromStatusIndexKey(byte[] key) {
+        if (key == null || key.length < INT_BYTE_SIZE + LONG_BYTE_SIZE + INT_BYTE_SIZE) {
+            return -1;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(key);
+        buffer.getInt();
+        return buffer.getLong();
+    }
+
+    /**
+     * Extract status code from a global status index key.
+     */
+    public static int extractStatusCodeFromStatusIndexKey(byte[] key) {
+        if (key == null || key.length < INT_BYTE_SIZE) {
+            return -1;
+        }
+        return ByteBuffer.wrap(key).getInt();
+    }
+
+    /**
+     * Extract xid from a branch session key.
+     *
+     * <p>Branch key layout: {@code xid_component(4 + xidBytes) | branchId(8)}.
+     */
+    public static String extractXidFromBranchKey(byte[] key) {
+        if (key == null || key.length < INT_BYTE_SIZE) {
+            return null;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(key);
+        int xidLength = buffer.getInt();
+        if (xidLength < 0 || buffer.remaining() < xidLength + LONG_BYTE_SIZE) {
+            return null;
+        }
+        byte[] xidBytes = new byte[xidLength];
+        buffer.get(xidBytes);
+        return new String(xidBytes, StandardCharsets.UTF_8);
     }
 
     private static byte[] encodeComponent(String value) {

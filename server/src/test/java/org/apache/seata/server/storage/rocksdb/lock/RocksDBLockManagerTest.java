@@ -109,6 +109,27 @@ class RocksDBLockManagerTest {
     }
 
     @Test
+    void testRangeDeleteReleaseKeepsSameXidOtherBranch() throws Exception {
+        try (RocksDBStoreEngine engine = open("range-release-same-xid-branch", true)) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession first = branchSession(1001L, 1L, "t_order:1");
+            BranchSession sameXid = branchSession(1001L, 2L, "t_order:2");
+            BranchSession conflict = branchSession(1002L, 3L, "t_order:2");
+            GlobalSession globalSession = new GlobalSession("app", "group", "tx", 60000);
+            globalSession.setXid(first.getXid());
+
+            Assertions.assertTrue(lockManager.acquireLock(first));
+            Assertions.assertTrue(lockManager.acquireLock(sameXid));
+
+            Assertions.assertTrue(lockManager.releaseLock(first));
+            Assertions.assertFalse(lockManager.acquireLock(conflict));
+
+            Assertions.assertTrue(lockManager.releaseGlobalSessionLock(globalSession));
+            Assertions.assertTrue(lockManager.acquireLock(conflict));
+        }
+    }
+
+    @Test
     void testReleaseGlobalSessionLock() throws Exception {
         try (RocksDBStoreEngine engine = open("release-global")) {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
@@ -236,8 +257,12 @@ class RocksDBLockManagerTest {
     }
 
     private RocksDBStoreEngine open(String name) {
+        return open(name, false);
+    }
+
+    private RocksDBStoreEngine open(String name, boolean enableRangeDelete) {
         return RocksDBStoreEngine.open(
-                new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
+                new RocksDBStoreConfig(tempDir.resolve(name).toString(), true, enableRangeDelete));
     }
 
     private BranchSession branchSession(long transactionId, long branchId, String lockKey) {
