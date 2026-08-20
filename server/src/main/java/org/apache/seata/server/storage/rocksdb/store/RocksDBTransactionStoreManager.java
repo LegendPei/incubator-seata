@@ -23,6 +23,7 @@ import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBLocalLocks;
@@ -41,9 +42,12 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /**
  * RocksDB transaction store manager for file store engine.
@@ -52,6 +56,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBTransactionStoreManager.class);
     private static final String MIGRATION_STATUS_KEY = "migration_status";
+    private static final int STATUS_SCAN_PAGE_SIZE = 1024;
 
     private final RocksDBStoreEngine storeEngine;
     private final RocksDBLocalLocks xidLocks;
@@ -175,6 +180,9 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         if (sessionCondition == null) {
             return Collections.emptyList();
         }
+        sessionCondition.clearNextStatusScanCursor();
+        sessionCondition.clearNextTimeoutScanCursor();
+        sessionCondition.clearScanStats();
         if (StringUtils.isNotBlank(sessionCondition.getXid())) {
             GlobalSession globalSession = readSession(sessionCondition.getXid(), !sessionCondition.isLazyLoadBranch());
             if (globalSession == null || !matches(globalSession, sessionCondition)) {
@@ -184,6 +192,9 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
         if (sessionCondition.getTransactionId() != null && sessionCondition.getTransactionId() > 0) {
             return readByTransactionId(sessionCondition);
+        }
+        if (shouldUseTimeoutDeadlineScan(sessionCondition)) {
+            return readByTimeoutDeadline(sessionCondition);
         }
         if (CollectionUtils.isNotEmpty(sessionCondition.getStatuses())) {
             return readByStatuses(sessionCondition);
@@ -280,28 +291,334 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return Collections.singletonList(globalSession);
     }
 
+    private List<GlobalSession> readByTimeoutDeadline(SessionCondition sessionCondition) {
+        SessionScanStatsAccumulator scanStats = new SessionScanStatsAccumulator();
+        ScanBudget scanBudget = new ScanBudget(sessionCondition.getScanLimit());
+        Set<String> seenXids = new LinkedHashSet<>();
+        List<GlobalSession> result = new ArrayList<>();
+        Integer limit = sessionCondition.getLimit();
+        byte[] cursor = sessionCondition.getTimeoutScanCursor();
+        do {
+            if (scanBudget.isExhausted()) {
+                break;
+            }
+            RocksDBIndexManager.TimeoutScanResult scanResult = indexManager.scanXidsByTimeoutDeadline(
+                    sessionCondition.getMaxTimeoutDeadlineMillis(),
+                    cursor,
+                    scanBudget.clamp(nextPageLimit(limit, result)));
+            scanBudget.record(scanResult.getRowsScanned());
+            scanStats.record(scanResult);
+            for (RocksDBIndexManager.TimeoutIndexEntry entry : scanResult.getEntries()) {
+                if (appendMatchingTimeoutSession(sessionCondition, seenXids, result, entry, scanStats)
+                        && isLimitReached(limit, result)) {
+                    break;
+                }
+            }
+            cursor = scanResult.getNextCursor();
+        } while (cursor != null && !isLimitReached(limit, result) && !scanBudget.isExhausted());
+        sessionCondition.setNextTimeoutScanCursor(cursor);
+        sessionCondition.setScanStats(scanStats.toStats(result.size()));
+        return result;
+    }
+
     private List<GlobalSession> readByStatuses(SessionCondition sessionCondition) {
+        SessionScanStatsAccumulator scanStats = new SessionScanStatsAccumulator();
+        ScanBudget scanBudget = new ScanBudget(sessionCondition.getScanLimit());
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
         Long overTimeAliveMills = sessionCondition.getOverTimeAliveMills();
+        Integer limit = sessionCondition.getLimit();
         Long maxBeginTime = overTimeAliveMills != null && overTimeAliveMills > 0
                 ? System.currentTimeMillis() - overTimeAliveMills
                 : null;
+        if (!shouldUseBoundedStatusScan(sessionCondition, maxBeginTime, limit, scanBudget)) {
+            for (GlobalStatus status : sessionCondition.getStatuses()) {
+                indexManager.scanXidsByStatus(
+                        status,
+                        xid -> appendMatchingSession(sessionCondition, seenXids, result, xid, status, null, scanStats));
+            }
+            sessionCondition.setScanStats(scanStats.toStats(result.size()));
+            return result;
+        }
+        if (sessionCondition.getStatuses().length > 1) {
+            List<GlobalSession> merged =
+                    readByStatusesWithKWayMerge(sessionCondition, maxBeginTime, limit, scanBudget, scanStats);
+            sessionCondition.setScanStats(scanStats.toStats(merged.size()));
+            return merged;
+        }
         for (GlobalStatus status : sessionCondition.getStatuses()) {
-            Iterable<String> xids = maxBeginTime == null
-                    ? indexManager.scanXidsByStatus(status)
-                    : indexManager.scanXidsByStatus(status, maxBeginTime, 0).getXids();
-            for (String xid : xids) {
-                if (!seenXids.add(xid)) {
-                    continue;
+            byte[] cursor = sessionCondition.getStatusScanCursor();
+            do {
+                if (scanBudget.isExhausted()) {
+                    break;
                 }
-                GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
-                if (globalSession != null && matches(globalSession, sessionCondition)) {
-                    result.add(globalSession);
+                RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
+                        status,
+                        0L,
+                        maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime,
+                        cursor,
+                        scanBudget.clamp(nextPageLimit(limit, result)));
+                scanBudget.record(scanResult.getRowsScanned());
+                scanStats.record(scanResult);
+                for (RocksDBIndexManager.StatusIndexEntry entry : scanResult.getEntries()) {
+                    if (appendMatchingSession(
+                                    sessionCondition,
+                                    seenXids,
+                                    result,
+                                    entry.getXid(),
+                                    entry.getStatus(),
+                                    entry.getBeginTime(),
+                                    scanStats)
+                            && isLimitReached(limit, result)) {
+                        break;
+                    }
                 }
+                cursor = scanResult.getNextCursor();
+            } while (cursor != null && !isLimitReached(limit, result) && !scanBudget.isExhausted());
+            sessionCondition.setNextStatusScanCursor(cursor);
+        }
+        sessionCondition.setScanStats(scanStats.toStats(result.size()));
+        return result;
+    }
+
+    private List<GlobalSession> readByStatusesWithKWayMerge(
+            SessionCondition sessionCondition,
+            Long maxBeginTime,
+            Integer limit,
+            ScanBudget scanBudget,
+            SessionScanStatsAccumulator scanStats) {
+        Set<String> seenXids = new LinkedHashSet<>();
+        List<GlobalSession> result = new ArrayList<>();
+        PriorityQueue<StatusScanCursor> queue =
+                new PriorityQueue<>(Comparator.comparingLong(StatusScanCursor::beginTime)
+                        .thenComparingInt(StatusScanCursor::statusCode)
+                        .thenComparing(StatusScanCursor::xid));
+        for (GlobalStatus status : sessionCondition.getStatuses()) {
+            StatusScanCursor cursor = new StatusScanCursor(status, maxBeginTime, limit, scanBudget, scanStats);
+            if (cursor.hasCurrent()) {
+                queue.offer(cursor);
+            }
+        }
+        while (!queue.isEmpty() && !isLimitReached(limit, result)) {
+            StatusScanCursor cursor = queue.poll();
+            RocksDBIndexManager.StatusIndexEntry entry = cursor.current();
+            appendMatchingSession(
+                    sessionCondition,
+                    seenXids,
+                    result,
+                    entry.getXid(),
+                    entry.getStatus(),
+                    entry.getBeginTime(),
+                    scanStats);
+            if (isLimitReached(limit, result)) {
+                break;
+            }
+            cursor.advance(limit, result, scanStats);
+            if (cursor.hasCurrent()) {
+                queue.offer(cursor);
             }
         }
         return result;
+    }
+
+    private boolean appendMatchingSession(
+            SessionCondition sessionCondition,
+            Set<String> seenXids,
+            List<GlobalSession> result,
+            String xid,
+            GlobalStatus indexStatus,
+            Long indexBeginTime,
+            SessionScanStatsAccumulator scanStats) {
+        if (seenXids.contains(xid)) {
+            return false;
+        }
+        scanStats.recordPointRead();
+        GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
+        if (globalSession != null
+                && globalSession.getStatus() == indexStatus
+                && (indexBeginTime == null || globalSession.getBeginTime() == indexBeginTime)
+                && matches(globalSession, sessionCondition)) {
+            seenXids.add(xid);
+            result.add(globalSession);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean appendMatchingTimeoutSession(
+            SessionCondition sessionCondition,
+            Set<String> seenXids,
+            List<GlobalSession> result,
+            RocksDBIndexManager.TimeoutIndexEntry entry,
+            SessionScanStatsAccumulator scanStats) {
+        if (seenXids.contains(entry.getXid())) {
+            return false;
+        }
+        scanStats.recordPointRead();
+        GlobalSession globalSession = readSession(entry.getXid(), !sessionCondition.isLazyLoadBranch());
+        if (globalSession != null
+                && globalSession.getStatus() == GlobalStatus.Begin
+                && RocksDBIndexManager.timeoutDeadlineMillis(globalSession) == entry.getDeadlineMillis()
+                && matches(globalSession, sessionCondition)) {
+            seenXids.add(entry.getXid());
+            result.add(globalSession);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean shouldUseBoundedStatusScan(
+            SessionCondition sessionCondition, Long maxBeginTime, Integer limit, ScanBudget scanBudget) {
+        return maxBeginTime != null
+                || limit != null && limit > 0
+                || scanBudget.isBounded()
+                || sessionCondition.getStatusScanCursor() != null;
+    }
+
+    private boolean shouldUseTimeoutDeadlineScan(SessionCondition sessionCondition) {
+        if (sessionCondition.getMaxTimeoutDeadlineMillis() == null
+                || CollectionUtils.isEmpty(sessionCondition.getStatuses())
+                || sessionCondition.getStatuses().length != 1) {
+            return false;
+        }
+        return sessionCondition.getStatuses()[0] == GlobalStatus.Begin;
+    }
+
+    private int nextPageLimit(Integer limit, List<GlobalSession> result) {
+        if (limit == null || limit <= 0) {
+            return STATUS_SCAN_PAGE_SIZE;
+        }
+        return Math.max(1, Math.min(STATUS_SCAN_PAGE_SIZE, limit - result.size()));
+    }
+
+    private boolean isLimitReached(Integer limit, List<GlobalSession> result) {
+        return limit != null && limit > 0 && result.size() >= limit;
+    }
+
+    private static class ScanBudget {
+        private final int limit;
+        private int examined;
+
+        ScanBudget(Integer limit) {
+            this.limit = limit == null || limit <= 0 ? 0 : limit;
+        }
+
+        boolean isBounded() {
+            return limit > 0;
+        }
+
+        boolean isExhausted() {
+            return isBounded() && examined >= limit;
+        }
+
+        int clamp(int requested) {
+            return isBounded() ? Math.min(requested, limit - examined) : requested;
+        }
+
+        void record(int rowsScanned) {
+            examined += rowsScanned;
+        }
+    }
+
+    private class StatusScanCursor {
+        private final GlobalStatus status;
+        private final Long maxBeginTime;
+        private final ScanBudget scanBudget;
+        private List<RocksDBIndexManager.StatusIndexEntry> entries = Collections.emptyList();
+        private byte[] nextCursor;
+        private int index;
+        private boolean exhausted;
+
+        StatusScanCursor(
+                GlobalStatus status,
+                Long maxBeginTime,
+                Integer limit,
+                ScanBudget scanBudget,
+                SessionScanStatsAccumulator scanStats) {
+            this.status = status;
+            this.maxBeginTime = maxBeginTime;
+            this.scanBudget = scanBudget;
+            loadNextPage(limit, Collections.emptyList(), scanStats);
+        }
+
+        boolean hasCurrent() {
+            return current() != null;
+        }
+
+        RocksDBIndexManager.StatusIndexEntry current() {
+            return index < entries.size() ? entries.get(index) : null;
+        }
+
+        long beginTime() {
+            return current().getBeginTime();
+        }
+
+        int statusCode() {
+            return status.getCode();
+        }
+
+        String xid() {
+            return current().getXid();
+        }
+
+        void advance(Integer limit, List<GlobalSession> result, SessionScanStatsAccumulator scanStats) {
+            index++;
+            if (index >= entries.size()) {
+                loadNextPage(limit, result, scanStats);
+            }
+        }
+
+        private void loadNextPage(
+                Integer limit, List<GlobalSession> result, SessionScanStatsAccumulator scanStats) {
+            if (exhausted || scanBudget.isExhausted()) {
+                entries = Collections.emptyList();
+                index = 0;
+                return;
+            }
+            int requested = scanBudget.isBounded() ? 1 : nextPageLimit(limit, result);
+            RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
+                    status,
+                    0L,
+                    maxBeginTime == null ? Long.MAX_VALUE : maxBeginTime,
+                    nextCursor,
+                    scanBudget.clamp(requested));
+            scanBudget.record(scanResult.getRowsScanned());
+            scanStats.record(scanResult);
+            entries = scanResult.getEntries();
+            index = 0;
+            nextCursor = scanResult.getNextCursor();
+            exhausted = nextCursor == null;
+        }
+    }
+
+    private static class SessionScanStatsAccumulator {
+        private final long startedAtNanos = System.nanoTime();
+        private long rowsScanned;
+        private long rowsReturned;
+        private long pointReads;
+        private boolean limitReached;
+
+        private void record(RocksDBIndexManager.StatusScanResult scanResult) {
+            rowsScanned += scanResult.getRowsScanned();
+            rowsReturned += scanResult.getRowsReturned();
+            limitReached |= scanResult.isLimitReached();
+        }
+
+        private void record(RocksDBIndexManager.TimeoutScanResult scanResult) {
+            rowsScanned += scanResult.getRowsScanned();
+            rowsReturned += scanResult.getRowsReturned();
+            limitReached |= scanResult.isLimitReached();
+        }
+
+        private void recordPointRead() {
+            pointReads++;
+        }
+
+        private SessionScanStats toStats(int sessionsReturned) {
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+            return new SessionScanStats(
+                    rowsScanned, rowsReturned, pointReads, sessionsReturned, elapsedMillis, limitReached);
+        }
     }
 
     private boolean matches(GlobalSession globalSession, SessionCondition sessionCondition) {
@@ -322,6 +639,11 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                     return true;
                 }
             }
+            return false;
+        }
+        if (sessionCondition.getMaxTimeoutDeadlineMillis() != null
+                && RocksDBIndexManager.timeoutDeadlineMillis(globalSession)
+                        > sessionCondition.getMaxTimeoutDeadlineMillis()) {
             return false;
         }
         if (sessionCondition.getStatus() != null) {

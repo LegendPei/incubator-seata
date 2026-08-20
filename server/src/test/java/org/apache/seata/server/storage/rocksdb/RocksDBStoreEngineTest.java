@@ -867,8 +867,79 @@ class RocksDBStoreEngineTest {
         Assertions.assertTrue(executor.isShutdown());
         RocksDBStoreEngine reopened = RocksDBStoreEngineFactory.getInstance(config);
         Assertions.assertNotSame(engine, reopened);
+        Assertions.assertFalse(reopened.wasLastShutdownClean());
         Assertions.assertNotNull(
                 reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid("xid-close-failure")));
+    }
+
+    @Test
+    void testFactoryCanRecreateEngineAfterPreControllerCloseFailure() throws Exception {
+        RocksDBStoreConfig config = config("pre-controller-close-failure-reopen", false);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance(config);
+        byte[] key = RocksDBKeyCodec.encodeXid("xid-pre-controller-close-failure");
+        byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+        engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value);
+
+        StoreException preCloseFailure = new StoreException("pre-controller-close failure");
+        StoreException controllerCloseFailure = new StoreException("controller close failure");
+        DirectScheduledExecutor executor = new DirectScheduledExecutor();
+        executor.failShutdownNowWith(controllerCloseFailure);
+        FailingWalSyncer syncer = new FailingWalSyncer();
+        replaceWalSyncController(
+                engine,
+                new RocksDBWalSyncController(
+                        RocksDBWalSyncMode.PERIODIC,
+                        syncer,
+                        1000L,
+                        100L,
+                        true,
+                        1000L,
+                        executor,
+                        true,
+                        new FailingAfterWriteClock(preCloseFailure),
+                        System::nanoTime));
+
+        StoreException exception = Assertions.assertThrows(StoreException.class, RocksDBStoreEngineFactory::destroy);
+
+        Assertions.assertSame(preCloseFailure, exception);
+        Assertions.assertArrayEquals(new Throwable[] {controllerCloseFailure}, exception.getSuppressed());
+        Assertions.assertTrue(engine.isClosed());
+        Assertions.assertTrue(executor.isShutdown());
+        Assertions.assertEquals(1, executor.shutdownNowCalls());
+        engine.close();
+        Assertions.assertEquals(1, executor.shutdownNowCalls());
+
+        RocksDBStoreEngine reopened = RocksDBStoreEngineFactory.getInstance(config);
+        Assertions.assertNotSame(engine, reopened);
+        Assertions.assertFalse(reopened.wasLastShutdownClean());
+        Assertions.assertArrayEquals(value, reopened.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+    }
+
+    @Test
+    void testCleanShutdownMarkerTracksPreviousClose() {
+        RocksDBStoreConfig config = config("clean-shutdown-marker", false);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            Assertions.assertFalse(engine.wasLastShutdownClean());
+        }
+
+        try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
+            Assertions.assertTrue(reopened.wasLastShutdownClean());
+        }
+    }
+
+    @Test
+    void testStartupDirtyShutdownMarkerIsDurablySynced() {
+        RocksDBStoreConfig config = periodicWalSyncConfig("dirty-shutdown-marker-sync", false, Long.MAX_VALUE);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            Assertions.assertFalse(engine.wasLastShutdownClean());
+        }
+
+        try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(config)) {
+            Assertions.assertTrue(reopened.wasLastShutdownClean());
+            Assertions.assertEquals(0L, reopened.diagnostics().getWalSyncStats().getUnsyncedWriteRequests());
+        }
     }
 
     @Test
@@ -951,6 +1022,54 @@ class RocksDBStoreEngineTest {
         try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
             byte[] key = RocksDBKeyCodec.encodeXid("xid-cycle-2");
             Assertions.assertNotNull(engine.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+        }
+    }
+
+    @Test
+    void testAppliesDbBudgetAndColumnFamilyWriteBufferProfiles() {
+        RocksDBStoreConfig config = new RocksDBStoreConfig(
+                tempDir.resolve("cf-profiles").toString(),
+                true,
+                0L,
+                2L * 1024L * 1024L,
+                2,
+                1,
+                0,
+                0,
+                0L,
+                0,
+                0,
+                0,
+                false,
+                false,
+                null,
+                false,
+                false,
+                RocksDBWalSyncMode.NONE,
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_INTERVAL_MILLIS,
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_WRITE_THRESHOLD,
+                true,
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS,
+                32L * 1024L * 1024L,
+                8L * 1024L * 1024L,
+                4L * 1024L * 1024L,
+                1L * 1024L * 1024L,
+                512L * 1024L,
+                64L * 1024L,
+                1024L * 1024L * 1024L);
+
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(config)) {
+            Assertions.assertEquals(32L * 1024L * 1024L, engine.getDbWriteBufferSize());
+            Assertions.assertEquals(1024L * 1024L * 1024L, engine.getMaxTotalWalSize());
+            Assertions.assertEquals(
+                    8L * 1024L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.GLOBAL_SESSION));
+            Assertions.assertEquals(
+                    4L * 1024L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.BRANCH_SESSION));
+            Assertions.assertEquals(
+                    1L * 1024L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.LOCK));
+            Assertions.assertEquals(
+                    512L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX));
+            Assertions.assertEquals(64L * 1024L, engine.getColumnFamilyWriteBufferSize(RocksDBColumnFamily.METADATA));
         }
     }
 
@@ -1097,6 +1216,23 @@ class RocksDBStoreEngineTest {
         }
     }
 
+    private static final class FailingAfterWriteClock implements LongSupplier {
+        private final RuntimeException failure;
+        private final AtomicInteger calls = new AtomicInteger();
+
+        private FailingAfterWriteClock(RuntimeException failure) {
+            this.failure = failure;
+        }
+
+        @Override
+        public long getAsLong() {
+            if (calls.incrementAndGet() > 1) {
+                throw failure;
+            }
+            return 1L;
+        }
+    }
+
     private static final class BlockingAfterWriteClock implements LongSupplier {
         private final AtomicInteger calls = new AtomicInteger();
         private final CountDownLatch afterWriteEntered = new CountDownLatch(1);
@@ -1162,6 +1298,8 @@ class RocksDBStoreEngineTest {
     private static final class DirectScheduledExecutor extends AbstractExecutorService
             implements ScheduledExecutorService {
         private boolean shutdown;
+        private int shutdownNowCalls;
+        private RuntimeException shutdownNowFailure;
 
         @Override
         public void shutdown() {
@@ -1171,7 +1309,19 @@ class RocksDBStoreEngineTest {
         @Override
         public List<Runnable> shutdownNow() {
             shutdown = true;
+            shutdownNowCalls++;
+            if (shutdownNowFailure != null) {
+                throw shutdownNowFailure;
+            }
             return Collections.emptyList();
+        }
+
+        private void failShutdownNowWith(RuntimeException failure) {
+            shutdownNowFailure = failure;
+        }
+
+        private int shutdownNowCalls() {
+            return shutdownNowCalls;
         }
 
         @Override

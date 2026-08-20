@@ -164,6 +164,41 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "writeBufferSize";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_DB_WRITE_BUFFER_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_DB_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "dbWriteBufferSize";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_MAX_TOTAL_WAL_SIZE = STORE_FILE_ROCKSDB_PREFIX + "maxTotalWalSize";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_GLOBAL_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "globalWriteBufferSize";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_BRANCH_WRITE_BUFFER_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_BRANCH_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "branchWriteBufferSize";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_LOCK_WRITE_BUFFER_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_LOCK_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "lockWriteBufferSize";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_INDEX_WRITE_BUFFER_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_INDEX_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "indexWriteBufferSize";
+
+    /**
+     * The constant STORE_FILE_ROCKSDB_METADATA_WRITE_BUFFER_SIZE.
+     */
+    String STORE_FILE_ROCKSDB_METADATA_WRITE_BUFFER_SIZE = STORE_FILE_ROCKSDB_PREFIX + "metadataWriteBufferSize";
+
+    /**
      * The constant STORE_FILE_ROCKSDB_MAX_WRITE_BUFFER_NUMBER.
      */
     String STORE_FILE_ROCKSDB_MAX_WRITE_BUFFER_NUMBER = STORE_FILE_ROCKSDB_PREFIX + "maxWriteBufferNumber";
@@ -1144,6 +1179,11 @@ public interface ConfigurationKeys {
      * The constant ENABLE_BRANCH_ASYNC_REMOVE
      */
     String ENABLE_BRANCH_ASYNC_REMOVE = SERVER_PREFIX + SESSION_PREFIX + "enableBranchAsyncRemove";
+
+    /**
+     * The constant SESSION_BACKGROUND_TASK_QUERY_LIMIT
+     */
+    String SESSION_BACKGROUND_TASK_QUERY_LIMIT = SERVER_PREFIX + SESSION_PREFIX + "backgroundTaskQueryLimit";
 
     /**
      * The constant SERVER_RAFT.

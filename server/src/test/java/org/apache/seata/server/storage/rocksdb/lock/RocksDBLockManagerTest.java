@@ -42,6 +42,10 @@ import org.springframework.mock.env.MockEnvironment;
 import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 class RocksDBLockManagerTest {
 
@@ -170,6 +174,46 @@ class RocksDBLockManagerTest {
     }
 
     @Test
+    void testConcurrentBatchedReleaseAndAcquireKeepsLockSetAtomic() throws Exception {
+        try (RocksDBStoreEngine engine = open("release-acquire-race")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine, 1);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            try {
+                for (int round = 0; round < 20; round++) {
+                    long oldTransactionId = 2000L + round * 2L;
+                    long nextTransactionId = oldTransactionId + 1L;
+                    String lockKey = "t_order:" + (round * 3 + 1) + "," + (round * 3 + 2) + "," + (round * 3 + 3);
+                    BranchSession oldHolder = branchSession(oldTransactionId, oldTransactionId, lockKey);
+                    BranchSession nextHolder = branchSession(nextTransactionId, nextTransactionId, lockKey);
+                    BranchSession thirdHolder = branchSession(10000L + round, 10000L + round, lockKey);
+                    GlobalSession oldGlobal = new GlobalSession("app", "group", "tx", 60000);
+                    oldGlobal.setXid(oldHolder.getXid());
+                    Assertions.assertTrue(lockManager.acquireLock(oldHolder));
+
+                    CyclicBarrier start = new CyclicBarrier(2);
+                    Future<Boolean> release = executor.submit(() -> {
+                        start.await();
+                        return lockManager.releaseGlobalSessionLock(oldGlobal);
+                    });
+                    Future<Boolean> acquire = executor.submit(() -> {
+                        start.await();
+                        return lockManager.acquireLock(nextHolder);
+                    });
+
+                    Assertions.assertTrue(release.get());
+                    if (!acquire.get()) {
+                        Assertions.assertTrue(lockManager.acquireLock(nextHolder));
+                    }
+                    Assertions.assertFalse(lockManager.acquireLock(thirdHolder));
+                    Assertions.assertTrue(lockManager.releaseLock(nextHolder));
+                }
+            } finally {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    @Test
     void testIsLockable() throws Exception {
         try (RocksDBStoreEngine engine = open("lockable")) {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
@@ -289,6 +333,43 @@ class RocksDBLockManagerTest {
             Assertions.assertTrue(secondBatch.isLimitReached());
             Assertions.assertTrue(
                     engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty());
+            Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                    .isEmpty());
+        }
+    }
+
+    @Test
+    void testCleanOrphanLocksBatchesStopsAtMaxBatchesWithCursor() throws Exception {
+        try (RocksDBStoreEngine engine = open("clean-orphan-batches")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession first = branchSession(1001L, 1L, "t_order:1");
+            BranchSession second = branchSession(1002L, 2L, "t_order:2");
+            BranchSession third = branchSession(1003L, 3L, "t_order:3");
+
+            Assertions.assertTrue(lockManager.acquireLock(first));
+            Assertions.assertTrue(lockManager.acquireLock(second));
+            Assertions.assertTrue(lockManager.acquireLock(third));
+
+            RocksDBLockManager.CleanOrphanLocksResult result = lockManager.cleanOrphanLocksBatches(1, 2);
+
+            Assertions.assertEquals(2, result.getCleaned());
+            Assertions.assertEquals(2, result.getScanned());
+            Assertions.assertEquals(2, result.getBatches());
+            Assertions.assertTrue(result.isLimitReached());
+            Assertions.assertNotNull(result.getNextSeekKey());
+            Assertions.assertEquals(
+                    1,
+                    engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                            .size());
+
+            RocksDBLockManager.CleanOrphanLocksResult finalResult =
+                    lockManager.cleanOrphanLocksBatches(result.getNextSeekKey(), 1, 2);
+
+            Assertions.assertEquals(1, finalResult.getCleaned());
+            Assertions.assertEquals(1, finalResult.getScanned());
+            Assertions.assertEquals(2, finalResult.getBatches());
+            Assertions.assertFalse(finalResult.isLimitReached());
+            Assertions.assertNull(finalResult.getNextSeekKey());
             Assertions.assertTrue(engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
                     .isEmpty());
         }

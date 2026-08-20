@@ -64,6 +64,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private static final int DELETE_BATCH_SIZE = 1024;
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBStoreEngine.class);
     private static final byte[] FORMAT_VERSION_KEY = "format_version".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_KEY = "clean_shutdown".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_TRUE = "true".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CLEAN_SHUTDOWN_FALSE = "false".getBytes(StandardCharsets.UTF_8);
     private static final String ROCKS_DB_VERSION;
     private static final String[] DB_LONG_PROPERTIES = {
         RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE,
@@ -102,7 +105,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final RocksDBStoreConfig config;
     private final Map<RocksDBColumnFamily, ColumnFamilyHandle> handles = new EnumMap<>(RocksDBColumnFamily.class);
     private final DBOptions dbOptions;
-    private final ColumnFamilyOptions columnFamilyOptions;
+    private final Map<RocksDBColumnFamily, ColumnFamilyOptions> columnFamilyOptions;
     private final ReadOptions readOptions;
     private final WriteOptions writeOptions;
     private final Cache blockCache;
@@ -110,16 +113,17 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final RocksDBWalSyncController walSyncController;
     private final RocksDB db;
     private final ReentrantReadWriteLock maintenanceLock = new ReentrantReadWriteLock(true);
+    private final boolean lastShutdownClean;
 
     private volatile boolean closed;
 
     private RocksDBStoreEngine(RocksDBStoreConfig config) {
         this.config = config;
         DBOptions openedDbOptions = null;
-        ColumnFamilyOptions openedColumnFamilyOptions = null;
+        Map<RocksDBColumnFamily, ColumnFamilyOptions> openedColumnFamilyOptions =
+                new EnumMap<>(RocksDBColumnFamily.class);
         ReadOptions openedReadOptions = null;
         WriteOptions openedWriteOptions = null;
-        BlockBasedTableConfig openedTableConfig = null;
         Cache openedBlockCache = null;
         Statistics openedStatistics = null;
         RocksDBWalSyncController openedWalSyncController = RocksDBWalSyncController.disabled();
@@ -135,24 +139,32 @@ public class RocksDBStoreEngine implements AutoCloseable {
             if (config.getMaxOpenFiles() > 0) {
                 openedDbOptions.setMaxOpenFiles(config.getMaxOpenFiles());
             }
+            if (config.getDbWriteBufferSize() > 0) {
+                openedDbOptions.setDbWriteBufferSize(config.getDbWriteBufferSize());
+            }
+            if (config.getMaxTotalWalSize() > 0) {
+                openedDbOptions.setMaxTotalWalSize(config.getMaxTotalWalSize());
+            }
             if (config.isEnableStatistics()) {
                 openedStatistics = new Statistics();
                 openedDbOptions.setStatistics(openedStatistics);
             }
 
-            openedColumnFamilyOptions = new ColumnFamilyOptions();
             if (config.getBlockCacheSize() > 0) {
                 openedBlockCache = new LRUCache(config.getBlockCacheSize());
-                openedTableConfig = new BlockBasedTableConfig().setBlockCache(openedBlockCache);
-                openedColumnFamilyOptions.setTableFormatConfig(openedTableConfig);
             }
-            applyColumnFamilyOptions(openedColumnFamilyOptions, config);
             openedReadOptions = new ReadOptions();
             openedWriteOptions = new WriteOptions().setDisableWAL(false).setSync(config.isSyncWrite());
 
             List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
             for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
-                descriptors.add(new ColumnFamilyDescriptor(columnFamily.getNameBytes(), openedColumnFamilyOptions));
+                ColumnFamilyOptions options = new ColumnFamilyOptions();
+                if (openedBlockCache != null) {
+                    options.setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(openedBlockCache));
+                }
+                applyColumnFamilyOptions(options, config, columnFamily);
+                openedColumnFamilyOptions.put(columnFamily, options);
+                descriptors.add(new ColumnFamilyDescriptor(columnFamily.getNameBytes(), options));
             }
 
             openedDb = RocksDB.open(openedDbOptions, config.getDbPath(), descriptors, openedHandles);
@@ -161,18 +173,23 @@ public class RocksDBStoreEngine implements AutoCloseable {
             }
             boolean metadataUpdated =
                     initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
+            boolean openedLastShutdownClean =
+                    isCleanShutdown(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA));
+            boolean dirtyShutdownMarkerUpdated = markDirtyShutdownDurably(
+                    openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
             openedWalSyncController = RocksDBWalSyncController.create(openedDb, config);
-            if (metadataUpdated) {
+            if (metadataUpdated && !dirtyShutdownMarkerUpdated) {
                 openedWalSyncController.afterWrite();
             }
             dbOptions = openedDbOptions;
-            columnFamilyOptions = openedColumnFamilyOptions;
+            columnFamilyOptions = Collections.unmodifiableMap(new EnumMap<>(openedColumnFamilyOptions));
             readOptions = openedReadOptions;
             writeOptions = openedWriteOptions;
             blockCache = openedBlockCache;
             statistics = openedStatistics;
             walSyncController = openedWalSyncController;
             db = openedDb;
+            lastShutdownClean = openedLastShutdownClean;
             handles.putAll(openedHandleMap);
             LOGGER.info(
                     "RocksDB file store engine opened, path:{}, columnFamilies:{}, formatVersion:{}, "
@@ -222,6 +239,26 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public RocksDBStoreConfig getConfig() {
         return config;
+    }
+
+    public boolean wasLastShutdownClean() {
+        return lastShutdownClean;
+    }
+
+    public long getDbWriteBufferSize() {
+        return dbOptions.dbWriteBufferSize();
+    }
+
+    public long getMaxTotalWalSize() {
+        return dbOptions.maxTotalWalSize();
+    }
+
+    public long getColumnFamilyWriteBufferSize(RocksDBColumnFamily columnFamily) {
+        ColumnFamilyOptions options = columnFamilyOptions.get(columnFamily);
+        if (options == null) {
+            throw new StoreException("RocksDB column family options not found:" + columnFamily);
+        }
+        return options.writeBufferSize();
     }
 
     public boolean isSyncWrite() {
@@ -741,10 +778,30 @@ public class RocksDBStoreEngine implements AutoCloseable {
             RocksDBStoreMetrics.unregister(this);
             RuntimeException syncFailure = null;
             try {
-                walSyncController.close();
+                markCleanShutdown(true);
+                walSyncController.afterWrite();
             } catch (RuntimeException e) {
                 syncFailure = e;
-            } finally {
+            }
+            try {
+                walSyncController.close();
+            } catch (RuntimeException e) {
+                if (syncFailure == null) {
+                    syncFailure = e;
+                } else if (syncFailure != e) {
+                    syncFailure.addSuppressed(e);
+                }
+            }
+            if (syncFailure != null) {
+                try {
+                    markDirtyShutdownDurably(db, handle(RocksDBColumnFamily.METADATA), writeOptions);
+                } catch (Exception markerFailure) {
+                    if (syncFailure != markerFailure) {
+                        syncFailure.addSuppressed(markerFailure);
+                    }
+                }
+            }
+            try {
                 closeQuietly(
                         new ArrayList<>(handles.values()),
                         db,
@@ -754,6 +811,12 @@ public class RocksDBStoreEngine implements AutoCloseable {
                         dbOptions,
                         blockCache,
                         statistics);
+            } catch (RuntimeException closeFailure) {
+                if (syncFailure == null) {
+                    syncFailure = closeFailure;
+                } else if (syncFailure != closeFailure) {
+                    syncFailure.addSuppressed(closeFailure);
+                }
             }
             if (syncFailure != null) {
                 throw syncFailure;
@@ -813,12 +876,49 @@ public class RocksDBStoreEngine implements AutoCloseable {
         return false;
     }
 
+    private void markCleanShutdown(boolean clean) {
+        try {
+            db.put(
+                    handle(RocksDBColumnFamily.METADATA),
+                    writeOptions,
+                    CLEAN_SHUTDOWN_KEY,
+                    clean ? CLEAN_SHUTDOWN_TRUE : CLEAN_SHUTDOWN_FALSE);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "write RocksDB clean shutdown marker failed");
+        }
+    }
+
+    private static boolean markCleanShutdown(
+            RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions, boolean clean)
+            throws RocksDBException {
+        byte[] expected = clean ? CLEAN_SHUTDOWN_TRUE : CLEAN_SHUTDOWN_FALSE;
+        byte[] existing = db.get(metadataHandle, CLEAN_SHUTDOWN_KEY);
+        if (Arrays.equals(existing, expected)) {
+            return false;
+        }
+        db.put(metadataHandle, writeOptions, CLEAN_SHUTDOWN_KEY, expected);
+        return true;
+    }
+
+    private static boolean markDirtyShutdownDurably(
+            RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions) throws RocksDBException {
+        if (markCleanShutdown(db, metadataHandle, writeOptions, false)) {
+            db.flushWal(true);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isCleanShutdown(RocksDB db, ColumnFamilyHandle metadataHandle) throws RocksDBException {
+        return Arrays.equals(db.get(metadataHandle, CLEAN_SHUTDOWN_KEY), CLEAN_SHUTDOWN_TRUE);
+    }
+
     private static void closeQuietly(
             List<ColumnFamilyHandle> handles,
             RocksDB db,
             WriteOptions writeOptions,
             ReadOptions readOptions,
-            ColumnFamilyOptions columnFamilyOptions,
+            Map<RocksDBColumnFamily, ColumnFamilyOptions> columnFamilyOptions,
             DBOptions dbOptions,
             Cache blockCache,
             Statistics statistics) {
@@ -835,7 +935,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
             readOptions.close();
         }
         if (columnFamilyOptions != null) {
-            columnFamilyOptions.close();
+            for (ColumnFamilyOptions options : columnFamilyOptions.values()) {
+                options.close();
+            }
         }
         if (dbOptions != null) {
             dbOptions.close();
@@ -844,9 +946,11 @@ public class RocksDBStoreEngine implements AutoCloseable {
         closeQuietly(statistics);
     }
 
-    private static void applyColumnFamilyOptions(ColumnFamilyOptions options, RocksDBStoreConfig config) {
-        if (config.getWriteBufferSize() > 0) {
-            options.setWriteBufferSize(config.getWriteBufferSize());
+    private static void applyColumnFamilyOptions(
+            ColumnFamilyOptions options, RocksDBStoreConfig config, RocksDBColumnFamily columnFamily) {
+        long writeBufferSize = config.getWriteBufferSize(columnFamily);
+        if (writeBufferSize > 0) {
+            options.setWriteBufferSize(writeBufferSize);
         }
         if (config.getMaxWriteBufferNumber() > 0) {
             options.setMaxWriteBufferNumber(config.getMaxWriteBufferNumber());

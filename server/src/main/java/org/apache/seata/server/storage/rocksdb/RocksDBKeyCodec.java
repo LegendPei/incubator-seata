@@ -96,6 +96,19 @@ public final class RocksDBKeyCodec {
         return out.toByteArray();
     }
 
+    public static byte[] encodeGlobalTimeoutIndex(long deadlineMillis, String xid) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeLong(out, deadlineMillis);
+        write(out, encodeComponent(xid));
+        return out.toByteArray();
+    }
+
+    public static byte[] encodeGlobalTimeoutSeekKey(long deadlineMillis) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeLong(out, deadlineMillis);
+        return out.toByteArray();
+    }
+
     public static byte[] encodeTransactionIdIndex(long transactionId) {
         return ByteBuffer.allocate(LONG_BYTE_SIZE).putLong(transactionId).array();
     }
@@ -168,6 +181,16 @@ public final class RocksDBKeyCodec {
             return -1;
         }
         return ByteBuffer.wrap(key).getInt();
+    }
+
+    /**
+     * Extract timeout deadline from a global timeout index key.
+     */
+    public static long extractDeadlineFromTimeoutIndexKey(byte[] key) {
+        if (key == null || key.length < LONG_BYTE_SIZE + INT_BYTE_SIZE) {
+            return -1;
+        }
+        return ByteBuffer.wrap(key).getLong();
     }
 
     /**

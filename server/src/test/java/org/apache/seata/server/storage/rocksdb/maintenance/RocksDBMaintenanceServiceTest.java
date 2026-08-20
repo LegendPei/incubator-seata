@@ -182,6 +182,109 @@ class RocksDBMaintenanceServiceTest {
     }
 
     @Test
+    void testPagedVerifyResumesFromReturnedCursor() {
+        try (RocksDBStoreEngine engine = open("verify-page-cursor")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession("page-1", GlobalStatus.Begin));
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession("page-2", GlobalStatus.Begin));
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession("page-3", GlobalStatus.Begin));
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+
+            RocksDBVerifyReport first = service.verifyCurrentState(RocksDBVerifyOptions.page(2, null, 10));
+            RocksDBVerifyReport second =
+                    service.verifyCurrentState(RocksDBVerifyOptions.page(2, first.getNextCursor(), 10));
+            int checkedRecords = first.getCheckedRecordCount() + second.getCheckedRecordCount();
+            RocksDBVerifyReport current = second;
+            int pages = 2;
+            while (!current.isComplete()) {
+                current = service.verifyCurrentState(RocksDBVerifyOptions.page(2, current.getNextCursor(), 10));
+                checkedRecords += current.getCheckedRecordCount();
+                Assertions.assertTrue(++pages <= 8, "paged verify did not reach completion");
+            }
+
+            Assertions.assertEquals(RocksDBVerifyMode.PAGE, first.getMode());
+            Assertions.assertEquals(2, first.getCheckedRecordCount());
+            Assertions.assertEquals(2, first.getCheckedGlobalCount());
+            Assertions.assertFalse(first.isComplete());
+            Assertions.assertNotNull(first.getNextCursor());
+            Assertions.assertEquals(2, second.getCheckedRecordCount());
+            Assertions.assertEquals(1, second.getCheckedGlobalCount());
+            Assertions.assertEquals(12, checkedRecords);
+            Assertions.assertNull(current.getNextCursor());
+            Assertions.assertTrue(first.isClean());
+            Assertions.assertTrue(second.isClean());
+        }
+    }
+
+    @Test
+    void testSampleVerifyBoundsEachColumnFamily() {
+        try (RocksDBStoreEngine engine = open("verify-sample")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            for (int i = 0; i < 3; i++) {
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession("sample-" + i, GlobalStatus.Begin));
+            }
+
+            RocksDBVerifyReport report =
+                    new RocksDBMaintenanceService(engine).verifyCurrentState(RocksDBVerifyOptions.sample(1, 10));
+
+            Assertions.assertEquals(RocksDBVerifyMode.SAMPLE, report.getMode());
+            Assertions.assertEquals(1, report.getCheckedGlobalCount());
+            Assertions.assertTrue(report.getCheckedIndexCount() <= 4);
+            Assertions.assertTrue(report.getCheckedRecordCount() <= 7);
+            Assertions.assertFalse(report.isComplete());
+            Assertions.assertNull(report.getNextCursor());
+            Assertions.assertTrue(report.isClean());
+        }
+    }
+
+    @Test
+    void testVerifyCapsErrorSamplesWithoutLosingIssueCount() {
+        try (RocksDBStoreEngine engine = open("verify-error-cap")) {
+            for (int i = 0; i < 3; i++) {
+                String xid = "xid-stale-" + i;
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                        RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Begin, i, xid),
+                        xid.getBytes(StandardCharsets.UTF_8));
+            }
+
+            RocksDBVerifyReport report =
+                    new RocksDBMaintenanceService(engine).verifyCurrentState(RocksDBVerifyOptions.full(2));
+
+            Assertions.assertEquals(3, report.getStaleStatusIndexCount());
+            Assertions.assertEquals(3, report.getInconsistentCount());
+            Assertions.assertEquals(2, report.getErrorMessages().size());
+            Assertions.assertEquals(3, report.getTotalErrorCount());
+        }
+    }
+
+    @Test
+    void testVerifyDetectsMissingGlobalIndexes() {
+        try (RocksDBStoreEngine engine = open("verify-missing-global-indexes")) {
+            GlobalSession global = globalSession("missing-indexes", GlobalStatus.Begin);
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
+            engine.delete(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    RocksDBKeyCodec.encodeGlobalStatusIndex(
+                            global.getStatus(), global.getBeginTime(), global.getXid()));
+            engine.delete(
+                    RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                    RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                            global.getBeginTime() + global.getTimeout(), global.getXid()));
+            engine.delete(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId()));
+
+            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
+
+            Assertions.assertEquals(1, report.getMissingStatusIndexCount());
+            Assertions.assertEquals(1, report.getMissingTimeoutIndexCount());
+            Assertions.assertEquals(1, report.getMissingTransactionIdIndexCount());
+            Assertions.assertEquals(3, report.getInconsistentCount());
+        }
+    }
+
+    @Test
     void testVerifyEmptyDatabase() {
         try (RocksDBStoreEngine engine = open("verify-empty")) {
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
@@ -221,31 +324,6 @@ class RocksDBMaintenanceServiceTest {
 
             Assertions.assertFalse(report.isClean());
             Assertions.assertEquals(1, report.getStaleTransactionIdIndexCount());
-        }
-    }
-
-    @Test
-    void testVerifyDetectsMissingGlobalIndexes() {
-        try (RocksDBStoreEngine engine = open("verify-missing-global-indexes")) {
-            GlobalSession global = globalSession("tx-missing-indexes", GlobalStatus.Begin);
-            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
-            engine.delete(
-                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
-                    RocksDBKeyCodec.encodeGlobalStatusIndex(
-                            global.getStatus(), global.getBeginTime(), global.getXid()));
-            engine.delete(
-                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
-                    RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId()));
-
-            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
-
-            Assertions.assertFalse(report.isClean());
-            Assertions.assertEquals(1, report.getStaleStatusIndexCount());
-            Assertions.assertEquals(1, report.getStaleTransactionIdIndexCount());
-            Assertions.assertTrue(report.getErrorMessages().stream()
-                    .anyMatch(message -> message.contains("missing global status index")));
-            Assertions.assertTrue(report.getErrorMessages().stream()
-                    .anyMatch(message -> message.contains("missing transaction id index")));
         }
     }
 

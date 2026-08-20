@@ -36,10 +36,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.util.Arrays;
 
 /**
  * Maintenance service for RocksDB file store engine.
@@ -53,6 +50,15 @@ public class RocksDBMaintenanceService {
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBMaintenanceService.class);
     private static final String CHECKPOINT_METADATA_FILE = "seata-checkpoint-metadata.txt";
     private static final byte[] EMPTY_PREFIX = new byte[0];
+    private static final RocksDBColumnFamily[] VERIFY_COLUMN_FAMILIES = {
+        RocksDBColumnFamily.GLOBAL_SESSION,
+        RocksDBColumnFamily.BRANCH_SESSION,
+        RocksDBColumnFamily.LOCK,
+        RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+        RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+        RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+        RocksDBColumnFamily.LOCK_BRANCH_INDEX
+    };
 
     private final RocksDBStoreEngine storeEngine;
     private final RocksDBIndexManager indexManager;
@@ -108,163 +114,317 @@ public class RocksDBMaintenanceService {
     }
 
     /**
-     * Verify the consistency of the current RocksDB state.
-     *
-     * <p>This method scans all column families and cross-checks references between
-     * global sessions, branch sessions, locks, lock indexes and secondary indexes.
-     * The returned report describes the counts of checked entities and any
-     * inconsistencies found. This method does not modify any data.
+     * Run an explicit full consistency verification.
      */
     public RocksDBVerifyReport verifyCurrentState() {
-        RocksDBVerifyReport.Builder report = RocksDBVerifyReport.builder();
+        return verifyCurrentState(RocksDBVerifyOptions.full());
+    }
 
-        // Step 1: Check format version
-        byte[] versionBytes =
-                storeEngine.get(RocksDBColumnFamily.METADATA, "format_version".getBytes(StandardCharsets.UTF_8));
-        if (versionBytes == null) {
-            report.addError("missing format_version in metadata");
-        } else {
-            String version = new String(versionBytes, StandardCharsets.UTF_8);
-            if (!Integer.toString(RocksDBStoreEngine.FORMAT_VERSION).equals(version)) {
-                report.addError("format_version mismatch, expected:" + RocksDBStoreEngine.FORMAT_VERSION + ", found:"
-                        + version);
-            }
+    /**
+     * Verify the current state without retaining full database-sized reference sets.
+     */
+    public RocksDBVerifyReport verifyCurrentState(RocksDBVerifyOptions options) {
+        RocksDBVerifyReport.Builder report = RocksDBVerifyReport.builder(options);
+        verifyMetadata(report);
+        switch (options.getMode()) {
+            case SAMPLE:
+                verifySample(options, report);
+                break;
+            case PAGE:
+                verifyPage(options, report);
+                break;
+            case FULL:
+            default:
+                verifyFull(report);
+                break;
         }
-
-        // Step 2: Scan global sessions
-        Map<String, GlobalVerifyEntry> globalSessions = new HashMap<>();
-        storeEngine.scanByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, EMPTY_PREFIX, (key, value) -> {
-            try {
-                RocksDBValueCodec.DecodedValue decoded = RocksDBValueCodec.decode(value);
-                GlobalSession session = new GlobalSession(null, null, null, 0, true);
-                session.decode(decoded.getPayload());
-                globalSessions.put(
-                        session.getXid(),
-                        new GlobalVerifyEntry(session.getTransactionId(), session.getStatus(), session.getBeginTime()));
-            } catch (Exception e) {
-                report.addError(
-                        "failed to decode global session, key length:" + key.length + ", message:" + e.getMessage());
-            }
-        });
-        report.checkedGlobalCount(globalSessions.size());
-
-        // Step 3: Verify GLOBAL_STATUS_INDEX
-        int staleStatusIndex = 0;
-        for (Map.Entry<String, GlobalVerifyEntry> entry : globalSessions.entrySet()) {
-            String xid = entry.getKey();
-            GlobalVerifyEntry globalEntry = entry.getValue();
-            byte[] expectedKey =
-                    RocksDBKeyCodec.encodeGlobalStatusIndex(globalEntry.status, globalEntry.beginTime, xid);
-            if (storeEngine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, expectedKey) == null) {
-                staleStatusIndex++;
-                report.addError("missing global status index, xid:" + xid);
-            }
-        }
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, EMPTY_PREFIX)) {
-            String xid = RocksDBKeyCodec.extractXidFromStatusIndexKey(entry.getKey());
-            if (xid == null) {
-                report.addError("invalid global status index key, length:" + entry.getKey().length);
-                staleStatusIndex++;
-                continue;
-            }
-            GlobalVerifyEntry globalEntry = globalSessions.get(xid);
-            if (globalEntry == null) {
-                staleStatusIndex++;
-                continue;
-            }
-            int statusCode = RocksDBKeyCodec.extractStatusCodeFromStatusIndexKey(entry.getKey());
-            long beginTime = RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(entry.getKey());
-            if (statusCode != globalEntry.status.getCode() || beginTime != globalEntry.beginTime) {
-                staleStatusIndex++;
-            }
-            // Verify value is xid
-            String indexXid = new String(entry.getValue(), StandardCharsets.UTF_8);
-            if (!xid.equals(indexXid)) {
-                report.addError("global status index value mismatch, key xid:" + xid + ", value xid:" + indexXid);
-                staleStatusIndex++;
-            }
-        }
-        report.staleStatusIndexCount(staleStatusIndex);
-
-        // Step 4: Verify TRANSACTION_ID_INDEX
-        int staleTxnIdIndex = 0;
-        for (Map.Entry<String, GlobalVerifyEntry> entry : globalSessions.entrySet()) {
-            String xid = entry.getKey();
-            byte[] expectedKey = RocksDBKeyCodec.encodeTransactionIdIndex(entry.getValue().transactionId);
-            if (storeEngine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, expectedKey) == null) {
-                staleTxnIdIndex++;
-                report.addError("missing transaction id index, xid:" + xid);
-            }
-        }
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.TRANSACTION_ID_INDEX, EMPTY_PREFIX)) {
-            String xid = new String(entry.getValue(), StandardCharsets.UTF_8);
-            GlobalVerifyEntry globalEntry = globalSessions.get(xid);
-            if (globalEntry == null) {
-                staleTxnIdIndex++;
-                continue;
-            }
-            long transactionId = ByteBuffer.wrap(entry.getKey()).getLong();
-            if (transactionId != globalEntry.transactionId) {
-                staleTxnIdIndex++;
-                report.addError("transaction id index mismatch, xid:" + xid
-                        + ", indexTxnId:" + transactionId
-                        + ", globalTxnId:" + globalEntry.transactionId);
-            }
-        }
-        report.staleTransactionIdIndexCount(staleTxnIdIndex);
-
-        // Step 5: Check orphan branches
-        int orphanBranches = 0;
-        int checkedBranches = 0;
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.BRANCH_SESSION, EMPTY_PREFIX)) {
-            checkedBranches++;
-            String xid = RocksDBKeyCodec.extractXidFromBranchKey(entry.getKey());
-            if (xid == null || !globalSessions.containsKey(xid)) {
-                orphanBranches++;
-            }
-        }
-        report.checkedBranchCount(checkedBranches);
-        report.orphanBranchCount(orphanBranches);
-
-        // Step 6: Verify LOCK_BRANCH_INDEX and collect valid lock keys
-        Set<String> validLockKeyHexSet = new HashSet<>();
-        int staleLockIndex = 0;
-        for (RocksDBStoreEngine.RocksDBEntry entry :
-                storeEngine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, EMPTY_PREFIX)) {
-            byte[] lockKey = entry.getValue();
-            byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
-            if (lockValue == null) {
-                staleLockIndex++;
-                continue;
-            }
-            // Cross-check: lock value xid should reference an existing global session
-            String lockXid = tryDecodeLockXid(lockValue);
-            if (lockXid != null && !globalSessions.containsKey(lockXid)) {
-                staleLockIndex++;
-                continue;
-            }
-            validLockKeyHexSet.add(bytesToHex(lockKey));
-        }
-        report.staleLockIndexCount(staleLockIndex);
-
-        // Step 7: Check orphan locks (LOCK without matching LOCK_BRANCH_INDEX)
-        int orphanLocks = 0;
-        int checkedLocks = 0;
-        for (RocksDBStoreEngine.RocksDBEntry entry : storeEngine.prefixScan(RocksDBColumnFamily.LOCK, EMPTY_PREFIX)) {
-            checkedLocks++;
-            if (!validLockKeyHexSet.contains(bytesToHex(entry.getKey()))) {
-                orphanLocks++;
-            }
-        }
-        report.checkedLockCount(checkedLocks);
-        report.orphanLockCount(orphanLocks);
-
         RocksDBVerifyReport result = report.build();
         LOGGER.info("RocksDB verify completed, {}", result);
         return result;
+    }
+
+    private void verifyMetadata(RocksDBVerifyReport.Builder report) {
+        byte[] versionBytes =
+                storeEngine.get(RocksDBColumnFamily.METADATA, "format_version".getBytes(StandardCharsets.UTF_8));
+        String expected = Integer.toString(RocksDBStoreEngine.FORMAT_VERSION);
+        if (versionBytes == null) {
+            report.error("missing format_version in metadata");
+        } else if (!expected.equals(new String(versionBytes, StandardCharsets.UTF_8))) {
+            report.error("format_version mismatch, expected:" + expected + ", found:"
+                    + new String(versionBytes, StandardCharsets.UTF_8));
+        }
+    }
+
+    private void verifyFull(RocksDBVerifyReport.Builder report) {
+        for (RocksDBColumnFamily columnFamily : VERIFY_COLUMN_FAMILIES) {
+            scanFamily(columnFamily, EMPTY_PREFIX, 0, report);
+        }
+        report.complete(true);
+    }
+
+    private void verifySample(RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
+        for (RocksDBColumnFamily columnFamily : VERIFY_COLUMN_FAMILIES) {
+            scanFamily(columnFamily, EMPTY_PREFIX, options.getLimit(), report);
+        }
+        report.complete(false);
+    }
+
+    private void verifyPage(RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
+        RocksDBVerifyCursor cursor = options.getCursor();
+        int familyIndex = cursor == null ? 0 : familyIndex(cursor.getColumnFamily());
+        int remaining = options.getLimit();
+        for (int i = familyIndex; i < VERIFY_COLUMN_FAMILIES.length; i++) {
+            RocksDBColumnFamily columnFamily = VERIFY_COLUMN_FAMILIES[i];
+            byte[] seekKey =
+                    cursor != null && cursor.getColumnFamily() == columnFamily ? cursor.getSeekKey() : EMPTY_PREFIX;
+            byte[][] lastKey = new byte[1][];
+            RocksDBStoreEngine.ScanStats stats =
+                    storeEngine.scanByPrefix(columnFamily, seekKey, EMPTY_PREFIX, remaining, null, (key, value) -> {
+                        lastKey[0] = key;
+                        verifyEntry(columnFamily, key, value, report);
+                    });
+            remaining -= stats.getRowsReturned();
+            if (remaining == 0 && lastKey[0] != null) {
+                report.nextCursor(new RocksDBVerifyCursor(columnFamily, nextSeekKey(lastKey[0])));
+                report.complete(false);
+                return;
+            }
+            cursor = null;
+        }
+        report.complete(true);
+    }
+
+    private void scanFamily(
+            RocksDBColumnFamily columnFamily, byte[] seekKey, int limit, RocksDBVerifyReport.Builder report) {
+        storeEngine.scanByPrefix(
+                columnFamily,
+                seekKey,
+                EMPTY_PREFIX,
+                limit,
+                null,
+                (key, value) -> verifyEntry(columnFamily, key, value, report));
+    }
+
+    private void verifyEntry(
+            RocksDBColumnFamily columnFamily, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+        report.checkedRecord(isIndex(columnFamily));
+        switch (columnFamily) {
+            case GLOBAL_SESSION:
+                verifyGlobal(key, value, report);
+                break;
+            case BRANCH_SESSION:
+                verifyBranch(key, report);
+                break;
+            case LOCK:
+                verifyLock(key, value, report);
+                break;
+            case GLOBAL_STATUS_INDEX:
+                verifyStatusIndex(key, value, report);
+                break;
+            case GLOBAL_TIMEOUT_INDEX:
+                verifyTimeoutIndex(key, value, report);
+                break;
+            case TRANSACTION_ID_INDEX:
+                verifyTransactionIdIndex(key, value, report);
+                break;
+            case LOCK_BRANCH_INDEX:
+                verifyLockIndex(key, value, report);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void verifyGlobal(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+        report.checkedGlobal();
+        GlobalVerifyEntry global = decodeGlobal(value, report, "global session");
+        if (global == null) {
+            return;
+        }
+        if (!Arrays.equals(key, RocksDBKeyCodec.encodeXid(global.xid))) {
+            report.error("global session key mismatch, xid:" + global.xid);
+        }
+        byte[] xidBytes = global.xid.getBytes(StandardCharsets.UTF_8);
+        byte[] statusValue = storeEngine.get(
+                RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                RocksDBKeyCodec.encodeGlobalStatusIndex(global.status, global.beginTime, global.xid));
+        if (!Arrays.equals(xidBytes, statusValue)) {
+            report.missingStatusIndex("missing global status index, xid:" + global.xid);
+        }
+        byte[] transactionValue = storeEngine.get(
+                RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                RocksDBKeyCodec.encodeTransactionIdIndex(global.transactionId));
+        if (!Arrays.equals(xidBytes, transactionValue)) {
+            report.missingTransactionIdIndex("missing transaction id index, xid:" + global.xid);
+        }
+        if (global.status == GlobalStatus.Begin) {
+            byte[] timeoutValue = storeEngine.get(
+                    RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                    RocksDBKeyCodec.encodeGlobalTimeoutIndex(global.deadlineMillis(), global.xid));
+            if (!Arrays.equals(xidBytes, timeoutValue)) {
+                report.missingTimeoutIndex("missing global timeout index, xid:" + global.xid);
+            }
+        }
+    }
+
+    private void verifyBranch(byte[] key, RocksDBVerifyReport.Builder report) {
+        report.checkedBranch();
+        String xid = RocksDBKeyCodec.extractXidFromBranchKey(key);
+        if (xid == null
+                || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid)) == null) {
+            report.orphanBranch("orphan branch session, xid:" + xid);
+        }
+    }
+
+    private void verifyLock(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+        report.checkedLock();
+        LockVerifyEntry lock = decodeLock(value);
+        if (lock == null
+                || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null) {
+            report.orphanLock("orphan or invalid lock holder");
+            return;
+        }
+        byte[] indexValue = storeEngine.get(
+                RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                RocksDBKeyCodec.encodeLockBranchIndex(lock.xid, lock.branchId, key));
+        if (!Arrays.equals(key, indexValue)) {
+            report.orphanLock("lock holder has no matching branch index, xid:" + lock.xid);
+        }
+    }
+
+    private void verifyStatusIndex(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+        try {
+            String xid = RocksDBKeyCodec.extractXidFromStatusIndexKey(key);
+            GlobalVerifyEntry global = readGlobal(xid);
+            if (global == null
+                    || !xid.equals(new String(value, StandardCharsets.UTF_8))
+                    || global.status.getCode() != RocksDBKeyCodec.extractStatusCodeFromStatusIndexKey(key)
+                    || global.beginTime != RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(key)) {
+                report.staleStatusIndex("stale global status index, xid:" + xid);
+            }
+        } catch (Exception e) {
+            report.staleStatusIndex("invalid global status index, message:" + e.getMessage());
+        }
+    }
+
+    private void verifyTimeoutIndex(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+        try {
+            String xid = new String(value, StandardCharsets.UTF_8);
+            GlobalVerifyEntry global = readGlobal(xid);
+            if (global == null
+                    || global.status != GlobalStatus.Begin
+                    || !Arrays.equals(key, RocksDBKeyCodec.encodeGlobalTimeoutIndex(global.deadlineMillis(), xid))) {
+                report.staleTimeoutIndex("stale global timeout index, xid:" + xid);
+            }
+        } catch (Exception e) {
+            report.staleTimeoutIndex("invalid global timeout index, message:" + e.getMessage());
+        }
+    }
+
+    private void verifyTransactionIdIndex(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+        try {
+            String xid = new String(value, StandardCharsets.UTF_8);
+            GlobalVerifyEntry global = readGlobal(xid);
+            if (global == null
+                    || key.length != Long.BYTES
+                    || ByteBuffer.wrap(key).getLong() != global.transactionId) {
+                report.staleTransactionIdIndex("stale transaction id index, xid:" + xid);
+            }
+        } catch (Exception e) {
+            report.staleTransactionIdIndex("invalid transaction id index, message:" + e.getMessage());
+        }
+    }
+
+    private void verifyLockIndex(byte[] key, byte[] lockKey, RocksDBVerifyReport.Builder report) {
+        byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
+        LockVerifyEntry lock = decodeLock(lockValue);
+        if (lock == null
+                || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null
+                || !Arrays.equals(key, RocksDBKeyCodec.encodeLockBranchIndex(lock.xid, lock.branchId, lockKey))) {
+            report.staleLockIndex("stale lock branch index");
+        }
+    }
+
+    private GlobalVerifyEntry readGlobal(String xid) {
+        if (xid == null) {
+            return null;
+        }
+        byte[] value = storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid));
+        return value == null ? null : decodeGlobal(value, null, "global session");
+    }
+
+    private static GlobalVerifyEntry decodeGlobal(
+            byte[] value, RocksDBVerifyReport.Builder report, String description) {
+        try {
+            RocksDBValueCodec.DecodedValue decoded = RocksDBValueCodec.decode(value);
+            if (decoded.getType() != RocksDBValueCodec.ValueType.GLOBAL_SESSION) {
+                throw new StoreException("unexpected value type:" + decoded.getType());
+            }
+            GlobalSession session = new GlobalSession(null, null, null, 0, true);
+            session.decode(decoded.getPayload());
+            return new GlobalVerifyEntry(
+                    session.getXid(),
+                    session.getTransactionId(),
+                    session.getStatus(),
+                    session.getBeginTime(),
+                    session.getTimeout());
+        } catch (Exception e) {
+            if (report != null) {
+                report.error("failed to decode " + description + ", message:" + e.getMessage());
+            }
+            return null;
+        }
+    }
+
+    private static LockVerifyEntry decodeLock(byte[] lockValue) {
+        if (lockValue == null) {
+            return null;
+        }
+        try {
+            RocksDBValueCodec.DecodedValue decoded = RocksDBValueCodec.decode(lockValue);
+            if (decoded.getType() != RocksDBValueCodec.ValueType.LOCK_HOLDER) {
+                return null;
+            }
+            ByteBuffer buffer = ByteBuffer.wrap(decoded.getPayload());
+            String xid = readString(buffer);
+            buffer.getLong();
+            long branchId = buffer.getLong();
+            return xid == null ? null : new LockVerifyEntry(xid, branchId);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String readString(ByteBuffer buffer) {
+        int length = buffer.getInt();
+        if (length < 0 || buffer.remaining() < length) {
+            return null;
+        }
+        byte[] bytes = new byte[length];
+        buffer.get(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private static boolean isIndex(RocksDBColumnFamily columnFamily) {
+        return columnFamily == RocksDBColumnFamily.GLOBAL_STATUS_INDEX
+                || columnFamily == RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX
+                || columnFamily == RocksDBColumnFamily.TRANSACTION_ID_INDEX
+                || columnFamily == RocksDBColumnFamily.LOCK_BRANCH_INDEX;
+    }
+
+    private static int familyIndex(RocksDBColumnFamily columnFamily) {
+        for (int i = 0; i < VERIFY_COLUMN_FAMILIES.length; i++) {
+            if (VERIFY_COLUMN_FAMILIES[i] == columnFamily) {
+                return i;
+            }
+        }
+        throw new IllegalArgumentException("unsupported verify cursor column family:" + columnFamily);
+    }
+
+    private static byte[] nextSeekKey(byte[] key) {
+        byte[] next = Arrays.copyOf(key, key.length + 1);
+        next[key.length] = 0;
+        return next;
     }
 
     /**
@@ -319,53 +479,36 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b & 0xff));
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Try to extract xid from a lock holder value.
-     * Lock value layout: RocksDBValueCodec header + xid(int length + bytes) + transactionId(long) + ...
-     * Returns null if decoding fails.
-     */
-    private static String tryDecodeLockXid(byte[] lockValue) {
-        try {
-            RocksDBValueCodec.DecodedValue decoded = RocksDBValueCodec.decode(lockValue);
-            if (decoded.getType() != RocksDBValueCodec.ValueType.LOCK_HOLDER) {
-                return null;
-            }
-            ByteBuffer buffer = ByteBuffer.wrap(decoded.getPayload());
-            int xidLength = buffer.getInt();
-            if (xidLength < 0 || buffer.remaining() < xidLength) {
-                return null;
-            }
-            if (xidLength == 0) {
-                return null;
-            }
-            byte[] xidBytes = new byte[xidLength];
-            buffer.get(xidBytes);
-            return new String(xidBytes, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /**
-     * Lightweight holder for global session fields needed during verify.
-     */
-    private static class GlobalVerifyEntry {
+    private static final class GlobalVerifyEntry {
+        final String xid;
         final long transactionId;
         final GlobalStatus status;
         final long beginTime;
+        final long timeout;
 
-        GlobalVerifyEntry(long transactionId, GlobalStatus status, long beginTime) {
+        GlobalVerifyEntry(String xid, long transactionId, GlobalStatus status, long beginTime, long timeout) {
+            this.xid = xid;
             this.transactionId = transactionId;
             this.status = status;
             this.beginTime = beginTime;
+            this.timeout = timeout;
+        }
+
+        long deadlineMillis() {
+            if (timeout > 0 && beginTime > Long.MAX_VALUE - timeout) {
+                return Long.MAX_VALUE;
+            }
+            return beginTime + timeout;
+        }
+    }
+
+    private static final class LockVerifyEntry {
+        final String xid;
+        final long branchId;
+
+        LockVerifyEntry(String xid, long branchId) {
+            this.xid = xid;
+            this.branchId = branchId;
         }
     }
 }
