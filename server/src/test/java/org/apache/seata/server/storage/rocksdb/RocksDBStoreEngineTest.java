@@ -178,6 +178,35 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testScanByPrefixDeadlineStopsEarly() {
+        try (RocksDBStoreEngine engine = open("scan-deadline", false)) {
+            byte[] prefix = "row-".getBytes(StandardCharsets.UTF_8);
+            for (int i = 0; i < 1000; i++) {
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_SESSION,
+                        ("row-" + String.format("%04d", i)).getBytes(StandardCharsets.UTF_8),
+                        ("value-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Use an already-expired deadline to force immediate stop
+            long expiredDeadline = System.nanoTime() - 1;
+            List<String> collected = new ArrayList<>();
+            RocksDBStoreEngine.ScanStats stats = engine.scanByPrefix(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    prefix,
+                    0,
+                    expiredDeadline,
+                    (key, value) -> collected.add(new String(value, StandardCharsets.UTF_8)));
+
+            // Deadline was expired before scan started, so it should stop at first check (256 rows)
+            Assertions.assertTrue(stats.isDeadlineReached());
+            Assertions.assertTrue(stats.isTruncated());
+            Assertions.assertTrue(collected.size() < 1000);
+            Assertions.assertEquals(collected.size(), stats.getRowsReturned());
+        }
+    }
+
+    @Test
     void testCloseChecksLifecycleGuardBeforeWriteLock() throws Exception {
         RocksDBStoreEngine engine = spy(open("close-lifecycle-guard-order", false));
         ReentrantReadWriteLock lifecycleLock = maintenanceLock(engine);
@@ -203,6 +232,34 @@ class RocksDBStoreEngineTest {
             if (!engine.isClosed()) {
                 engine.close();
             }
+        }
+    }
+
+    @Test
+    void testScanByPrefixLimitAndDeadlineCombined() {
+        try (RocksDBStoreEngine engine = open("scan-limit-deadline", false)) {
+            byte[] prefix = "item-".getBytes(StandardCharsets.UTF_8);
+            for (int i = 0; i < 100; i++) {
+                engine.put(
+                        RocksDBColumnFamily.GLOBAL_SESSION,
+                        ("item-" + String.format("%03d", i)).getBytes(StandardCharsets.UTF_8),
+                        ("val-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Limit of 10 should stop before deadline matters
+            long generousDeadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+            List<String> collected = new ArrayList<>();
+            RocksDBStoreEngine.ScanStats stats = engine.scanByPrefix(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    prefix,
+                    10,
+                    generousDeadline,
+                    (key, value) -> collected.add(new String(value, StandardCharsets.UTF_8)));
+
+            Assertions.assertEquals(10, collected.size());
+            Assertions.assertTrue(stats.isLimitReached());
+            Assertions.assertFalse(stats.isDeadlineReached());
+            Assertions.assertTrue(stats.isTruncated());
         }
     }
 

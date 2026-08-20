@@ -92,10 +92,24 @@ public class RocksDBLockManager extends AbstractLockManager {
     }
 
     public CleanOrphanLocksResult cleanOrphanLocksBatches(int batchLimit, int maxBatches) {
-        return cleanOrphanLocksBatches(null, batchLimit, maxBatches);
+        return cleanOrphanLocksBatches(null, batchLimit, maxBatches, 0L);
     }
 
     public CleanOrphanLocksResult cleanOrphanLocksBatches(byte[] seekKey, int batchLimit, int maxBatches) {
+        return cleanOrphanLocksBatches(seekKey, batchLimit, maxBatches, 0L);
+    }
+
+    /**
+     * Clean orphan locks in batches with optional deadline protection.
+     *
+     * @param seekKey      starting position (null for beginning)
+     * @param batchLimit   max entries per batch
+     * @param maxBatches   max number of batches to execute
+     * @param deadlineNanos absolute nanoTime deadline; 0 means no deadline
+     * @return aggregated result
+     */
+    public CleanOrphanLocksResult cleanOrphanLocksBatches(
+            byte[] seekKey, int batchLimit, int maxBatches, long deadlineNanos) {
         if (batchLimit <= 0) {
             throw new IllegalArgumentException("batchLimit must be positive");
         }
@@ -106,8 +120,13 @@ public class RocksDBLockManager extends AbstractLockManager {
         int scanned = 0;
         int batches = 0;
         boolean limitReached = false;
+        boolean deadlineReached = false;
         byte[] cursor = CleanOrphanLocksResult.copy(seekKey);
         for (int i = 0; i < maxBatches; i++) {
+            if (deadlineNanos > 0 && System.nanoTime() >= deadlineNanos) {
+                deadlineReached = true;
+                break;
+            }
             CleanOrphanLocksResult result = cleanOrphanLocks(cursor, batchLimit);
             batches++;
             cleaned += result.getCleaned();
@@ -118,7 +137,7 @@ public class RocksDBLockManager extends AbstractLockManager {
                 break;
             }
         }
-        return new CleanOrphanLocksResult(cleaned, scanned, limitReached, cursor, batches);
+        return new CleanOrphanLocksResult(cleaned, scanned, limitReached, deadlineReached, cursor, batches);
     }
 
     @Override
@@ -130,17 +149,29 @@ public class RocksDBLockManager extends AbstractLockManager {
         private final int cleaned;
         private final int scanned;
         private final boolean limitReached;
+        private final boolean deadlineReached;
         private final byte[] nextSeekKey;
         private final int batches;
 
         CleanOrphanLocksResult(int cleaned, int scanned, boolean limitReached, byte[] nextSeekKey) {
-            this(cleaned, scanned, limitReached, nextSeekKey, 1);
+            this(cleaned, scanned, limitReached, false, nextSeekKey, 1);
         }
 
         CleanOrphanLocksResult(int cleaned, int scanned, boolean limitReached, byte[] nextSeekKey, int batches) {
+            this(cleaned, scanned, limitReached, false, nextSeekKey, batches);
+        }
+
+        CleanOrphanLocksResult(
+                int cleaned,
+                int scanned,
+                boolean limitReached,
+                boolean deadlineReached,
+                byte[] nextSeekKey,
+                int batches) {
             this.cleaned = cleaned;
             this.scanned = scanned;
             this.limitReached = limitReached;
+            this.deadlineReached = deadlineReached;
             this.nextSeekKey = copy(nextSeekKey);
             this.batches = batches;
         }
@@ -155,6 +186,14 @@ public class RocksDBLockManager extends AbstractLockManager {
 
         public boolean isLimitReached() {
             return limitReached;
+        }
+
+        public boolean isDeadlineReached() {
+            return deadlineReached;
+        }
+
+        public boolean isTruncated() {
+            return limitReached || deadlineReached;
         }
 
         public byte[] getNextSeekKey() {

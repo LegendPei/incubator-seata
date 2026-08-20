@@ -17,11 +17,14 @@
 package org.apache.seata.server.storage.rocksdb.benchmark;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.session.GlobalSession;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
+import org.apache.seata.server.storage.rocksdb.RocksDBWalSyncMode;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
@@ -32,6 +35,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
@@ -43,6 +47,106 @@ import java.util.stream.Stream;
 class RocksDBFileModeBenchmarkTest {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    @Test
+    void testCrashRecoveryCheckpointTimeoutSupportsScaledRuns() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("checkpointTimeoutMillis", "300000");
+
+        Assertions.assertEquals(300000L, RocksDBCrashRecoveryHarness.checkpointTimeoutMillis(options));
+        Assertions.assertEquals(
+                300000L, RocksDBCrashRecoveryHarness.checkpointTimeoutMillis(Collections.<String, String>emptyMap()));
+    }
+
+    @Test
+    void testCrashHarnessBuildsPeriodicWalConfigFromOptions() throws Exception {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("syncWrite", "false");
+        options.put("walSyncMode", "periodic");
+        options.put("walSyncIntervalMillis", "100");
+        options.put("walSyncWriteThreshold", "10");
+
+        RocksDBStoreConfig config = RocksDBCrashRecoveryHarness.storeConfig(Files.createTempDirectory("r8-wal"), options);
+
+        Assertions.assertFalse(config.isSyncWrite());
+        Assertions.assertEquals(RocksDBWalSyncMode.PERIODIC, config.getWalSyncMode());
+        Assertions.assertEquals(100, config.getWalSyncIntervalMillis());
+        Assertions.assertEquals(10L, config.getWalSyncWriteThreshold());
+    }
+
+    @Test
+    void testCrashHarnessForwardsWarmupOptionToWriter() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("warmupWrites", "2");
+        options.put("syncWrite", "false");
+        options.put("walSyncMode", "periodic");
+        options.put("walSyncIntervalMillis", "100");
+        options.put("walSyncWriteThreshold", "10");
+        options.put("checkpointPolicy", "afterSync");
+        options.put("checkpointSyncTimeoutMillis", "5000");
+
+        List<String> arguments = RocksDBCrashRecoveryHarness.writerArguments(
+                Paths.get("db"), Paths.get("checkpoint"), options);
+
+        Assertions.assertTrue(arguments.contains("--warmupWrites=2"));
+        Assertions.assertTrue(arguments.contains("--syncWrite=false"));
+        Assertions.assertTrue(arguments.contains("--walSyncMode=periodic"));
+        Assertions.assertTrue(arguments.contains("--walSyncIntervalMillis=100"));
+        Assertions.assertTrue(arguments.contains("--walSyncWriteThreshold=10"));
+        Assertions.assertTrue(arguments.contains("--checkpointPolicy=afterSync"));
+        Assertions.assertTrue(arguments.contains("--checkpointSyncTimeoutMillis=5000"));
+    }
+
+    @Test
+    void testCrashHarnessRejectsAfterSyncWithoutDurabilityMechanism() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("syncWrite", "false");
+        options.put("walSyncMode", "none");
+        options.put("checkpointPolicy", "afterSync");
+
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+
+        options.remove("checkpointPolicy");
+        options.put("warmupWrites", "1");
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+    }
+
+    @Test
+    void testCrashHarnessRequiresExactRecoveryForDurableCheckpoint() {
+        Map<String, String> syncWrite = new LinkedHashMap<>();
+        syncWrite.put("syncWrite", "true");
+        Map<String, String> afterSync = new LinkedHashMap<>();
+        afterSync.put("syncWrite", "false");
+        afterSync.put("walSyncMode", "periodic");
+        afterSync.put("checkpointPolicy", "afterSync");
+        Map<String, String> asyncBeforeSync = new LinkedHashMap<>();
+        asyncBeforeSync.put("syncWrite", "false");
+        asyncBeforeSync.put("walSyncMode", "periodic");
+
+        Assertions.assertTrue(RocksDBCrashRecoveryHarness.requiresExactRecovery(syncWrite));
+        Assertions.assertTrue(RocksDBCrashRecoveryHarness.requiresExactRecovery(afterSync));
+        Assertions.assertFalse(RocksDBCrashRecoveryHarness.requiresExactRecovery(asyncBeforeSync));
+    }
+
+    @Test
+    void testCrashHarnessRejectsInvalidCheckpointBounds() {
+        Map<String, String> options = new LinkedHashMap<>();
+        options.put("count", "5");
+        options.put("checkpointAfter", "6");
+
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+
+        options.put("checkpointAfter", "0");
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+    }
 
     @Test
     void testOptionsParseQueryAndCompareControls() throws Exception {
@@ -61,6 +165,56 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals(3, intField(options, "queryLimit"));
         Assertions.assertEquals(2, intField(options, "repeatRuns"));
         Assertions.assertEquals("BA", stringField(options, "compareOrder"));
+    }
+
+    @Test
+    void testParsePhase4ComparisonOptions() throws Exception {
+        Object options = parseOptions(
+                "--dataPayloadProfile=phase4",
+                "--queryWorkload=status",
+                "--orphanCleanBatchLimit=500",
+                "--orphanCleanMaxBatches=2",
+                "--orphanCleanRoundSleepMillis=75");
+
+        Assertions.assertEquals("phase4", stringField(options, "dataPayloadProfile"));
+        Assertions.assertEquals("status", stringField(options, "queryWorkload"));
+        Assertions.assertEquals(500, intField(options, "orphanCleanBatchLimit"));
+        Assertions.assertEquals(2, intField(options, "orphanCleanMaxBatches"));
+        Assertions.assertEquals(75L, longField(options, "orphanCleanRoundSleepMillis"));
+    }
+
+    @Test
+    void testDerivedOptionsPreserveExecutionProfiles() throws Exception {
+        Object options = parseOptions(
+                "--dataPayloadProfile=phase4",
+                "--queryWorkload=status",
+                "--orphanCleanBatchLimit=500",
+                "--orphanCleanMaxBatches=2",
+                "--orphanCleanRoundSleepMillis=75");
+
+        Method method = options.getClass().getDeclaredMethod("withRunLabel", String.class);
+        method.setAccessible(true);
+        Object derived = method.invoke(options, "R1");
+
+        Assertions.assertEquals("phase4", stringField(derived, "dataPayloadProfile"));
+        Assertions.assertEquals("status", stringField(derived, "queryWorkload"));
+        Assertions.assertEquals(500, intField(derived, "orphanCleanBatchLimit"));
+        Assertions.assertEquals(2, intField(derived, "orphanCleanMaxBatches"));
+        Assertions.assertEquals(75L, longField(derived, "orphanCleanRoundSleepMillis"));
+    }
+
+    @Test
+    void testPhase4PayloadProfileOmitsProductionApplicationData() throws Exception {
+        Object phase4Options = parseOptions("--globalCount=2", "--dataPayloadProfile=phase4");
+        Object productionOptions = parseOptions("--globalCount=2", "--dataPayloadProfile=production");
+
+        List<GlobalSession> phase4Sessions = globalSessions(createDataSet(phase4Options, 0));
+        List<GlobalSession> productionSessions = globalSessions(createDataSet(productionOptions, 0));
+
+        Assertions.assertTrue(phase4Sessions.stream().allMatch(session -> session.getApplicationData() == null));
+        Assertions.assertTrue(productionSessions.stream()
+                .allMatch(session -> session.getApplicationData() != null
+                        && !session.getApplicationData().isEmpty()));
     }
 
     @Test
@@ -311,6 +465,131 @@ class RocksDBFileModeBenchmarkTest {
     }
 
     @Test
+    void testGlobalRemoveBenchmarkReportsActualDeleteStrategyMetrics() throws Exception {
+        Path scanDbPath = Files.createTempDirectory("rocksdb-benchmark-global-remove-scan-");
+        Path rangeDbPath = Files.createTempDirectory("rocksdb-benchmark-global-remove-range-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Map<String, String> scan = runGlobalRemoveBenchmark(scanDbPath, false, "write", "write.global_remove");
+            Map<String, String> range = runGlobalRemoveBenchmark(rangeDbPath, true, "write", "write.global_remove");
+
+            Assertions.assertEquals("8", scan.get("branchFanout"));
+            Assertions.assertEquals("8", scan.get("rowsScanned"));
+            Assertions.assertEquals("8", scan.get("iteratorNext"));
+            Assertions.assertEquals("20", scan.get("pointDeleteCount"));
+            Assertions.assertEquals("0", scan.get("rangeDeleteCount"));
+            Assertions.assertEquals("4", scan.get("deleteBatchCount"));
+
+            Assertions.assertEquals("8", range.get("branchFanout"));
+            Assertions.assertEquals("0", range.get("rowsScanned"));
+            Assertions.assertEquals("0", range.get("iteratorNext"));
+            Assertions.assertEquals("12", range.get("pointDeleteCount"));
+            Assertions.assertEquals("4", range.get("rangeDeleteCount"));
+            Assertions.assertEquals("4", range.get("deleteBatchCount"));
+
+            Map<String, String> cleanupScan =
+                    runGlobalRemoveBenchmark(scanDbPath, false, "cleanup", "cleanup.global_remove_with_branches");
+            Map<String, String> cleanupRange =
+                    runGlobalRemoveBenchmark(rangeDbPath, true, "cleanup", "cleanup.global_remove_with_branches");
+            Assertions.assertEquals("12", cleanupScan.get("branchFanout"));
+            Assertions.assertEquals("12", cleanupScan.get("rowsScanned"));
+            Assertions.assertEquals("25", cleanupScan.get("pointDeleteCount"));
+            Assertions.assertEquals("0", cleanupScan.get("rangeDeleteCount"));
+            Assertions.assertEquals("12", cleanupRange.get("branchFanout"));
+            Assertions.assertEquals("0", cleanupRange.get("rowsScanned"));
+            Assertions.assertEquals("13", cleanupRange.get("pointDeleteCount"));
+            Assertions.assertEquals("4", cleanupRange.get("rangeDeleteCount"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(scanDbPath);
+            deleteRecursively(rangeDbPath);
+        }
+    }
+
+    @Test
+    void testDefaultBenchmarkSetExcludesExplicitBackgroundInterference() throws Exception {
+        Object options = parseOptions();
+        Field field = options.getClass().getDeclaredField("benchmarks");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> benchmarks =
+                (java.util.Set<String>) field.get(options);
+
+        Assertions.assertFalse(benchmarks.contains("background"));
+    }
+
+    @Test
+    void testLifecycleGlobalRemoveReleasesLocksBeforeDeletingSessions() throws Exception {
+        Path scanDbPath = Files.createTempDirectory("rocksdb-benchmark-lifecycle-remove-scan-");
+        Path rangeDbPath = Files.createTempDirectory("rocksdb-benchmark-lifecycle-remove-range-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Map<String, String> scan = runGlobalLifecycleBenchmark(scanDbPath, false);
+            Map<String, String> range = runGlobalLifecycleBenchmark(rangeDbPath, true);
+
+            Assertions.assertEquals("12", scan.get("branchFanout"));
+            Assertions.assertEquals("24", scan.get("lockFanout"));
+            Assertions.assertEquals("36", scan.get("rowsScanned"));
+            Assertions.assertEquals("0", scan.get("pointReads"));
+            Assertions.assertEquals("0", scan.get("rangeDeleteCount"));
+
+            Assertions.assertEquals("12", range.get("branchFanout"));
+            Assertions.assertEquals("24", range.get("lockFanout"));
+            Assertions.assertEquals("24", range.get("rowsScanned"));
+            Assertions.assertEquals("0", range.get("pointReads"));
+            Assertions.assertEquals("4", range.get("rangeDeleteCount"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(scanDbPath);
+            deleteRecursively(rangeDbPath);
+        }
+    }
+
+    @Test
+    void testBackgroundInterferenceCursorAdvancesPastPersistentFailures() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-background-interference-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=background",
+                    "--globalCount=3000",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=RollbackRetrying:1,TimeoutRollbacking:1",
+                    "--queryLimit=128",
+                    "--queryIterationsPerRound=30",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+            Assertions.assertTrue(
+                    lines.stream().anyMatch(line -> line.startsWith("background.r2_coordinator_multi_status_cursor,")));
+            Assertions.assertTrue(lines.stream().anyMatch(line -> line.startsWith("background.r2_foreground_probe,")));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
     void testAppendWriteBenchmarkOnlyEmitsAddScenarios() throws Exception {
         Path dbPath = Files.createTempDirectory("rocksdb-benchmark-append-write-");
         Object originalEnvironment =
@@ -377,6 +656,7 @@ class RocksDBFileModeBenchmarkTest {
                     "--measureRounds=1",
                     "--queryIterationsPerRound=1",
                     "--queryLimit=2",
+                    "--queryWorkload=status",
                     "--cleanup=true",
                     "--dbPath=" + dbPath);
             Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
@@ -396,6 +676,187 @@ class RocksDBFileModeBenchmarkTest {
             Assertions.assertEquals("2", statusLine.get("rowsReturned"));
             Assertions.assertEquals("2", statusLine.get("pointReads"));
             Assertions.assertEquals("2", statusLine.get("iteratorNext"));
+            Assertions.assertEquals(1, lines.size());
+            Assertions.assertFalse(lines.stream().anyMatch(line -> line.startsWith("query.xid,")));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testQueryMultiStatusBenchmarkCarriesCursorAndUsesBoundedScanStats() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-query-multi-status-stats-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=query",
+                    "--globalCount=6",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=RollbackRetrying:1,TimeoutRollbacking:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--queryIterationsPerRound=2",
+                    "--queryLimit=2",
+                    "--queryWorkload=status_multi",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> statusLine = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("query.status_multi,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("query.status_multi row missing")));
+            Assertions.assertEquals("8", statusLine.get("rowsScanned"));
+            Assertions.assertEquals("8", statusLine.get("rowsReturned"));
+            Assertions.assertEquals("4", statusLine.get("pointReads"));
+            Assertions.assertEquals("8", statusLine.get("iteratorNext"));
+            Assertions.assertEquals(1, lines.size());
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testFullScanFilterBenchmarkUsesActualScanStats() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-full-scan-stats-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_MAX_LIMIT, "2");
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, environment);
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=query",
+                    "--globalCount=6",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=RollbackRetrying:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--queryIterationsPerRound=1",
+                    "--queryWorkload=full_scan_filter",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> fullScanLine = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("query.full_scan_filter,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("query.full_scan_filter row missing")));
+            Assertions.assertEquals("2", fullScanLine.get("rowsScanned"));
+            Assertions.assertEquals("2", fullScanLine.get("rowsReturned"));
+            Assertions.assertEquals("0", fullScanLine.get("pointReads"));
+            Assertions.assertEquals("2", fullScanLine.get("iteratorNext"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testBeginSortedBenchmarkUsesStatusScanStats() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-begin-scan-stats-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=query",
+                    "--globalCount=6",
+                    "--branchPerGlobal=0",
+                    "--statusDistribution=Begin:1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--queryIterationsPerRound=1",
+                    "--queryWorkload=begin_sorted",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> beginLine = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("query.begin_sorted,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("query.begin_sorted row missing")));
+            Assertions.assertEquals("6", beginLine.get("rowsScanned"));
+            Assertions.assertEquals("6", beginLine.get("rowsReturned"));
+            Assertions.assertEquals("6", beginLine.get("pointReads"));
+            Assertions.assertEquals("6", beginLine.get("iteratorNext"));
+        } finally {
+            ConfigurationCache.clear();
+            restoreEnvironment(originalEnvironment);
+            deleteRecursively(dbPath);
+        }
+    }
+
+    @Test
+    void testBatchedOrphanBenchmarkEmitsForegroundProbeMetrics() throws Exception {
+        Path dbPath = Files.createTempDirectory("rocksdb-benchmark-orphan-probe-");
+        Object originalEnvironment =
+                ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        ConfigurationCache.clear();
+        try {
+            Object options = parseOptions(
+                    "--benchmark=lock",
+                    "--lockWorkload=clean_orphan_batched",
+                    "--globalCount=4",
+                    "--branchPerGlobal=1",
+                    "--lockPerBranch=1",
+                    "--warmupRounds=0",
+                    "--measureRounds=1",
+                    "--sampleEvery=1",
+                    "--orphanCleanBatchLimit=2",
+                    "--orphanCleanMaxBatches=1",
+                    "--orphanCleanRoundSleepMillis=7",
+                    "--cleanup=true",
+                    "--dbPath=" + dbPath);
+            Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            method.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+
+            Map<String, String> probe = parseCsvLine(lines.stream()
+                    .filter(line -> line.startsWith("lock.clean_orphan_batched_foreground_probe,"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("foreground probe row missing")));
+            Assertions.assertTrue(Long.parseLong(probe.get("ops")) > 0L);
+            Assertions.assertEquals("2", probe.get("orphanCleanBatchLimit"));
+            Assertions.assertEquals("1", probe.get("orphanCleanMaxBatches"));
+            Assertions.assertEquals("7", probe.get("orphanCleanRoundSleepMillis"));
         } finally {
             ConfigurationCache.clear();
             restoreEnvironment(originalEnvironment);
@@ -439,6 +900,10 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertTrue(header.contains("queryIterationsPerRound"));
         Assertions.assertTrue(header.contains("queryLimit"));
         Assertions.assertTrue(header.contains("lockIndexScanBatchSize"));
+        Assertions.assertTrue(header.contains("dataPayloadProfile"));
+        Assertions.assertTrue(header.contains("queryWorkload"));
+        Assertions.assertTrue(header.contains("orphanCleanBatchLimit"));
+        Assertions.assertTrue(header.contains("orphanCleanMaxBatches"));
         Assertions.assertTrue(header.contains("repeatRun"));
         Assertions.assertTrue(header.contains("compareOrder"));
         Assertions.assertTrue(header.contains("rowsScanned"));
@@ -447,6 +912,7 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertTrue(header.contains("innerOperations"));
         Assertions.assertTrue(header.contains("pointReads"));
         Assertions.assertTrue(header.contains("iteratorNext"));
+        Assertions.assertTrue(header.contains("orphanCleanRoundSleepMillis"));
         Assertions.assertTrue(header.contains("writeBatchBytes"));
     }
 
@@ -511,7 +977,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "2",
                         "iteratorNext", "10",
                         "writeBatchBytes", "100",
-                        "innerOperations", "1")),
+                        "innerOperations", "1",
+                        "rangeDeleteCount", "0",
+                        "pointDeleteCount", "10",
+                        "deleteBatchCount", "1",
+                        "branchFanout", "4",
+                        "lockFanout", "0")),
                 csvLine(map(
                         "scenario", "query.status",
                         "repeatRun", "A2",
@@ -526,7 +997,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "6",
                         "iteratorNext", "30",
                         "writeBatchBytes", "300",
-                        "innerOperations", "3")));
+                        "innerOperations", "3",
+                        "rangeDeleteCount", "2",
+                        "pointDeleteCount", "30",
+                        "deleteBatchCount", "3",
+                        "branchFanout", "12",
+                        "lockFanout", "4")));
         Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("summarizeCsvLines", List.class);
         method.setAccessible(true);
 
@@ -550,6 +1026,11 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals("20.000", summary.get("iteratorNextMean"));
         Assertions.assertEquals("200.000", summary.get("writeBatchBytesMean"));
         Assertions.assertEquals("2.000", summary.get("innerOperationsMean"));
+        Assertions.assertEquals("1.000", summary.get("rangeDeleteCountMean"));
+        Assertions.assertEquals("20.000", summary.get("pointDeleteCountMean"));
+        Assertions.assertEquals("2.000", summary.get("deleteBatchCountMean"));
+        Assertions.assertEquals("8.000", summary.get("branchFanoutMean"));
+        Assertions.assertEquals("2.000", summary.get("lockFanoutMean"));
     }
 
     @Test
@@ -569,7 +1050,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "2",
                         "iteratorNext", "10",
                         "writeBatchBytes", "100",
-                        "innerOperations", "1")),
+                        "innerOperations", "1",
+                        "rangeDeleteCount", "0",
+                        "pointDeleteCount", "10",
+                        "deleteBatchCount", "1",
+                        "branchFanout", "4",
+                        "lockFanout", "0")),
                 csvLine(map(
                         "scenario", "query.status",
                         "repeatRun", "B2",
@@ -584,7 +1070,12 @@ class RocksDBFileModeBenchmarkTest {
                         "pointReads", "6",
                         "iteratorNext", "30",
                         "writeBatchBytes", "300",
-                        "innerOperations", "3")));
+                        "innerOperations", "3",
+                        "rangeDeleteCount", "2",
+                        "pointDeleteCount", "30",
+                        "deleteBatchCount", "3",
+                        "branchFanout", "12",
+                        "lockFanout", "4")));
         Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("summarizeCsvLinesAsJson", List.class);
         method.setAccessible(true);
 
@@ -607,6 +1098,11 @@ class RocksDBFileModeBenchmarkTest {
         Assertions.assertEquals(4.0D, ((Number) operations.get("pointReadsMean")).doubleValue());
         Assertions.assertEquals(20.0D, ((Number) operations.get("iteratorNextMean")).doubleValue());
         Assertions.assertEquals(200.0D, ((Number) operations.get("writeBatchBytesMean")).doubleValue());
+        Assertions.assertEquals(1.0D, ((Number) operations.get("rangeDeleteCountMean")).doubleValue());
+        Assertions.assertEquals(20.0D, ((Number) operations.get("pointDeleteCountMean")).doubleValue());
+        Assertions.assertEquals(2.0D, ((Number) operations.get("deleteBatchCountMean")).doubleValue());
+        Assertions.assertEquals(8.0D, ((Number) operations.get("branchFanoutMean")).doubleValue());
+        Assertions.assertEquals(2.0D, ((Number) operations.get("lockFanoutMean")).doubleValue());
         Assertions.assertEquals(Collections.singletonList("query.status:B"), root.get("summaryKeys"));
     }
 
@@ -731,6 +1227,57 @@ class RocksDBFileModeBenchmarkTest {
         Field field = target.getDeclaredField(name);
         field.setAccessible(true);
         return ((Number) field.get(null)).longValue();
+    }
+
+    private Map<String, String> runGlobalRemoveBenchmark(
+            Path dbPath, boolean enableRangeDelete, String benchmark, String scenario) throws Exception {
+        Object options = parseOptions(
+                "--benchmark=" + benchmark,
+                "--globalCount=4",
+                "--branchPerGlobal=3",
+                "--lockPerBranch=0",
+                "--warmupRounds=0",
+                "--measureRounds=1",
+                "--batchSize=1",
+                "--enableRangeDelete=" + enableRangeDelete,
+                "--cleanup=true",
+                "--dbPath=" + dbPath);
+        Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+        return parseCsvLine(lines.stream()
+                .filter(line -> line.startsWith(scenario + ","))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(scenario + " row missing")));
+    }
+
+    private Map<String, String> runGlobalLifecycleBenchmark(Path dbPath, boolean enableRangeDelete) throws Exception {
+        Object options = parseOptions(
+                "--benchmark=lifecycle",
+                "--globalCount=4",
+                "--branchPerGlobal=3",
+                "--lockPerBranch=2",
+                "--warmupRounds=0",
+                "--measureRounds=1",
+                "--batchSize=1",
+                "--enableRangeDelete=" + enableRangeDelete,
+                "--cleanup=true",
+                "--dbPath=" + dbPath);
+        Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+        method.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> lines = (List<String>) method.invoke(constructor.newInstance(), options, null);
+        return parseCsvLine(lines.stream()
+                .filter(line -> line.startsWith("lifecycle.global_remove_with_locks,"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("lifecycle.global_remove_with_locks row missing")));
     }
 
     private String csvLine(Map<String, String> valuesByColumn) throws Exception {

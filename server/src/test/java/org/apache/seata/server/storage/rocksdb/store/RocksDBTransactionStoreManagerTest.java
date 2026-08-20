@@ -16,6 +16,7 @@
  */
 package org.apache.seata.server.storage.rocksdb.store;
 
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
@@ -45,6 +46,9 @@ import org.springframework.mock.env.MockEnvironment;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
@@ -57,11 +61,13 @@ class RocksDBTransactionStoreManagerTest {
     private Object originalEnvironment;
     private SessionManager originalRootSessionManager;
     private Map<String, SessionManager> originalSessionManagerMap;
+    private MockEnvironment environment;
 
     @BeforeEach
     void beforeEach() throws Exception {
         originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
-        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        environment = new MockEnvironment();
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, environment);
         ConfigurationCache.clear();
         originalRootSessionManager = getRootSessionManager();
         originalSessionManagerMap = getSessionManagerMap();
@@ -164,6 +170,50 @@ class RocksDBTransactionStoreManagerTest {
                             .readSession(kept.getXid(), true)
                             .getBranchSessions()
                             .size());
+        }
+    }
+
+    @Test
+    void testGlobalRemoveIsIdempotentAndPersistsAcrossReopenForBothDeleteStrategies() {
+        for (boolean enableRangeDelete : new boolean[] {false, true}) {
+            String databaseName = "global-remove-reopen-" + enableRangeDelete;
+            GlobalSession removed = globalSession("tx-remove-reopen-" + enableRangeDelete, GlobalStatus.Begin);
+            GlobalSession kept = globalSession("tx-keep-reopen-" + enableRangeDelete, GlobalStatus.Begin);
+
+            try (RocksDBStoreEngine engine = open(databaseName, enableRangeDelete)) {
+                RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, removed);
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 1L));
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 2L));
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(removed, 3L));
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, kept);
+                storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession(kept, 1L));
+
+                Assertions.assertTrue(storeManager.writeSession(LogOperation.GLOBAL_REMOVE, removed));
+                Assertions.assertTrue(storeManager.writeSession(LogOperation.GLOBAL_REMOVE, removed));
+            }
+
+            try (RocksDBStoreEngine engine = open(databaseName, enableRangeDelete)) {
+                RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+                Assertions.assertNull(storeManager.readSession(removed.getXid(), true));
+                Assertions.assertTrue(engine.prefixScan(
+                                RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(removed.getXid()))
+                        .isEmpty());
+                Assertions.assertTrue(storeManager.readSession(new GlobalStatus[] {GlobalStatus.Begin}, false).stream()
+                        .noneMatch(session -> removed.getXid().equals(session.getXid())));
+                SessionCondition transactionIdCondition = new SessionCondition();
+                transactionIdCondition.setTransactionId(removed.getTransactionId());
+                Assertions.assertTrue(
+                        storeManager.readSession(transactionIdCondition).isEmpty());
+                Assertions.assertNull(engine.get(
+                        RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                        RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                                removed.getBeginTime() + removed.getTimeout(), removed.getXid())));
+
+                GlobalSession actualKept = storeManager.readSession(kept.getXid(), true);
+                Assertions.assertNotNull(actualKept);
+                Assertions.assertEquals(1, actualKept.getBranchSessions().size());
+            }
         }
     }
 
@@ -589,7 +639,67 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
-    void testReadByStatusWithoutLimitUsesSingleIteratorScan() throws Exception {
+    void testReadByStatusReturnsCompleteGlobalSessionFields() {
+        try (RocksDBStoreEngine engine = open("condition-status-complete-fields")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession expected =
+                    new GlobalSession("status-application", "status-service-group", "status-transaction", 60_000);
+            expected.setApplicationData("status-application-data");
+            expected.setBeginTime(123_456L);
+            expected.setStatus(GlobalStatus.Committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, expected);
+
+            GlobalSession byXid = storeManager.readSession(expected.getXid(), false);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(10);
+            List<GlobalSession> byStatus = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, byStatus.size());
+            GlobalSession actual = byStatus.get(0);
+            Assertions.assertEquals("status-application", actual.getApplicationId());
+            Assertions.assertEquals("status-service-group", actual.getTransactionServiceGroup());
+            Assertions.assertEquals("status-transaction", actual.getTransactionName());
+            Assertions.assertEquals("status-application-data", actual.getApplicationData());
+            Assertions.assertEquals(byXid.getApplicationId(), actual.getApplicationId());
+            Assertions.assertEquals(byXid.getTransactionServiceGroup(), actual.getTransactionServiceGroup());
+            Assertions.assertEquals(byXid.getTransactionName(), actual.getTransactionName());
+            Assertions.assertEquals(byXid.getApplicationData(), actual.getApplicationData());
+            Assertions.assertEquals(byXid.getXid(), actual.getXid());
+            Assertions.assertEquals(byXid.getTransactionId(), actual.getTransactionId());
+            Assertions.assertEquals(byXid.getBeginTime(), actual.getBeginTime());
+            Assertions.assertEquals(byXid.getStatus(), actual.getStatus());
+        }
+    }
+
+    @Test
+    void testReadByStatusReturnsDuplicateIndexXidOnlyOnce() {
+        try (RocksDBStoreEngine engine = open("condition-status-duplicate-xid")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession session = globalSession("tx-status-duplicate-xid", GlobalStatus.Committed);
+            session.setBeginTime(321L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, session);
+            byte[] canonicalKey = RocksDBKeyCodec.encodeGlobalStatusIndex(
+                    session.getStatus(), session.getBeginTime(), session.getXid());
+            byte[] duplicateKey = Arrays.copyOf(canonicalKey, canonicalKey.length + 1);
+            duplicateKey[duplicateKey.length - 1] = 1;
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                    duplicateKey,
+                    session.getXid().getBytes(StandardCharsets.UTF_8));
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed);
+            condition.setLazyLoadBranch(true);
+            condition.setLimit(10);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, actual.size());
+            Assertions.assertEquals(session.getXid(), actual.get(0).getXid());
+        }
+    }
+
+    @Test
+    void testReadByStatusWithoutLimitUsesPagedScan() throws Exception {
         try (RocksDBStoreEngine engine = open("condition-status-unlimited-fast")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             CountingIndexManager indexManager = new CountingIndexManager(engine);
@@ -605,8 +715,9 @@ class RocksDBTransactionStoreManagerTest {
             List<GlobalSession> actual = storeManager.readSession(condition);
 
             Assertions.assertEquals(2, actual.size());
-            Assertions.assertEquals(1, indexManager.fullStatusScanCalls);
-            Assertions.assertEquals(0, indexManager.pagedStatusScanCalls);
+            // After Direction A optimization: always use paged scan (no unbounded full scan)
+            Assertions.assertEquals(0, indexManager.fullStatusScanCalls);
+            Assertions.assertTrue(indexManager.pagedStatusScanCalls >= 1);
         }
     }
 
@@ -638,6 +749,30 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertEquals(2, stats.getSessionsReturned());
             Assertions.assertTrue(stats.isLimitReached());
             Assertions.assertTrue(stats.getElapsedMillis() >= 0);
+        }
+    }
+
+    @Test
+    void testUnfilteredSessionScanRecordsScanStats() {
+        try (RocksDBStoreEngine engine = open("condition-unfiltered-scan-stats")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession("tx-unfiltered-1", GlobalStatus.Begin));
+            storeManager.writeSession(
+                    LogOperation.GLOBAL_ADD, globalSession("tx-unfiltered-2", GlobalStatus.Committing));
+            storeManager.writeSession(
+                    LogOperation.GLOBAL_ADD, globalSession("tx-unfiltered-3", GlobalStatus.Committed));
+
+            SessionCondition condition = new SessionCondition();
+            condition.setLazyLoadBranch(true);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+            SessionScanStats stats = condition.getScanStats();
+
+            Assertions.assertEquals(3, actual.size());
+            Assertions.assertEquals(3, stats.getRowsScanned());
+            Assertions.assertEquals(3, stats.getRowsReturned());
+            Assertions.assertEquals(0, stats.getPointReads());
+            Assertions.assertEquals(3, stats.getSessionsReturned());
+            Assertions.assertFalse(stats.isLimitReached());
         }
     }
 
@@ -679,7 +814,7 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
-    void testReadByMultipleStatusesWithoutLimitUsesSingleIteratorScan() throws Exception {
+    void testReadByMultipleStatusesWithoutLimitUsesPagedScan() throws Exception {
         try (RocksDBStoreEngine engine = open("condition-multi-status-unlimited-fast")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             CountingIndexManager indexManager = new CountingIndexManager(engine);
@@ -695,8 +830,44 @@ class RocksDBTransactionStoreManagerTest {
             List<GlobalSession> actual = storeManager.readSession(condition);
 
             Assertions.assertEquals(2, actual.size());
-            Assertions.assertEquals(2, indexManager.fullStatusScanCalls);
-            Assertions.assertEquals(0, indexManager.pagedStatusScanCalls);
+            // After Direction A optimization: always use paged scan (no unbounded full scan)
+            Assertions.assertEquals(0, indexManager.fullStatusScanCalls);
+            Assertions.assertTrue(indexManager.pagedStatusScanCalls >= 1);
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesWithoutLimitHonorsFullScanDeadline() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-multi-status-deadline")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            Assertions.assertEquals(1L, fullScanDeadlineMillis(storeManager));
+            int sessionCount = 4096;
+            for (int i = 0; i < sessionCount; i++) {
+                GlobalStatus status = i % 2 == 0 ? GlobalStatus.Committed : GlobalStatus.Rollbacked;
+                GlobalSession session = globalSession("tx-multi-deadline-" + i, status);
+                session.setBeginTime(i);
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, session);
+            }
+
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            condition.setLazyLoadBranch(true);
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertTrue(
+                    actual.size() < sessionCount,
+                    "an unlimited multi-status scan must stop when fullScanDeadlineMillis is reached");
+        }
+    }
+
+    @Test
+    void testMultiStatusScanPageSizeUsesConfiguredValue() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "64");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-multi-status-page-size")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            Assertions.assertEquals(64, multiStatusScanPageSize(storeManager));
         }
     }
 
@@ -723,6 +894,133 @@ class RocksDBTransactionStoreManagerTest {
             Assertions.assertEquals(2, actual.size());
             Assertions.assertEquals(secondStatusEarly.getXid(), actual.get(0).getXid());
             Assertions.assertEquals(secondStatusMiddle.getXid(), actual.get(1).getXid());
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesAndLimitResumesWithPerStatusCursors() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-limit-cursor")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committedEarly = globalSession("tx-committed-early", GlobalStatus.Committed);
+            committedEarly.setBeginTime(100L);
+            GlobalSession rollbackedMiddle = globalSession("tx-rollbacked-middle", GlobalStatus.Rollbacked);
+            rollbackedMiddle.setBeginTime(200L);
+            GlobalSession committedLate = globalSession("tx-committed-late", GlobalStatus.Committed);
+            committedLate.setBeginTime(300L);
+            GlobalSession rollbackedLate = globalSession("tx-rollbacked-late", GlobalStatus.Rollbacked);
+            rollbackedLate.setBeginTime(400L);
+
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committedLate);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedLate);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committedEarly);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedMiddle);
+
+            SessionCondition firstPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            firstPage.setLazyLoadBranch(true);
+            firstPage.setLimit(2);
+            List<GlobalSession> firstActual = storeManager.readSession(firstPage);
+
+            Assertions.assertEquals(
+                    List.of(committedEarly.getXid(), rollbackedMiddle.getXid()),
+                    firstActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+            Map<GlobalStatus, byte[]> nextCursors = firstPage.getNextStatusScanCursors();
+            Assertions.assertNotNull(nextCursors.get(GlobalStatus.Committed));
+            Assertions.assertNotNull(nextCursors.get(GlobalStatus.Rollbacked));
+
+            SessionCondition secondPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            secondPage.setLazyLoadBranch(true);
+            secondPage.setLimit(2);
+            secondPage.setStatusScanCursors(nextCursors);
+            List<GlobalSession> secondActual = storeManager.readSession(secondPage);
+
+            Assertions.assertEquals(
+                    List.of(committedLate.getXid(), rollbackedLate.getXid()),
+                    secondActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesKeepsExhaustedStatusCursorUntilOtherStatusesFinish() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-exhausted-cursor")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committed = globalSession("tx-committed-only", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            GlobalSession rollbackedFirst = globalSession("tx-rollbacked-first", GlobalStatus.Rollbacked);
+            rollbackedFirst.setBeginTime(200L);
+            GlobalSession rollbackedSecond = globalSession("tx-rollbacked-second", GlobalStatus.Rollbacked);
+            rollbackedSecond.setBeginTime(300L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedFirst);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbackedSecond);
+
+            SessionCondition firstPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            firstPage.setLazyLoadBranch(true);
+            firstPage.setLimit(2);
+            List<GlobalSession> firstActual = storeManager.readSession(firstPage);
+
+            Assertions.assertEquals(
+                    List.of(committed.getXid(), rollbackedFirst.getXid()),
+                    firstActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+            Assertions.assertNotNull(firstPage.getNextStatusScanCursors().get(GlobalStatus.Committed));
+
+            SessionCondition secondPage = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            secondPage.setLazyLoadBranch(true);
+            secondPage.setLimit(2);
+            secondPage.setStatusScanCursors(firstPage.getNextStatusScanCursors());
+            List<GlobalSession> secondActual = storeManager.readSession(secondPage);
+
+            Assertions.assertEquals(
+                    List.of(rollbackedSecond.getXid()),
+                    secondActual.stream().map(GlobalSession::getXid).collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    void testReadByMultipleStatusesClearsCursorsAfterCombinedPassExhausts() {
+        try (RocksDBStoreEngine engine = open("condition-multi-status-combined-pass-exhausted")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committed = globalSession("tx-pass-committed", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            GlobalSession rollbacked = globalSession("tx-pass-rollbacked", GlobalStatus.Rollbacked);
+            rollbacked.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbacked);
+
+            Map<GlobalStatus, byte[]> cursors = Collections.emptyMap();
+            List<String> seenXids = new ArrayList<>();
+            boolean exhausted = false;
+            for (int page = 0; page < 5; page++) {
+                SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+                condition.setLazyLoadBranch(true);
+                condition.setLimit(1);
+                condition.setScanLimit(1);
+                condition.setStatusScanCursors(cursors);
+                List<GlobalSession> actual = storeManager.readSession(condition);
+                cursors = condition.getNextStatusScanCursors();
+                if (actual.isEmpty()) {
+                    exhausted = true;
+                    break;
+                }
+                seenXids.add(actual.get(0).getXid());
+            }
+
+            Assertions.assertTrue(exhausted, "the combined status pass must terminate");
+            Assertions.assertEquals(List.of(committed.getXid(), rollbacked.getXid()), seenXids);
+            Assertions.assertTrue(cursors.isEmpty(), "an exhausted combined pass must clear every status cursor");
+
+            GlobalSession earlier = globalSession("tx-pass-new-earlier", GlobalStatus.Committed);
+            earlier.setBeginTime(50L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, earlier);
+            SessionCondition restarted = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            restarted.setLazyLoadBranch(true);
+            restarted.setLimit(1);
+            restarted.setScanLimit(1);
+            restarted.setStatusScanCursors(cursors);
+
+            List<GlobalSession> restartedActual = storeManager.readSession(restarted);
+
+            Assertions.assertEquals(1, restartedActual.size());
+            Assertions.assertEquals(earlier.getXid(), restartedActual.get(0).getXid());
         }
     }
 
@@ -929,6 +1227,18 @@ class RocksDBTransactionStoreManagerTest {
         Field field = RocksDBTransactionStoreManager.class.getDeclaredField("indexManager");
         field.setAccessible(true);
         field.set(storeManager, indexManager);
+    }
+
+    private long fullScanDeadlineMillis(RocksDBTransactionStoreManager storeManager) throws Exception {
+        Field field = RocksDBTransactionStoreManager.class.getDeclaredField("fullScanDeadlineMillis");
+        field.setAccessible(true);
+        return field.getLong(storeManager);
+    }
+
+    private int multiStatusScanPageSize(RocksDBTransactionStoreManager storeManager) throws Exception {
+        Field field = RocksDBTransactionStoreManager.class.getDeclaredField("multiStatusScanPageSize");
+        field.setAccessible(true);
+        return field.getInt(storeManager);
     }
 
     private static final class CountingIndexManager extends RocksDBIndexManager {
