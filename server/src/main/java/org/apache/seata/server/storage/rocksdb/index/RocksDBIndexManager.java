@@ -92,12 +92,14 @@ public class RocksDBIndexManager {
         }
 
         try (WriteBatch metadataBatch = new WriteBatch()) {
-            metadataBatch.put(
-                    storeEngine.handle(RocksDBColumnFamily.METADATA),
+            storeEngine.put(
+                    metadataBatch,
+                    RocksDBColumnFamily.METADATA,
                     bytes(INDEX_VERSION_KEY),
                     bytes(Integer.toString(INDEX_VERSION)));
-            metadataBatch.put(
-                    storeEngine.handle(RocksDBColumnFamily.METADATA),
+            storeEngine.put(
+                    metadataBatch,
+                    RocksDBColumnFamily.METADATA,
                     bytes(INDEX_BUILD_STATUS_KEY),
                     bytes(INDEX_BUILD_STATUS_COMPLETED));
             storeEngine.write(metadataBatch);
@@ -108,24 +110,28 @@ public class RocksDBIndexManager {
 
     public void putGlobalIndexes(WriteBatch batch, GlobalSession globalSession) throws RocksDBException {
         byte[] xidValue = bytes(globalSession.getXid());
-        batch.put(
-                storeEngine.handle(RocksDBColumnFamily.GLOBAL_STATUS_INDEX),
+        storeEngine.put(
+                batch,
+                RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
                 RocksDBKeyCodec.encodeGlobalStatusIndex(
                         globalSession.getStatus(), globalSession.getBeginTime(), globalSession.getXid()),
                 xidValue);
-        batch.put(
-                storeEngine.handle(RocksDBColumnFamily.TRANSACTION_ID_INDEX),
+        storeEngine.put(
+                batch,
+                RocksDBColumnFamily.TRANSACTION_ID_INDEX,
                 RocksDBKeyCodec.encodeTransactionIdIndex(globalSession.getTransactionId()),
                 xidValue);
     }
 
     public void deleteGlobalIndexes(WriteBatch batch, GlobalSession globalSession) throws RocksDBException {
-        batch.delete(
-                storeEngine.handle(RocksDBColumnFamily.GLOBAL_STATUS_INDEX),
+        storeEngine.delete(
+                batch,
+                RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
                 RocksDBKeyCodec.encodeGlobalStatusIndex(
                         globalSession.getStatus(), globalSession.getBeginTime(), globalSession.getXid()));
-        batch.delete(
-                storeEngine.handle(RocksDBColumnFamily.TRANSACTION_ID_INDEX),
+        storeEngine.delete(
+                batch,
+                RocksDBColumnFamily.TRANSACTION_ID_INDEX,
                 RocksDBKeyCodec.encodeTransactionIdIndex(globalSession.getTransactionId()));
     }
 
@@ -147,6 +153,48 @@ public class RocksDBIndexManager {
                 RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
                 RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
                 (key, value) -> consumer.accept(string(value)));
+    }
+
+    public StatusScanResult scanXidsByStatus(GlobalStatus status, long maxBeginTimeInclusive, int limit) {
+        List<String> xids = new ArrayList<>();
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
+                RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+                RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
+                RocksDBKeyCodec.encodeGlobalStatusPrefix(status),
+                limit,
+                (key, value) -> RocksDBKeyCodec.extractBeginTimeFromStatusIndexKey(key) <= maxBeginTimeInclusive,
+                (key, value) -> xids.add(string(value)));
+        return new StatusScanResult(xids, stats);
+    }
+
+    public static class StatusScanResult {
+        private final List<String> xids;
+        private final int rowsScanned;
+        private final int rowsReturned;
+        private final boolean limitReached;
+
+        StatusScanResult(List<String> xids, RocksDBStoreEngine.ScanStats scanStats) {
+            this.xids = xids;
+            this.rowsScanned = scanStats.getRowsScanned();
+            this.rowsReturned = scanStats.getRowsReturned();
+            this.limitReached = scanStats.isLimitReached();
+        }
+
+        public List<String> getXids() {
+            return xids;
+        }
+
+        public int getRowsScanned() {
+            return rowsScanned;
+        }
+
+        public int getRowsReturned() {
+            return rowsReturned;
+        }
+
+        public boolean isLimitReached() {
+            return limitReached;
+        }
     }
 
     private GlobalSession decodeGlobalSession(byte[] value) {

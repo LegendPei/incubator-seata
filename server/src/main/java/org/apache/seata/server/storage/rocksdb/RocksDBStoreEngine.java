@@ -20,6 +20,7 @@ import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.util.StringUtils;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.Cache;
+import org.rocksdb.Checkpoint;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
@@ -63,6 +64,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private static final int DELETE_BATCH_SIZE = 1024;
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBStoreEngine.class);
     private static final byte[] FORMAT_VERSION_KEY = "format_version".getBytes(StandardCharsets.UTF_8);
+    private static final String ROCKS_DB_VERSION;
     private static final String[] DB_LONG_PROPERTIES = {
         RocksDBStoreDiagnostics.ESTIMATE_LIVE_DATA_SIZE,
         RocksDBStoreDiagnostics.TOTAL_SST_FILES_SIZE,
@@ -94,6 +96,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     static {
         RocksDB.loadLibrary();
+        ROCKS_DB_VERSION = readRocksDBVersion();
     }
 
     private final RocksDBStoreConfig config;
@@ -104,6 +107,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final WriteOptions writeOptions;
     private final Cache blockCache;
     private final Statistics statistics;
+    private final RocksDBWalSyncController walSyncController;
     private final RocksDB db;
     private final ReentrantReadWriteLock maintenanceLock = new ReentrantReadWriteLock(true);
 
@@ -118,6 +122,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         BlockBasedTableConfig openedTableConfig = null;
         Cache openedBlockCache = null;
         Statistics openedStatistics = null;
+        RocksDBWalSyncController openedWalSyncController = RocksDBWalSyncController.disabled();
         RocksDB openedDb = null;
         List<ColumnFamilyHandle> openedHandles = new ArrayList<>();
         Map<RocksDBColumnFamily, ColumnFamilyHandle> openedHandleMap = new EnumMap<>(RocksDBColumnFamily.class);
@@ -154,13 +159,19 @@ public class RocksDBStoreEngine implements AutoCloseable {
             for (int i = 0; i < RocksDBColumnFamily.values().length; i++) {
                 openedHandleMap.put(RocksDBColumnFamily.values()[i], openedHandles.get(i));
             }
-            initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
+            boolean metadataUpdated =
+                    initMetadata(openedDb, openedHandleMap.get(RocksDBColumnFamily.METADATA), openedWriteOptions);
+            openedWalSyncController = RocksDBWalSyncController.create(openedDb, config);
+            if (metadataUpdated) {
+                openedWalSyncController.afterWrite();
+            }
             dbOptions = openedDbOptions;
             columnFamilyOptions = openedColumnFamilyOptions;
             readOptions = openedReadOptions;
             writeOptions = openedWriteOptions;
             blockCache = openedBlockCache;
             statistics = openedStatistics;
+            walSyncController = openedWalSyncController;
             db = openedDb;
             handles.putAll(openedHandleMap);
             LOGGER.info(
@@ -169,11 +180,17 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     config.getDbPath(),
                     handles.keySet(),
                     FORMAT_VERSION,
-                    rocksDBVersion(),
+                    ROCKS_DB_VERSION,
                     config.isSyncWrite(),
                     config.tuningSummary());
+            if (config.isSyncWrite() && config.getWalSyncMode().isPeriodic()) {
+                LOGGER.info(
+                        "RocksDB periodic WAL sync is ignored because syncWrite is enabled, path:{}",
+                        config.getDbPath());
+            }
             RocksDBStoreMetrics.tryRegister(this);
         } catch (StoreException e) {
+            closeQuietly(openedWalSyncController);
             closeQuietly(
                     openedHandles,
                     openedDb,
@@ -185,6 +202,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     openedStatistics);
             throw e;
         } catch (Exception e) {
+            closeQuietly(openedWalSyncController);
             closeQuietly(
                     openedHandles,
                     openedDb,
@@ -208,10 +226,6 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public boolean isSyncWrite() {
         return config.isSyncWrite();
-    }
-
-    public RocksDB getDB() {
-        return db;
     }
 
     public boolean isClosed() {
@@ -238,13 +252,18 @@ public class RocksDBStoreEngine implements AutoCloseable {
      * Returns block cache memory usage in bytes, or 0 if block cache is not enabled or engine is closed.
      */
     public long getBlockCacheUsage() {
-        if (blockCache == null || closed) {
-            return 0L;
-        }
+        maintenanceLock.readLock().lock();
         try {
-            return blockCache.getUsage();
-        } catch (Exception e) {
-            return 0L;
+            if (blockCache == null || closed) {
+                return 0L;
+            }
+            try {
+                return blockCache.getUsage();
+            } catch (Exception e) {
+                return 0L;
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -252,13 +271,18 @@ public class RocksDBStoreEngine implements AutoCloseable {
      * Returns block cache pinned memory usage in bytes, or 0 if block cache is not enabled or engine is closed.
      */
     public long getBlockCachePinnedUsage() {
-        if (blockCache == null || closed) {
-            return 0L;
-        }
+        maintenanceLock.readLock().lock();
         try {
-            return blockCache.getPinnedUsage();
-        } catch (Exception e) {
-            return 0L;
+            if (blockCache == null || closed) {
+                return 0L;
+            }
+            try {
+                return blockCache.getPinnedUsage();
+            } catch (Exception e) {
+                return 0L;
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -266,58 +290,85 @@ public class RocksDBStoreEngine implements AutoCloseable {
      * Returns block cache configured capacity in bytes, or 0 if block cache is not enabled or engine is closed.
      */
     public long getBlockCacheCapacity() {
-        if (blockCache == null || closed) {
-            return 0L;
+        maintenanceLock.readLock().lock();
+        try {
+            return blockCache == null || closed ? 0L : config.getBlockCacheSize();
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
-        return config.getBlockCacheSize();
     }
 
     public RocksDBStoreDiagnostics diagnostics() {
-        if (closed) {
-            return closedDiagnostics(config);
-        }
-        Map<String, Long> properties = new LinkedHashMap<>();
-        Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties = new EnumMap<>(RocksDBColumnFamily.class);
-        List<String> errors = new ArrayList<>();
-        for (String property : DB_LONG_PROPERTIES) {
-            properties.put(property, readLongProperty(property, errors));
-        }
-        for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
-            Map<String, Long> values = new LinkedHashMap<>();
-            for (String property : COLUMN_FAMILY_LONG_PROPERTIES) {
-                values.put(property, readLongProperty(columnFamily, property, errors));
+        maintenanceLock.readLock().lock();
+        try {
+            if (closed) {
+                return closedDiagnostics(config);
             }
-            columnFamilyProperties.put(columnFamily, values);
+            Map<String, Long> properties = new LinkedHashMap<>();
+            Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties =
+                    new EnumMap<>(RocksDBColumnFamily.class);
+            List<String> errors = new ArrayList<>();
+            for (String property : DB_LONG_PROPERTIES) {
+                properties.put(property, readLongProperty(property, errors));
+            }
+            for (RocksDBColumnFamily columnFamily : RocksDBColumnFamily.values()) {
+                Map<String, Long> values = new LinkedHashMap<>();
+                for (String property : COLUMN_FAMILY_LONG_PROPERTIES) {
+                    values.put(property, readLongProperty(columnFamily, property, errors));
+                }
+                columnFamilyProperties.put(columnFamily, values);
+            }
+            return new RocksDBStoreDiagnostics(
+                    config.getDbPath(),
+                    FORMAT_VERSION,
+                    ROCKS_DB_VERSION,
+                    config.isSyncWrite(),
+                    false,
+                    config.tuningSummary(),
+                    properties,
+                    columnFamilyProperties,
+                    errors,
+                    blockCacheUsage(),
+                    blockCachePinnedUsage(),
+                    blockCacheCapacity(),
+                    walSyncController.stats());
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
-        return new RocksDBStoreDiagnostics(
-                config.getDbPath(),
-                FORMAT_VERSION,
-                rocksDBVersion(),
-                config.isSyncWrite(),
-                false,
-                config.tuningSummary(),
-                properties,
-                columnFamilyProperties,
-                errors,
-                getBlockCacheUsage(),
-                getBlockCachePinnedUsage(),
-                getBlockCacheCapacity());
     }
 
     public byte[] get(RocksDBColumnFamily columnFamily, byte[] key) {
+        maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             return db.get(handle(columnFamily), key);
         } catch (RocksDBException e) {
             throw new StoreException(e, "read RocksDB failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
     public void put(RocksDBColumnFamily columnFamily, byte[] key, byte[] value) {
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             db.put(handle(columnFamily), writeOptions, key, value);
+            afterWrite();
         } catch (RocksDBException e) {
             throw new StoreException(e, "write RocksDB failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
+        }
+    }
+
+    public void put(WriteBatch batch, RocksDBColumnFamily columnFamily, byte[] key, byte[] value)
+            throws RocksDBException {
+        Objects.requireNonNull(batch, "batch must not be null");
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            batch.put(handle(columnFamily), key, value);
         } finally {
             maintenanceLock.readLock().unlock();
         }
@@ -326,9 +377,22 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void delete(RocksDBColumnFamily columnFamily, byte[] key) {
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             db.delete(handle(columnFamily), writeOptions, key);
+            afterWrite();
         } catch (RocksDBException e) {
             throw new StoreException(e, "delete RocksDB failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
+        }
+    }
+
+    public void delete(WriteBatch batch, RocksDBColumnFamily columnFamily, byte[] key) throws RocksDBException {
+        Objects.requireNonNull(batch, "batch must not be null");
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            batch.delete(handle(columnFamily), key);
         } finally {
             maintenanceLock.readLock().unlock();
         }
@@ -337,7 +401,9 @@ public class RocksDBStoreEngine implements AutoCloseable {
     public void write(WriteBatch batch) {
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             db.write(writeOptions, batch);
+            afterWrite();
         } catch (RocksDBException e) {
             throw new StoreException(e, "write RocksDB batch failed");
         } finally {
@@ -347,57 +413,153 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
     public <T> T withMaintenanceLock(Supplier<T> action) {
         Objects.requireNonNull(action, "maintenance action must not be null");
+        ensureLifecycleWriteLockAcquisitionAllowed();
         maintenanceLock.writeLock().lock();
         try {
+            ensureOpen();
             return action.get();
         } finally {
             maintenanceLock.writeLock().unlock();
         }
     }
 
-    public List<RocksDBEntry> prefixScan(RocksDBColumnFamily columnFamily, byte[] prefix) {
-        List<RocksDBEntry> entries = new ArrayList<>();
-        try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
-            for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
-                byte[] key = iterator.key();
-                if (!RocksDBKeyCodec.startsWith(key, prefix)) {
-                    break;
-                }
-                entries.add(new RocksDBEntry(copy(key), copy(iterator.value())));
+    void ensureLifecycleWriteLockAcquisitionAllowed() {
+        if (maintenanceLock.getReadHoldCount() > 0 && !maintenanceLock.isWriteLockedByCurrentThread()) {
+            throw new StoreException("RocksDB lifecycle read-to-write lock upgrade is not allowed");
+        }
+    }
+
+    void ensureFactoryAccessAllowed() {
+        if (maintenanceLock.getReadHoldCount() > 0 || maintenanceLock.isWriteLockedByCurrentThread()) {
+            throw new StoreException(
+                    "RocksDB store engine factory access is not allowed while holding a lifecycle lock");
+        }
+    }
+
+    public void createCheckpoint(String checkpointPath) {
+        Objects.requireNonNull(checkpointPath, "checkpointPath must not be null");
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            try (Checkpoint checkpoint = Checkpoint.create(db)) {
+                checkpoint.createCheckpoint(checkpointPath);
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "create RocksDB checkpoint failed, path:" + checkpointPath);
             }
-            iterator.status();
-            return entries;
-        } catch (RocksDBException e) {
-            throw new StoreException(e, "scan RocksDB failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
+        }
+    }
+
+    private void afterWrite() {
+        walSyncController.afterWrite();
+    }
+
+    public List<RocksDBEntry> prefixScan(RocksDBColumnFamily columnFamily, byte[] prefix) {
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            List<RocksDBEntry> entries = new ArrayList<>();
+            try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+                for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
+                    byte[] key = iterator.key();
+                    if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                        break;
+                    }
+                    entries.add(new RocksDBEntry(copy(key), copy(iterator.value())));
+                }
+                iterator.status();
+                return entries;
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "scan RocksDB failed, columnFamily:" + columnFamily.getName());
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
+        }
+    }
+
+    public ScanStats scanByPrefix(
+            RocksDBColumnFamily columnFamily,
+            byte[] seekKey,
+            byte[] prefix,
+            int limit,
+            RocksDBEntryFilter filter,
+            RocksDBEntryConsumer consumer) {
+        Objects.requireNonNull(seekKey, "seekKey must not be null");
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        Objects.requireNonNull(consumer, "consumer must not be null");
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            int rowsScanned = 0;
+            int rowsReturned = 0;
+            boolean limitReached = false;
+            try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+                for (iterator.seek(seekKey); iterator.isValid(); iterator.next()) {
+                    byte[] key = iterator.key();
+                    if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                        break;
+                    }
+                    byte[] value = iterator.value();
+                    rowsScanned++;
+                    if (filter != null && !filter.shouldContinue(key, value)) {
+                        break;
+                    }
+                    consumer.accept(copy(key), copy(value));
+                    rowsReturned++;
+                    if (limit > 0 && rowsReturned >= limit) {
+                        limitReached = true;
+                        break;
+                    }
+                }
+                iterator.status();
+                return new ScanStats(rowsScanned, rowsReturned, limitReached);
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
     public void scanByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix, RocksDBEntryConsumer consumer) {
         Objects.requireNonNull(prefix, "prefix must not be null");
         Objects.requireNonNull(consumer, "consumer must not be null");
-        try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
-            for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
-                byte[] key = iterator.key();
-                if (!RocksDBKeyCodec.startsWith(key, prefix)) {
-                    break;
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+                for (iterator.seek(prefix); iterator.isValid(); iterator.next()) {
+                    byte[] key = iterator.key();
+                    if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                        break;
+                    }
+                    consumer.accept(copy(key), copy(iterator.value()));
                 }
-                consumer.accept(copy(key), copy(iterator.value()));
+                iterator.status();
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
             }
-            iterator.status();
-        } catch (RocksDBException e) {
-            throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
     public boolean prefixExists(RocksDBColumnFamily columnFamily, byte[] prefix) {
         Objects.requireNonNull(prefix, "prefix must not be null");
-        try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
-            iterator.seek(prefix);
-            boolean exists = iterator.isValid() && RocksDBKeyCodec.startsWith(iterator.key(), prefix);
-            iterator.status();
-            return exists;
-        } catch (RocksDBException e) {
-            throw new StoreException(e, "check RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
+                iterator.seek(prefix);
+                boolean exists = iterator.isValid() && RocksDBKeyCodec.startsWith(iterator.key(), prefix);
+                iterator.status();
+                return exists;
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "check RocksDB prefix failed, columnFamily:" + columnFamily.getName());
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -405,6 +567,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         Objects.requireNonNull(prefix, "prefix must not be null");
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
             if (config.isEnableRangeDelete() && deleteRangeByPrefix(columnFamily, prefix)) {
                 return;
             }
@@ -418,11 +581,17 @@ public class RocksDBStoreEngine implements AutoCloseable {
             throws RocksDBException {
         Objects.requireNonNull(batch, "batch must not be null");
         Objects.requireNonNull(prefix, "prefix must not be null");
-        if (config.isEnableRangeDelete() && deleteRangeByPrefix(batch, columnFamily, prefix)) {
-            return true;
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            if (config.isEnableRangeDelete() && deleteRangeByPrefix(batch, columnFamily, prefix)) {
+                return true;
+            }
+            scanDeleteByPrefix(batch, columnFamily, prefix);
+            return false;
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
-        scanDeleteByPrefix(batch, columnFamily, prefix);
-        return false;
     }
 
     /**
@@ -437,13 +606,15 @@ public class RocksDBStoreEngine implements AutoCloseable {
      */
     public boolean deleteRangeByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
         Objects.requireNonNull(prefix, "prefix must not be null");
-        byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
-        if (end == null) {
-            return false;
-        }
         maintenanceLock.readLock().lock();
         try {
+            ensureOpen();
+            byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
+            if (end == null) {
+                return false;
+            }
             db.deleteRange(handle(columnFamily), writeOptions, prefix, end);
+            afterWrite();
             if (config.isRangeDeleteCompactAfterDelete()) {
                 db.compactRange(handle(columnFamily), prefix, end);
             }
@@ -459,12 +630,18 @@ public class RocksDBStoreEngine implements AutoCloseable {
             throws RocksDBException {
         Objects.requireNonNull(batch, "batch must not be null");
         Objects.requireNonNull(prefix, "prefix must not be null");
-        byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
-        if (end == null) {
-            return false;
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            byte[] end = RocksDBKeyCodec.prefixEnd(prefix);
+            if (end == null) {
+                return false;
+            }
+            batch.deleteRange(handle(columnFamily), prefix, end);
+            return true;
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
-        batch.deleteRange(handle(columnFamily), prefix, end);
-        return true;
     }
 
     private void scanDeleteByPrefix(RocksDBColumnFamily columnFamily, byte[] prefix) {
@@ -489,6 +666,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     return;
                 }
                 db.write(writeOptions, batch);
+                afterWrite();
             } catch (RocksDBException e) {
                 throw new StoreException(e, "delete RocksDB prefix failed, columnFamily:" + columnFamily.getName());
             }
@@ -504,14 +682,20 @@ public class RocksDBStoreEngine implements AutoCloseable {
     }
 
     public void flush() {
-        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
-            db.flush(flushOptions, new ArrayList<>(handles.values()));
-        } catch (RocksDBException e) {
-            throw new StoreException(e, "flush RocksDB failed");
+        maintenanceLock.readLock().lock();
+        try {
+            ensureOpen();
+            try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+                db.flush(flushOptions, new ArrayList<>(handles.values()));
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "flush RocksDB failed");
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
-    public ColumnFamilyHandle handle(RocksDBColumnFamily columnFamily) {
+    private ColumnFamilyHandle handle(RocksDBColumnFamily columnFamily) {
         ColumnFamilyHandle handle = handles.get(columnFamily);
         if (handle == null) {
             throw new StoreException("RocksDB column family handle not found:" + columnFamily.getName());
@@ -519,23 +703,70 @@ public class RocksDBStoreEngine implements AutoCloseable {
         return handle;
     }
 
+    private long blockCacheUsage() {
+        if (blockCache == null) {
+            return 0L;
+        }
+        try {
+            return blockCache.getUsage();
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    private long blockCachePinnedUsage() {
+        if (blockCache == null) {
+            return 0L;
+        }
+        try {
+            return blockCache.getPinnedUsage();
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    private long blockCacheCapacity() {
+        return blockCache == null ? 0L : config.getBlockCacheSize();
+    }
+
     @Override
     public void close() {
+        ensureLifecycleWriteLockAcquisitionAllowed();
+        maintenanceLock.writeLock().lock();
+        try {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            RocksDBStoreMetrics.unregister(this);
+            RuntimeException syncFailure = null;
+            try {
+                walSyncController.close();
+            } catch (RuntimeException e) {
+                syncFailure = e;
+            } finally {
+                closeQuietly(
+                        new ArrayList<>(handles.values()),
+                        db,
+                        writeOptions,
+                        readOptions,
+                        columnFamilyOptions,
+                        dbOptions,
+                        blockCache,
+                        statistics);
+            }
+            if (syncFailure != null) {
+                throw syncFailure;
+            }
+        } finally {
+            maintenanceLock.writeLock().unlock();
+        }
+    }
+
+    private void ensureOpen() {
         if (closed) {
-            return;
+            throw new StoreException("RocksDB store engine is closed");
         }
-        closed = true;
-        RocksDBStoreMetrics.unregister(this);
-        for (ColumnFamilyHandle handle : handles.values()) {
-            handle.close();
-        }
-        db.close();
-        writeOptions.close();
-        readOptions.close();
-        columnFamilyOptions.close();
-        dbOptions.close();
-        closeQuietly(blockCache);
-        closeQuietly(statistics);
     }
 
     public static RocksDBStoreDiagnostics closedDiagnostics() {
@@ -549,7 +780,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         return new RocksDBStoreDiagnostics(
                 dbPath,
                 FORMAT_VERSION,
-                rocksDBVersion(),
+                ROCKS_DB_VERSION,
                 syncWrite,
                 true,
                 tuningSummary,
@@ -558,7 +789,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                 new ArrayList<>());
     }
 
-    private static void initMetadata(RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions)
+    private static boolean initMetadata(RocksDB db, ColumnFamilyHandle metadataHandle, WriteOptions writeOptions)
             throws RocksDBException {
         byte[] existing = db.get(metadataHandle, FORMAT_VERSION_KEY);
         if (existing == null) {
@@ -567,7 +798,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
                     writeOptions,
                     FORMAT_VERSION_KEY,
                     Integer.toString(FORMAT_VERSION).getBytes(StandardCharsets.UTF_8));
-            return;
+            return true;
         }
         int existingFormatVersion;
         try {
@@ -579,6 +810,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
             throw new StoreException(
                     "unsupported RocksDB format version:" + existingFormatVersion + ", expected:" + FORMAT_VERSION);
         }
+        return false;
     }
 
     private static void closeQuietly(
@@ -647,18 +879,24 @@ public class RocksDBStoreEngine implements AutoCloseable {
      * Read a DB-level long property. Returns 0 on failure and logs the error.
      */
     public long getLongProperty(String property) {
-        if (closed) {
-            return 0L;
-        }
+        maintenanceLock.readLock().lock();
         try {
-            return db.getAggregatedLongProperty(property);
-        } catch (RocksDBException e) {
-            try {
-                return db.getLongProperty(property);
-            } catch (RocksDBException fallback) {
-                LOGGER.debug("read RocksDB property failed, property:{}, message:{}", property, fallback.getMessage());
+            if (closed) {
                 return 0L;
             }
+            try {
+                return db.getAggregatedLongProperty(property);
+            } catch (RocksDBException e) {
+                try {
+                    return db.getLongProperty(property);
+                } catch (RocksDBException fallback) {
+                    LOGGER.debug(
+                            "read RocksDB property failed, property:{}, message:{}", property, fallback.getMessage());
+                    return 0L;
+                }
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -666,18 +904,23 @@ public class RocksDBStoreEngine implements AutoCloseable {
      * Read a column-family-level long property. Returns 0 on failure and logs the error.
      */
     public long getLongProperty(RocksDBColumnFamily columnFamily, String property) {
-        if (closed) {
-            return 0L;
-        }
+        maintenanceLock.readLock().lock();
         try {
-            return db.getLongProperty(handle(columnFamily), property);
-        } catch (RocksDBException e) {
-            LOGGER.debug(
-                    "read RocksDB column family property failed, columnFamily:{}, property:{}, message:{}",
-                    columnFamily.getName(),
-                    property,
-                    e.getMessage());
-            return 0L;
+            if (closed) {
+                return 0L;
+            }
+            try {
+                return db.getLongProperty(handle(columnFamily), property);
+            } catch (RocksDBException e) {
+                LOGGER.debug(
+                        "read RocksDB column family property failed, columnFamily:{}, property:{}, message:{}",
+                        columnFamily.getName(),
+                        property,
+                        e.getMessage());
+                return 0L;
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -685,14 +928,19 @@ public class RocksDBStoreEngine implements AutoCloseable {
      * Read a DB-level string property. Returns null on failure.
      */
     public String getProperty(String property) {
-        if (closed) {
-            return null;
-        }
+        maintenanceLock.readLock().lock();
         try {
-            return db.getProperty(property);
-        } catch (RocksDBException e) {
-            LOGGER.debug("read RocksDB string property failed, property:{}, message:{}", property, e.getMessage());
-            return null;
+            if (closed) {
+                return null;
+            }
+            try {
+                return db.getProperty(property);
+            } catch (RocksDBException e) {
+                LOGGER.debug("read RocksDB string property failed, property:{}, message:{}", property, e.getMessage());
+                return null;
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -700,18 +948,23 @@ public class RocksDBStoreEngine implements AutoCloseable {
      * Read a column-family-level string property. Returns null on failure.
      */
     public String getProperty(RocksDBColumnFamily columnFamily, String property) {
-        if (closed) {
-            return null;
-        }
+        maintenanceLock.readLock().lock();
         try {
-            return db.getProperty(handle(columnFamily), property);
-        } catch (RocksDBException e) {
-            LOGGER.debug(
-                    "read RocksDB column family string property failed, columnFamily:{}, property:{}, message:{}",
-                    columnFamily.getName(),
-                    property,
-                    e.getMessage());
-            return null;
+            if (closed) {
+                return null;
+            }
+            try {
+                return db.getProperty(handle(columnFamily), property);
+            } catch (RocksDBException e) {
+                LOGGER.debug(
+                        "read RocksDB column family string property failed, columnFamily:{}, property:{}, message:{}",
+                        columnFamily.getName(),
+                        property,
+                        e.getMessage());
+                return null;
+            }
+        } finally {
+            maintenanceLock.readLock().unlock();
         }
     }
 
@@ -759,7 +1012,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
         }
     }
 
-    private static String rocksDBVersion() {
+    private static String readRocksDBVersion() {
         RocksDB.Version version = RocksDB.rocksdbVersion();
         return version == null ? "unknown" : version.toString();
     }
@@ -798,6 +1051,39 @@ public class RocksDBStoreEngine implements AutoCloseable {
         public byte[] getValue() {
             return copy(value);
         }
+    }
+
+    public static class ScanStats {
+        private final int rowsScanned;
+        private final int rowsReturned;
+        private final boolean limitReached;
+
+        public ScanStats(int rowsScanned, int rowsReturned, boolean limitReached) {
+            this.rowsScanned = rowsScanned;
+            this.rowsReturned = rowsReturned;
+            this.limitReached = limitReached;
+        }
+
+        public int getRowsScanned() {
+            return rowsScanned;
+        }
+
+        public int getRowsReturned() {
+            return rowsReturned;
+        }
+
+        public boolean isLimitReached() {
+            return limitReached;
+        }
+    }
+
+    /**
+     * Predicate that controls whether a bounded scan should continue.
+     */
+    @FunctionalInterface
+    public interface RocksDBEntryFilter {
+
+        boolean shouldContinue(byte[] key, byte[] value) throws RocksDBException;
     }
 
     /**

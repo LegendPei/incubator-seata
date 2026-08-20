@@ -101,6 +101,26 @@ public class StoreFileProperties {
     @ConfigurationProperties(prefix = STORE_FILE_ROCKSDB_PREFIX)
     public static class RocksDB {
         private String dir = "sessionStore/rocksdb";
+        private String blockCacheSize = "0";
+        private String writeBufferSize = "0";
+        private Integer maxWriteBufferNumber = 0;
+        private Integer minWriteBufferNumberToMerge = 0;
+        private Integer maxBackgroundJobs = 0;
+        private Integer maxOpenFiles = 0;
+        private String targetFileSizeBase = "0";
+        private Integer level0FileNumCompactionTrigger = 0;
+        private Integer level0SlowdownWritesTrigger = 0;
+        private Integer level0StopWritesTrigger = 0;
+        private Boolean enableStatistics = false;
+        private Boolean optimizeFiltersForHits = false;
+        private String compressionType;
+        private Boolean enableRangeDelete = false;
+        private Boolean rangeDeleteCompactAfterDelete = false;
+        private String walSyncMode = "none";
+        private Integer walSyncIntervalMillis = 2000;
+        private Long walSyncWriteThreshold = 10L;
+        private Boolean walSyncOnShutdown = true;
+        private Integer walSyncWarnThresholdMillis = 1000;
 
         public String getDir() {
             return dir;
@@ -108,6 +128,186 @@ public class StoreFileProperties {
 
         public RocksDB setDir(String dir) {
             this.dir = dir;
+            return this;
+        }
+
+        public String getBlockCacheSize() {
+            return blockCacheSize;
+        }
+
+        public RocksDB setBlockCacheSize(String blockCacheSize) {
+            this.blockCacheSize = blockCacheSize;
+            return this;
+        }
+
+        public String getWriteBufferSize() {
+            return writeBufferSize;
+        }
+
+        public RocksDB setWriteBufferSize(String writeBufferSize) {
+            this.writeBufferSize = writeBufferSize;
+            return this;
+        }
+
+        public Integer getMaxWriteBufferNumber() {
+            return maxWriteBufferNumber;
+        }
+
+        public RocksDB setMaxWriteBufferNumber(Integer maxWriteBufferNumber) {
+            this.maxWriteBufferNumber = maxWriteBufferNumber;
+            return this;
+        }
+
+        public Integer getMinWriteBufferNumberToMerge() {
+            return minWriteBufferNumberToMerge;
+        }
+
+        public RocksDB setMinWriteBufferNumberToMerge(Integer minWriteBufferNumberToMerge) {
+            this.minWriteBufferNumberToMerge = minWriteBufferNumberToMerge;
+            return this;
+        }
+
+        public Integer getMaxBackgroundJobs() {
+            return maxBackgroundJobs;
+        }
+
+        public RocksDB setMaxBackgroundJobs(Integer maxBackgroundJobs) {
+            this.maxBackgroundJobs = maxBackgroundJobs;
+            return this;
+        }
+
+        public Integer getMaxOpenFiles() {
+            return maxOpenFiles;
+        }
+
+        public RocksDB setMaxOpenFiles(Integer maxOpenFiles) {
+            this.maxOpenFiles = maxOpenFiles;
+            return this;
+        }
+
+        public String getTargetFileSizeBase() {
+            return targetFileSizeBase;
+        }
+
+        public RocksDB setTargetFileSizeBase(String targetFileSizeBase) {
+            this.targetFileSizeBase = targetFileSizeBase;
+            return this;
+        }
+
+        public Integer getLevel0FileNumCompactionTrigger() {
+            return level0FileNumCompactionTrigger;
+        }
+
+        public RocksDB setLevel0FileNumCompactionTrigger(Integer level0FileNumCompactionTrigger) {
+            this.level0FileNumCompactionTrigger = level0FileNumCompactionTrigger;
+            return this;
+        }
+
+        public Integer getLevel0SlowdownWritesTrigger() {
+            return level0SlowdownWritesTrigger;
+        }
+
+        public RocksDB setLevel0SlowdownWritesTrigger(Integer level0SlowdownWritesTrigger) {
+            this.level0SlowdownWritesTrigger = level0SlowdownWritesTrigger;
+            return this;
+        }
+
+        public Integer getLevel0StopWritesTrigger() {
+            return level0StopWritesTrigger;
+        }
+
+        public RocksDB setLevel0StopWritesTrigger(Integer level0StopWritesTrigger) {
+            this.level0StopWritesTrigger = level0StopWritesTrigger;
+            return this;
+        }
+
+        public Boolean getEnableStatistics() {
+            return enableStatistics;
+        }
+
+        public RocksDB setEnableStatistics(Boolean enableStatistics) {
+            this.enableStatistics = enableStatistics;
+            return this;
+        }
+
+        public Boolean getOptimizeFiltersForHits() {
+            return optimizeFiltersForHits;
+        }
+
+        public RocksDB setOptimizeFiltersForHits(Boolean optimizeFiltersForHits) {
+            this.optimizeFiltersForHits = optimizeFiltersForHits;
+            return this;
+        }
+
+        public String getCompressionType() {
+            return compressionType;
+        }
+
+        public RocksDB setCompressionType(String compressionType) {
+            this.compressionType = compressionType;
+            return this;
+        }
+
+        public Boolean getEnableRangeDelete() {
+            return enableRangeDelete;
+        }
+
+        public RocksDB setEnableRangeDelete(Boolean enableRangeDelete) {
+            this.enableRangeDelete = enableRangeDelete;
+            return this;
+        }
+
+        public Boolean getRangeDeleteCompactAfterDelete() {
+            return rangeDeleteCompactAfterDelete;
+        }
+
+        public RocksDB setRangeDeleteCompactAfterDelete(Boolean rangeDeleteCompactAfterDelete) {
+            this.rangeDeleteCompactAfterDelete = rangeDeleteCompactAfterDelete;
+            return this;
+        }
+
+        public String getWalSyncMode() {
+            return walSyncMode;
+        }
+
+        public RocksDB setWalSyncMode(String walSyncMode) {
+            this.walSyncMode = walSyncMode;
+            return this;
+        }
+
+        public Integer getWalSyncIntervalMillis() {
+            return walSyncIntervalMillis;
+        }
+
+        public RocksDB setWalSyncIntervalMillis(Integer walSyncIntervalMillis) {
+            this.walSyncIntervalMillis = walSyncIntervalMillis;
+            return this;
+        }
+
+        public Long getWalSyncWriteThreshold() {
+            return walSyncWriteThreshold;
+        }
+
+        public RocksDB setWalSyncWriteThreshold(Long walSyncWriteThreshold) {
+            this.walSyncWriteThreshold = walSyncWriteThreshold;
+            return this;
+        }
+
+        public Boolean getWalSyncOnShutdown() {
+            return walSyncOnShutdown;
+        }
+
+        public RocksDB setWalSyncOnShutdown(Boolean walSyncOnShutdown) {
+            this.walSyncOnShutdown = walSyncOnShutdown;
+            return this;
+        }
+
+        public Integer getWalSyncWarnThresholdMillis() {
+            return walSyncWarnThresholdMillis;
+        }
+
+        public RocksDB setWalSyncWarnThresholdMillis(Integer walSyncWarnThresholdMillis) {
+            this.walSyncWarnThresholdMillis = walSyncWarnThresholdMillis;
             return this;
         }
     }

@@ -38,6 +38,11 @@ public class RocksDBStoreConfig {
 
     private static final long DEFAULT_LONG_OPTION = 0L;
     private static final int DEFAULT_INT_OPTION = 0;
+    static final RocksDBWalSyncMode DEFAULT_WAL_SYNC_MODE = RocksDBWalSyncMode.NONE;
+    static final int DEFAULT_WAL_SYNC_INTERVAL_MILLIS = 2000;
+    static final long DEFAULT_WAL_SYNC_WRITE_THRESHOLD = 10L;
+    static final boolean DEFAULT_WAL_SYNC_ON_SHUTDOWN = true;
+    static final int DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS = 1000;
 
     private final String dbPath;
     private final boolean syncWrite;
@@ -56,6 +61,11 @@ public class RocksDBStoreConfig {
     private final String compressionType;
     private final boolean enableRangeDelete;
     private final boolean rangeDeleteCompactAfterDelete;
+    private final RocksDBWalSyncMode walSyncMode;
+    private final int walSyncIntervalMillis;
+    private final long walSyncWriteThreshold;
+    private final boolean walSyncOnShutdown;
+    private final int walSyncWarnThresholdMillis;
 
     public RocksDBStoreConfig(String dbPath, boolean syncWrite) {
         this(dbPath, syncWrite, false);
@@ -79,7 +89,12 @@ public class RocksDBStoreConfig {
                 false,
                 null,
                 enableRangeDelete,
-                false);
+                false,
+                DEFAULT_WAL_SYNC_MODE,
+                DEFAULT_WAL_SYNC_INTERVAL_MILLIS,
+                DEFAULT_WAL_SYNC_WRITE_THRESHOLD,
+                DEFAULT_WAL_SYNC_ON_SHUTDOWN,
+                DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS);
     }
 
     public RocksDBStoreConfig(
@@ -115,7 +130,12 @@ public class RocksDBStoreConfig {
                 optimizeFiltersForHits,
                 compressionType,
                 false,
-                false);
+                false,
+                DEFAULT_WAL_SYNC_MODE,
+                DEFAULT_WAL_SYNC_INTERVAL_MILLIS,
+                DEFAULT_WAL_SYNC_WRITE_THRESHOLD,
+                DEFAULT_WAL_SYNC_ON_SHUTDOWN,
+                DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS);
     }
 
     public RocksDBStoreConfig(
@@ -152,7 +172,12 @@ public class RocksDBStoreConfig {
                 optimizeFiltersForHits,
                 compressionType,
                 enableRangeDelete,
-                false);
+                false,
+                DEFAULT_WAL_SYNC_MODE,
+                DEFAULT_WAL_SYNC_INTERVAL_MILLIS,
+                DEFAULT_WAL_SYNC_WRITE_THRESHOLD,
+                DEFAULT_WAL_SYNC_ON_SHUTDOWN,
+                DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS);
     }
 
     public RocksDBStoreConfig(
@@ -173,6 +198,54 @@ public class RocksDBStoreConfig {
             String compressionType,
             boolean enableRangeDelete,
             boolean rangeDeleteCompactAfterDelete) {
+        this(
+                dbPath,
+                syncWrite,
+                blockCacheSize,
+                writeBufferSize,
+                maxWriteBufferNumber,
+                minWriteBufferNumberToMerge,
+                maxBackgroundJobs,
+                maxOpenFiles,
+                targetFileSizeBase,
+                level0FileNumCompactionTrigger,
+                level0SlowdownWritesTrigger,
+                level0StopWritesTrigger,
+                enableStatistics,
+                optimizeFiltersForHits,
+                compressionType,
+                enableRangeDelete,
+                rangeDeleteCompactAfterDelete,
+                DEFAULT_WAL_SYNC_MODE,
+                DEFAULT_WAL_SYNC_INTERVAL_MILLIS,
+                DEFAULT_WAL_SYNC_WRITE_THRESHOLD,
+                DEFAULT_WAL_SYNC_ON_SHUTDOWN,
+                DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS);
+    }
+
+    public RocksDBStoreConfig(
+            String dbPath,
+            boolean syncWrite,
+            long blockCacheSize,
+            long writeBufferSize,
+            int maxWriteBufferNumber,
+            int minWriteBufferNumberToMerge,
+            int maxBackgroundJobs,
+            int maxOpenFiles,
+            long targetFileSizeBase,
+            int level0FileNumCompactionTrigger,
+            int level0SlowdownWritesTrigger,
+            int level0StopWritesTrigger,
+            boolean enableStatistics,
+            boolean optimizeFiltersForHits,
+            String compressionType,
+            boolean enableRangeDelete,
+            boolean rangeDeleteCompactAfterDelete,
+            RocksDBWalSyncMode walSyncMode,
+            int walSyncIntervalMillis,
+            long walSyncWriteThreshold,
+            boolean walSyncOnShutdown,
+            int walSyncWarnThresholdMillis) {
         this.dbPath = dbPath;
         this.syncWrite = syncWrite;
         this.blockCacheSize = nonNegative(blockCacheSize, ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE);
@@ -198,6 +271,14 @@ public class RocksDBStoreConfig {
         this.compressionType = StringUtils.isBlank(compressionType) ? null : compressionType.trim();
         this.enableRangeDelete = enableRangeDelete;
         this.rangeDeleteCompactAfterDelete = rangeDeleteCompactAfterDelete;
+        this.walSyncMode = walSyncMode == null ? DEFAULT_WAL_SYNC_MODE : walSyncMode;
+        this.walSyncIntervalMillis =
+                positive(walSyncIntervalMillis, ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS);
+        this.walSyncWriteThreshold =
+                positive(walSyncWriteThreshold, ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD);
+        this.walSyncOnShutdown = walSyncOnShutdown;
+        this.walSyncWarnThresholdMillis = positive(
+                walSyncWarnThresholdMillis, ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS);
     }
 
     public static RocksDBStoreConfig fromConfiguration() {
@@ -232,7 +313,25 @@ public class RocksDBStoreConfig {
                 config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS, false),
                 config.getConfig(ConfigurationKeys.STORE_FILE_ROCKSDB_COMPRESSION_TYPE),
                 config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_ENABLE_RANGE_DELETE, false),
-                config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_RANGE_DELETE_COMPACT_AFTER_DELETE, false));
+                config.getBoolean(ConfigurationKeys.STORE_FILE_ROCKSDB_RANGE_DELETE_COMPACT_AFTER_DELETE, false),
+                walSyncMode(config.getConfig(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_MODE)),
+                positive(
+                        config.getInt(
+                                ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS,
+                                DEFAULT_WAL_SYNC_INTERVAL_MILLIS),
+                        ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS),
+                positive(
+                        config.getLong(
+                                ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD,
+                                DEFAULT_WAL_SYNC_WRITE_THRESHOLD),
+                        ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD),
+                config.getBoolean(
+                        ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_ON_SHUTDOWN, DEFAULT_WAL_SYNC_ON_SHUTDOWN),
+                positive(
+                        config.getInt(
+                                ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS,
+                                DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS),
+                        ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS));
     }
 
     public String getDbPath() {
@@ -303,6 +402,30 @@ public class RocksDBStoreConfig {
         return rangeDeleteCompactAfterDelete;
     }
 
+    public RocksDBWalSyncMode getWalSyncMode() {
+        return walSyncMode;
+    }
+
+    public int getWalSyncIntervalMillis() {
+        return walSyncIntervalMillis;
+    }
+
+    public long getWalSyncWriteThreshold() {
+        return walSyncWriteThreshold;
+    }
+
+    public boolean isWalSyncOnShutdown() {
+        return walSyncOnShutdown;
+    }
+
+    public int getWalSyncWarnThresholdMillis() {
+        return walSyncWarnThresholdMillis;
+    }
+
+    public boolean isPeriodicWalSyncEnabled() {
+        return !syncWrite && walSyncMode.isPeriodic();
+    }
+
     public String tuningSummary() {
         return "blockCacheSize="
                 + blockCacheSize
@@ -333,7 +456,17 @@ public class RocksDBStoreConfig {
                 + ", enableRangeDelete="
                 + enableRangeDelete
                 + ", rangeDeleteCompactAfterDelete="
-                + rangeDeleteCompactAfterDelete;
+                + rangeDeleteCompactAfterDelete
+                + ", walSyncMode="
+                + walSyncMode.configValue()
+                + ", walSyncIntervalMillis="
+                + walSyncIntervalMillis
+                + ", walSyncWriteThreshold="
+                + walSyncWriteThreshold
+                + ", walSyncOnShutdown="
+                + walSyncOnShutdown
+                + ", walSyncWarnThresholdMillis="
+                + walSyncWarnThresholdMillis;
     }
 
     @Override
@@ -360,6 +493,11 @@ public class RocksDBStoreConfig {
                 && optimizeFiltersForHits == that.optimizeFiltersForHits
                 && enableRangeDelete == that.enableRangeDelete
                 && rangeDeleteCompactAfterDelete == that.rangeDeleteCompactAfterDelete
+                && walSyncIntervalMillis == that.walSyncIntervalMillis
+                && walSyncWriteThreshold == that.walSyncWriteThreshold
+                && walSyncOnShutdown == that.walSyncOnShutdown
+                && walSyncWarnThresholdMillis == that.walSyncWarnThresholdMillis
+                && walSyncMode == that.walSyncMode
                 && Objects.equals(dbPath, that.dbPath)
                 && Objects.equals(compressionType, that.compressionType);
     }
@@ -383,11 +521,27 @@ public class RocksDBStoreConfig {
                 optimizeFiltersForHits,
                 compressionType,
                 enableRangeDelete,
-                rangeDeleteCompactAfterDelete);
+                rangeDeleteCompactAfterDelete,
+                walSyncMode,
+                walSyncIntervalMillis,
+                walSyncWriteThreshold,
+                walSyncOnShutdown,
+                walSyncWarnThresholdMillis);
     }
 
     private static int intOption(Configuration config, String key) {
         return nonNegative(config.getInt(key, DEFAULT_INT_OPTION), key);
+    }
+
+    private static RocksDBWalSyncMode walSyncMode(String value) {
+        try {
+            return RocksDBWalSyncMode.of(value);
+        } catch (IllegalArgumentException e) {
+            throw new StoreException(
+                    e,
+                    "invalid RocksDB WAL sync mode, key:" + ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_MODE
+                            + ", value:" + value);
+        }
     }
 
     private static long sizeOption(Configuration config, String key) {
@@ -430,6 +584,20 @@ public class RocksDBStoreConfig {
     private static long nonNegative(long value, String key) {
         if (value < 0) {
             throw new StoreException("RocksDB config must be non-negative, key:" + key + ", value:" + value);
+        }
+        return value;
+    }
+
+    private static int positive(int value, String key) {
+        if (value <= 0) {
+            throw new StoreException("RocksDB config must be positive, key:" + key + ", value:" + value);
+        }
+        return value;
+    }
+
+    private static long positive(long value, String key) {
+        if (value <= 0) {
+            throw new StoreException("RocksDB config must be positive, key:" + key + ", value:" + value);
         }
         return value;
     }

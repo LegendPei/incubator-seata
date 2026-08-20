@@ -207,7 +207,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (oldValue != null) {
                 indexManager.deleteGlobalIndexes(batch, decodeGlobalSession(oldValue, true));
             }
-            batch.put(storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION), key, encodeGlobalSession(session));
+            storeEngine.put(batch, RocksDBColumnFamily.GLOBAL_SESSION, key, encodeGlobalSession(session));
             indexManager.putGlobalIndexes(batch, session);
             storeEngine.write(batch);
         } catch (RocksDBException e) {
@@ -222,9 +222,8 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (oldValue != null) {
                 indexManager.deleteGlobalIndexes(batch, decodeGlobalSession(oldValue, true));
             }
-            batch.delete(
-                    storeEngine.handle(RocksDBColumnFamily.GLOBAL_SESSION),
-                    RocksDBKeyCodec.encodeXid(session.getXid()));
+            storeEngine.delete(
+                    batch, RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(session.getXid()));
             storeEngine.deleteByPrefix(
                     batch, RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(session.getXid()));
             storeEngine.write(batch);
@@ -284,16 +283,23 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
     private List<GlobalSession> readByStatuses(SessionCondition sessionCondition) {
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
+        Long overTimeAliveMills = sessionCondition.getOverTimeAliveMills();
+        Long maxBeginTime = overTimeAliveMills != null && overTimeAliveMills > 0
+                ? System.currentTimeMillis() - overTimeAliveMills
+                : null;
         for (GlobalStatus status : sessionCondition.getStatuses()) {
-            indexManager.scanXidsByStatus(status, xid -> {
+            Iterable<String> xids = maxBeginTime == null
+                    ? indexManager.scanXidsByStatus(status)
+                    : indexManager.scanXidsByStatus(status, maxBeginTime, 0).getXids();
+            for (String xid : xids) {
                 if (!seenXids.add(xid)) {
-                    return;
+                    continue;
                 }
                 GlobalSession globalSession = readSession(xid, !sessionCondition.isLazyLoadBranch());
                 if (globalSession != null && matches(globalSession, sessionCondition)) {
                     result.add(globalSession);
                 }
-            });
+            }
         }
         return result;
     }

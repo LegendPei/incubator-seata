@@ -69,6 +69,7 @@ public class RocksDBStoreDiagnostics {
     private final long blockCacheUsage;
     private final long blockCachePinnedUsage;
     private final long blockCacheCapacity;
+    private final RocksDBWalSyncStats walSyncStats;
 
     public RocksDBStoreDiagnostics(
             String dbPath,
@@ -92,7 +93,8 @@ public class RocksDBStoreDiagnostics {
                 errors,
                 0L,
                 0L,
-                0L);
+                0L,
+                RocksDBWalSyncStats.NONE);
     }
 
     public RocksDBStoreDiagnostics(
@@ -108,6 +110,36 @@ public class RocksDBStoreDiagnostics {
             long blockCacheUsage,
             long blockCachePinnedUsage,
             long blockCacheCapacity) {
+        this(
+                dbPath,
+                formatVersion,
+                rocksDBVersion,
+                syncWrite,
+                closed,
+                tuningSummary,
+                properties,
+                columnFamilyProperties,
+                errors,
+                blockCacheUsage,
+                blockCachePinnedUsage,
+                blockCacheCapacity,
+                RocksDBWalSyncStats.NONE);
+    }
+
+    public RocksDBStoreDiagnostics(
+            String dbPath,
+            int formatVersion,
+            String rocksDBVersion,
+            boolean syncWrite,
+            boolean closed,
+            String tuningSummary,
+            Map<String, Long> properties,
+            Map<RocksDBColumnFamily, Map<String, Long>> columnFamilyProperties,
+            List<String> errors,
+            long blockCacheUsage,
+            long blockCachePinnedUsage,
+            long blockCacheCapacity,
+            RocksDBWalSyncStats walSyncStats) {
         this.dbPath = dbPath;
         this.formatVersion = formatVersion;
         this.rocksDBVersion = rocksDBVersion;
@@ -120,6 +152,7 @@ public class RocksDBStoreDiagnostics {
         this.blockCacheUsage = blockCacheUsage;
         this.blockCachePinnedUsage = blockCachePinnedUsage;
         this.blockCacheCapacity = blockCacheCapacity;
+        this.walSyncStats = walSyncStats == null ? RocksDBWalSyncStats.NONE : walSyncStats;
     }
 
     public String getDbPath() {
@@ -181,6 +214,10 @@ public class RocksDBStoreDiagnostics {
 
     public boolean isBlockCacheEnabled() {
         return blockCacheCapacity > 0;
+    }
+
+    public RocksDBWalSyncStats getWalSyncStats() {
+        return walSyncStats;
     }
 
     private static Map<RocksDBColumnFamily, Map<String, Long>> unmodifiableColumnFamilyProperties(

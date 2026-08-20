@@ -116,6 +116,34 @@ class RocksDBIndexManagerTest {
     }
 
     @Test
+    void testScanXidsByStatusBeforeBeginTimeDeadlineStopsAtBoundary() {
+        try (RocksDBStoreEngine engine = open("bounded-status")) {
+            GlobalSession old = globalSession("tx-old", GlobalStatus.Begin);
+            old.setBeginTime(100L);
+            GlobalSession deadline = globalSession("tx-deadline", GlobalStatus.Begin);
+            deadline.setBeginTime(200L);
+            GlobalSession future = globalSession("tx-future", GlobalStatus.Begin);
+            future.setBeginTime(300L);
+            GlobalSession otherStatus = globalSession("tx-other-status", GlobalStatus.Committing);
+            otherStatus.setBeginTime(50L);
+            putGlobal(engine, old);
+            putGlobal(engine, deadline);
+            putGlobal(engine, future);
+            putGlobal(engine, otherStatus);
+
+            RocksDBIndexManager indexManager = new RocksDBIndexManager(engine);
+            indexManager.ensureReady();
+
+            RocksDBIndexManager.StatusScanResult result = indexManager.scanXidsByStatus(GlobalStatus.Begin, 200L, 10);
+
+            Assertions.assertEquals(List.of(old.getXid(), deadline.getXid()), result.getXids());
+            Assertions.assertEquals(3, result.getRowsScanned());
+            Assertions.assertEquals(2, result.getRowsReturned());
+            Assertions.assertFalse(result.isLimitReached());
+        }
+    }
+
+    @Test
     void testFutureIndexVersionFailsFast() {
         try (RocksDBStoreEngine engine = open("future")) {
             engine.put(

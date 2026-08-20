@@ -27,6 +27,8 @@ import org.apache.seata.server.storage.rocksdb.RocksDBLocalLocks;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 
+import java.util.Arrays;
+
 /**
  * RocksDB lock manager for file store engine.
  */
@@ -40,7 +42,11 @@ public class RocksDBLockManager extends AbstractLockManager {
     }
 
     public RocksDBLockManager(RocksDBStoreEngine storeEngine) {
-        this.locker = new RocksDBLocker(storeEngine, new RocksDBLocalLocks());
+        this(storeEngine, RocksDBLocker.DEFAULT_LOCK_INDEX_SCAN_BATCH_SIZE);
+    }
+
+    RocksDBLockManager(RocksDBStoreEngine storeEngine, int lockIndexScanBatchSize) {
+        this.locker = new RocksDBLocker(storeEngine, new RocksDBLocalLocks(), lockIndexScanBatchSize);
     }
 
     @Override
@@ -67,8 +73,50 @@ public class RocksDBLockManager extends AbstractLockManager {
         return locker.cleanOrphanLocks();
     }
 
+    public CleanOrphanLocksResult cleanOrphanLocks(int limit) {
+        return locker.cleanOrphanLocks(limit);
+    }
+
+    public CleanOrphanLocksResult cleanOrphanLocks(byte[] seekKey, int limit) {
+        return locker.cleanOrphanLocks(seekKey, limit);
+    }
+
     @Override
     protected Locker getLocker(BranchSession branchSession) {
         return locker;
+    }
+
+    public static class CleanOrphanLocksResult {
+        private final int cleaned;
+        private final int scanned;
+        private final boolean limitReached;
+        private final byte[] nextSeekKey;
+
+        CleanOrphanLocksResult(int cleaned, int scanned, boolean limitReached, byte[] nextSeekKey) {
+            this.cleaned = cleaned;
+            this.scanned = scanned;
+            this.limitReached = limitReached;
+            this.nextSeekKey = copy(nextSeekKey);
+        }
+
+        public int getCleaned() {
+            return cleaned;
+        }
+
+        public int getScanned() {
+            return scanned;
+        }
+
+        public boolean isLimitReached() {
+            return limitReached;
+        }
+
+        public byte[] getNextSeekKey() {
+            return copy(nextSeekKey);
+        }
+
+        private static byte[] copy(byte[] value) {
+            return value == null ? null : Arrays.copyOf(value, value.length);
+        }
     }
 }

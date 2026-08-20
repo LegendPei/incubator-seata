@@ -52,13 +52,21 @@ import static org.apache.seata.core.exception.TransactionExceptionCode.LockKeyCo
 public class RocksDBLocker extends AbstractLocker {
 
     private static final byte[] EMPTY_VALUE = new byte[0];
+    static final int DEFAULT_LOCK_INDEX_SCAN_BATCH_SIZE = 1024;
 
     private final RocksDBStoreEngine storeEngine;
     private final RocksDBLocalLocks localLocks;
+    private final int lockIndexScanBatchSize;
 
     public RocksDBLocker(RocksDBStoreEngine storeEngine, RocksDBLocalLocks localLocks) {
+        this(storeEngine, localLocks, DEFAULT_LOCK_INDEX_SCAN_BATCH_SIZE);
+    }
+
+    RocksDBLocker(RocksDBStoreEngine storeEngine, RocksDBLocalLocks localLocks, int lockIndexScanBatchSize) {
         this.storeEngine = storeEngine;
         this.localLocks = localLocks;
+        this.lockIndexScanBatchSize =
+                lockIndexScanBatchSize > 0 ? lockIndexScanBatchSize : DEFAULT_LOCK_INDEX_SCAN_BATCH_SIZE;
     }
 
     @Override
@@ -130,9 +138,10 @@ public class RocksDBLocker extends AbstractLocker {
                     continue;
                 }
                 byte[] lockKey = encodeLockKey(lockDO);
-                batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
-                batch.delete(
-                        storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX),
+                storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
+                storeEngine.delete(
+                        batch,
+                        RocksDBColumnFamily.LOCK_BRANCH_INDEX,
                         RocksDBKeyCodec.encodeLockBranchIndex(lockDO.getXid(), lockDO.getBranchId(), lockKey));
             }
             storeEngine.write(batch);
@@ -186,24 +195,35 @@ public class RocksDBLocker extends AbstractLocker {
         if (StringUtils.isBlank(xid)) {
             return;
         }
-        List<RocksDBStoreEngine.RocksDBEntry> indexEntries = storeEngine.prefixScan(
-                RocksDBColumnFamily.LOCK_BRANCH_INDEX, RocksDBKeyCodec.encodeLockBranchIndexGlobalPrefix(xid));
-        try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
-                WriteBatch batch = new WriteBatch()) {
-            for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
-                byte[] lockKey = indexEntry.getValue();
-                byte[] value = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
-                if (value == null) {
-                    continue;
+        byte[] indexPrefix = RocksDBKeyCodec.encodeLockBranchIndexGlobalPrefix(xid);
+        byte[] seekKey = indexPrefix;
+        try {
+            while (seekKey != null) {
+                List<RocksDBStoreEngine.RocksDBEntry> indexEntries =
+                        scanLockBranchIndex(seekKey, indexPrefix, lockIndexScanBatchSize);
+                if (CollectionUtils.isEmpty(indexEntries)) {
+                    break;
                 }
-                LockDO lockDO = decodeLock(value);
-                if (!StringUtils.equals(lockDO.getXid(), xid)) {
-                    continue;
+
+                try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
+                        WriteBatch batch = new WriteBatch()) {
+                    for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
+                        byte[] lockKey = indexEntry.getValue();
+                        byte[] value = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
+                        if (value == null) {
+                            continue;
+                        }
+                        LockDO lockDO = decodeLock(value);
+                        if (!StringUtils.equals(lockDO.getXid(), xid)) {
+                            continue;
+                        }
+                        lockDO.setStatus(lockStatus.getCode());
+                        storeEngine.put(batch, RocksDBColumnFamily.LOCK, lockKey, encodeLock(lockDO));
+                    }
+                    storeEngine.write(batch);
                 }
-                lockDO.setStatus(lockStatus.getCode());
-                batch.put(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey, encodeLock(lockDO));
+                seekKey = nextLockBranchIndexSeekKey(indexPrefix, indexEntries);
             }
-            storeEngine.write(batch);
         } catch (RocksDBException e) {
             throw new StoreException(e, "update RocksDB lock status failed, xid:" + xid);
         }
@@ -221,10 +241,22 @@ public class RocksDBLocker extends AbstractLocker {
     }
 
     public int cleanOrphanLocks() {
-        List<RocksDBStoreEngine.RocksDBEntry> indexEntries =
-                storeEngine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, EMPTY_VALUE);
+        return cleanOrphanLocks(0).getCleaned();
+    }
+
+    public RocksDBLockManager.CleanOrphanLocksResult cleanOrphanLocks(int limit) {
+        return cleanOrphanLocks(EMPTY_VALUE, limit);
+    }
+
+    public RocksDBLockManager.CleanOrphanLocksResult cleanOrphanLocks(byte[] seekKey, int limit) {
+        byte[] actualSeekKey = seekKey == null ? EMPTY_VALUE : Arrays.copyOf(seekKey, seekKey.length);
+        LockBranchIndexScanResult scanResult = scanLockBranchIndexWithStats(actualSeekKey, EMPTY_VALUE, limit);
+        List<RocksDBStoreEngine.RocksDBEntry> indexEntries = scanResult.getIndexEntries();
+        boolean limitReached = scanResult.getStats().isLimitReached();
+        byte[] nextSeekKey = limitReached ? nextLockBranchIndexSeekKey(EMPTY_VALUE, indexEntries, limit) : null;
         if (CollectionUtils.isEmpty(indexEntries)) {
-            return 0;
+            return new RocksDBLockManager.CleanOrphanLocksResult(
+                    0, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
         }
         int cleaned = 0;
         try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
@@ -233,7 +265,7 @@ public class RocksDBLocker extends AbstractLocker {
                 byte[] lockKey = indexEntry.getValue();
                 byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
                 if (lockValue == null) {
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     cleaned++;
                     continue;
                 }
@@ -242,7 +274,7 @@ public class RocksDBLocker extends AbstractLocker {
                 byte[] expectedIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
                         existingLock.getXid(), existingLock.getBranchId(), lockKey);
                 if (!Arrays.equals(expectedIndexKey, indexEntry.getKey())) {
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     cleaned++;
                     continue;
                 }
@@ -251,15 +283,76 @@ public class RocksDBLocker extends AbstractLocker {
                                 RocksDBColumnFamily.BRANCH_SESSION,
                                 RocksDBKeyCodec.encodeBranch(existingLock.getXid(), existingLock.getBranchId()))
                         == null) {
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
-                    batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexEntry.getKey());
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
+                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     cleaned++;
                 }
             }
             storeEngine.write(batch);
-            return cleaned;
+            return new RocksDBLockManager.CleanOrphanLocksResult(
+                    cleaned, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
         } catch (RocksDBException e) {
             throw new StoreException(e, "clean RocksDB orphan locks failed");
+        }
+    }
+
+    private List<RocksDBStoreEngine.RocksDBEntry> scanLockBranchIndex(byte[] prefix, int limit) {
+        return scanLockBranchIndexWithStats(prefix, prefix, limit).getIndexEntries();
+    }
+
+    private List<RocksDBStoreEngine.RocksDBEntry> scanLockBranchIndex(byte[] seekKey, byte[] prefix, int limit) {
+        return scanLockBranchIndexWithStats(seekKey, prefix, limit).getIndexEntries();
+    }
+
+    private LockBranchIndexScanResult scanLockBranchIndexWithStats(byte[] prefix, int limit) {
+        return scanLockBranchIndexWithStats(prefix, prefix, limit);
+    }
+
+    private LockBranchIndexScanResult scanLockBranchIndexWithStats(byte[] seekKey, byte[] prefix, int limit) {
+        List<RocksDBStoreEngine.RocksDBEntry> indexEntries = new ArrayList<>();
+        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
+                RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+                seekKey,
+                prefix,
+                limit,
+                null,
+                (key, value) -> indexEntries.add(new RocksDBStoreEngine.RocksDBEntry(key, value)));
+        return new LockBranchIndexScanResult(indexEntries, stats);
+    }
+
+    private byte[] nextLockBranchIndexSeekKey(byte[] prefix, List<RocksDBStoreEngine.RocksDBEntry> indexEntries) {
+        return nextLockBranchIndexSeekKey(prefix, indexEntries, lockIndexScanBatchSize);
+    }
+
+    private byte[] nextLockBranchIndexSeekKey(
+            byte[] prefix, List<RocksDBStoreEngine.RocksDBEntry> indexEntries, int batchSize) {
+        if (batchSize <= 0 || indexEntries.size() < batchSize) {
+            return null;
+        }
+        byte[] nextSeekKey = RocksDBKeyCodec.prefixEnd(
+                indexEntries.get(indexEntries.size() - 1).getKey());
+        if (nextSeekKey == null || !RocksDBKeyCodec.startsWith(nextSeekKey, prefix)) {
+            return null;
+        }
+        return nextSeekKey;
+    }
+
+    private static final class LockBranchIndexScanResult {
+        private final List<RocksDBStoreEngine.RocksDBEntry> indexEntries;
+        private final RocksDBStoreEngine.ScanStats stats;
+
+        private LockBranchIndexScanResult(
+                List<RocksDBStoreEngine.RocksDBEntry> indexEntries, RocksDBStoreEngine.ScanStats stats) {
+            this.indexEntries = indexEntries;
+            this.stats = stats;
+        }
+
+        private List<RocksDBStoreEngine.RocksDBEntry> getIndexEntries() {
+            return indexEntries;
+        }
+
+        private RocksDBStoreEngine.ScanStats getStats() {
+            return stats;
         }
     }
 
@@ -267,9 +360,10 @@ public class RocksDBLocker extends AbstractLocker {
         try (WriteBatch batch = new WriteBatch()) {
             for (LockDO lockDO : lockDOs) {
                 byte[] lockKey = encodeLockKey(lockDO);
-                batch.put(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey, encodeLock(lockDO));
-                batch.put(
-                        storeEngine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX),
+                storeEngine.put(batch, RocksDBColumnFamily.LOCK, lockKey, encodeLock(lockDO));
+                storeEngine.put(
+                        batch,
+                        RocksDBColumnFamily.LOCK_BRANCH_INDEX,
                         RocksDBKeyCodec.encodeLockBranchIndex(lockDO.getXid(), lockDO.getBranchId(), lockKey),
                         lockKey);
             }
@@ -280,26 +374,33 @@ public class RocksDBLocker extends AbstractLocker {
     }
 
     private boolean releaseByIndex(byte[] indexPrefix, String xid, Long branchId) {
-        List<RocksDBStoreEngine.RocksDBEntry> indexEntries =
-                storeEngine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexPrefix);
-        if (CollectionUtils.isEmpty(indexEntries)) {
-            return true;
-        }
-        try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
-                WriteBatch batch = new WriteBatch()) {
-            for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
-                byte[] lockKey = indexEntry.getValue();
-                byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
-                if (lockValue != null) {
-                    LockDO existingLock = decodeLock(lockValue);
-                    if (StringUtils.equals(existingLock.getXid(), xid)
-                            && (branchId == null || branchId.equals(existingLock.getBranchId()))) {
-                        batch.delete(storeEngine.handle(RocksDBColumnFamily.LOCK), lockKey);
-                    }
+        byte[] seekKey = indexPrefix;
+        try {
+            while (seekKey != null) {
+                List<RocksDBStoreEngine.RocksDBEntry> indexEntries =
+                        scanLockBranchIndex(seekKey, indexPrefix, lockIndexScanBatchSize);
+                if (CollectionUtils.isEmpty(indexEntries)) {
+                    break;
                 }
+
+                try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
+                        WriteBatch batch = new WriteBatch()) {
+                    for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
+                        byte[] lockKey = indexEntry.getValue();
+                        byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
+                        if (lockValue != null) {
+                            LockDO existingLock = decodeLock(lockValue);
+                            if (StringUtils.equals(existingLock.getXid(), xid)
+                                    && (branchId == null || branchId.equals(existingLock.getBranchId()))) {
+                                storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
+                            }
+                        }
+                        storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
+                    }
+                    storeEngine.write(batch);
+                }
+                seekKey = nextLockBranchIndexSeekKey(indexPrefix, indexEntries);
             }
-            storeEngine.deleteByPrefix(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexPrefix);
-            storeEngine.write(batch);
             return true;
         } catch (RocksDBException e) {
             throw new StoreException(e, "release RocksDB locks failed");

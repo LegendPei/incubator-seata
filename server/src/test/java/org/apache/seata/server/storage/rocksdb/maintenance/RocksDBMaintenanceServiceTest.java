@@ -313,8 +313,8 @@ class RocksDBMaintenanceServiceTest {
             byte[] indexKey = RocksDBKeyCodec.encodeLockBranchIndex(global.getXid(), 1L, lockKey);
 
             try (WriteBatch batch = new WriteBatch()) {
-                batch.put(engine.handle(RocksDBColumnFamily.LOCK), lockKey, lockValue);
-                batch.put(engine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexKey, lockKey);
+                engine.put(batch, RocksDBColumnFamily.LOCK, lockKey, lockValue);
+                engine.put(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexKey, lockKey);
                 engine.write(batch);
             } catch (Exception e) {
                 Assertions.fail(e);
@@ -337,8 +337,8 @@ class RocksDBMaintenanceServiceTest {
             byte[] indexKey = RocksDBKeyCodec.encodeLockBranchIndex("xid-gone", 1L, lockKey);
 
             try (WriteBatch batch = new WriteBatch()) {
-                batch.put(engine.handle(RocksDBColumnFamily.LOCK), lockKey, lockValue);
-                batch.put(engine.handle(RocksDBColumnFamily.LOCK_BRANCH_INDEX), indexKey, lockKey);
+                engine.put(batch, RocksDBColumnFamily.LOCK, lockKey, lockValue);
+                engine.put(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexKey, lockKey);
                 engine.write(batch);
             } catch (Exception e) {
                 Assertions.fail(e);

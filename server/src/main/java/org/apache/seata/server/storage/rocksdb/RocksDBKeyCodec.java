@@ -89,6 +89,13 @@ public final class RocksDBKeyCodec {
         return out.toByteArray();
     }
 
+    public static byte[] encodeGlobalStatusSeekKey(GlobalStatus status, long beginTime) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeInt(out, status.getCode());
+        writeLong(out, beginTime);
+        return out.toByteArray();
+    }
+
     public static byte[] encodeTransactionIdIndex(long transactionId) {
         return ByteBuffer.allocate(LONG_BYTE_SIZE).putLong(transactionId).array();
     }
