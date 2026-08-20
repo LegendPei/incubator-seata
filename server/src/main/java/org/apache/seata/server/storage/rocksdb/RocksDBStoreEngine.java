@@ -50,6 +50,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -115,6 +116,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
     private final RocksDB db;
     private final ReentrantReadWriteLock maintenanceLock = new ReentrantReadWriteLock(true);
     private final boolean lastShutdownClean;
+    private final ReentrantLock maintenanceRunLock = new ReentrantLock(true);
 
     private volatile boolean closed;
 
@@ -508,6 +510,19 @@ public class RocksDBStoreEngine implements AutoCloseable {
             }
         } finally {
             maintenanceLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Serializes complete maintenance runs without blocking ordinary writes between bounded batches.
+     */
+    public <T> T withMaintenanceRunLock(Supplier<T> action) {
+        Objects.requireNonNull(action, "maintenance run action must not be null");
+        maintenanceRunLock.lock();
+        try {
+            return action.get();
+        } finally {
+            maintenanceRunLock.unlock();
         }
     }
 

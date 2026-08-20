@@ -77,6 +77,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -1097,6 +1098,7 @@ public final class RocksDBFileModeBenchmark {
                     }
                     boolean measureProbe = round >= options.warmupRounds;
                     AtomicBoolean probeRunning = new AtomicBoolean(true);
+                    CountDownLatch probeStarted = new CountDownLatch(1);
                     Thread probeThread = new Thread(
                             () -> {
                                 int index = 0;
@@ -1114,6 +1116,7 @@ public final class RocksDBFileModeBenchmark {
                                     }
                                     if (measureProbe) {
                                         cleanOrphanBatchedProbeStats.record(System.nanoTime() - startedAt);
+                                        probeStarted.countDown();
                                     }
                                 }
                             },
@@ -1125,6 +1128,11 @@ public final class RocksDBFileModeBenchmark {
                     int batchRounds = 0;
                     long passStartNanos = System.nanoTime();
                     try {
+                        if (measureProbe) {
+                            assertTrue(
+                                    probeStarted.await(5L, TimeUnit.SECONDS),
+                                    "orphan cleanup foreground probe did not start");
+                        }
                         while (true) {
                             byte[] seekKey = cursor;
                             RocksDBLockManager.CleanOrphanLocksResult[] resultHolder =

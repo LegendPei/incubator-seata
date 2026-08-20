@@ -22,13 +22,16 @@ package org.apache.seata.server.storage.rocksdb.maintenance;
 public final class RocksDBVerifyOptions {
 
     private static final int DEFAULT_MAX_ERROR_SAMPLES = 100;
+    private static final long DEFAULT_DEADLINE_MILLIS = 60_000L;
 
     private final RocksDBVerifyMode mode;
     private final int limit;
     private final RocksDBVerifyCursor cursor;
     private final int maxErrorSamples;
+    private final long deadlineMillis;
 
-    private RocksDBVerifyOptions(RocksDBVerifyMode mode, int limit, RocksDBVerifyCursor cursor, int maxErrorSamples) {
+    private RocksDBVerifyOptions(
+            RocksDBVerifyMode mode, int limit, RocksDBVerifyCursor cursor, int maxErrorSamples, long deadlineMillis) {
         if (mode != RocksDBVerifyMode.FULL && limit <= 0) {
             throw new IllegalArgumentException("verify limit must be positive for " + mode);
         }
@@ -38,10 +41,14 @@ public final class RocksDBVerifyOptions {
         if (mode != RocksDBVerifyMode.PAGE && cursor != null) {
             throw new IllegalArgumentException("verify cursor is only supported in PAGE mode");
         }
+        if (deadlineMillis < 0) {
+            throw new IllegalArgumentException("verify deadlineMillis must be non-negative");
+        }
         this.mode = mode;
         this.limit = limit;
         this.cursor = cursor;
         this.maxErrorSamples = maxErrorSamples;
+        this.deadlineMillis = deadlineMillis;
     }
 
     public static RocksDBVerifyOptions full() {
@@ -49,15 +56,28 @@ public final class RocksDBVerifyOptions {
     }
 
     public static RocksDBVerifyOptions full(int maxErrorSamples) {
-        return new RocksDBVerifyOptions(RocksDBVerifyMode.FULL, 0, null, maxErrorSamples);
+        return full(maxErrorSamples, DEFAULT_DEADLINE_MILLIS);
+    }
+
+    public static RocksDBVerifyOptions full(int maxErrorSamples, long deadlineMillis) {
+        return new RocksDBVerifyOptions(RocksDBVerifyMode.FULL, 0, null, maxErrorSamples, deadlineMillis);
     }
 
     public static RocksDBVerifyOptions sample(int limitPerColumnFamily, int maxErrorSamples) {
-        return new RocksDBVerifyOptions(RocksDBVerifyMode.SAMPLE, limitPerColumnFamily, null, maxErrorSamples);
+        return sample(limitPerColumnFamily, maxErrorSamples, DEFAULT_DEADLINE_MILLIS);
+    }
+
+    public static RocksDBVerifyOptions sample(int limitPerColumnFamily, int maxErrorSamples, long deadlineMillis) {
+        return new RocksDBVerifyOptions(
+                RocksDBVerifyMode.SAMPLE, limitPerColumnFamily, null, maxErrorSamples, deadlineMillis);
     }
 
     public static RocksDBVerifyOptions page(int limit, RocksDBVerifyCursor cursor, int maxErrorSamples) {
-        return new RocksDBVerifyOptions(RocksDBVerifyMode.PAGE, limit, cursor, maxErrorSamples);
+        return page(limit, cursor, maxErrorSamples, DEFAULT_DEADLINE_MILLIS);
+    }
+
+    public static RocksDBVerifyOptions page(int limit, RocksDBVerifyCursor cursor, int maxErrorSamples, long deadlineMillis) {
+        return new RocksDBVerifyOptions(RocksDBVerifyMode.PAGE, limit, cursor, maxErrorSamples, deadlineMillis);
     }
 
     public RocksDBVerifyMode getMode() {
@@ -74,5 +94,9 @@ public final class RocksDBVerifyOptions {
 
     public int getMaxErrorSamples() {
         return maxErrorSamples;
+    }
+
+    public long getDeadlineMillis() {
+        return deadlineMillis;
     }
 }

@@ -18,7 +18,9 @@ package org.apache.seata.server.storage.rocksdb.maintenance;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Immutable report produced by RocksDB consistency verification.
@@ -28,6 +30,8 @@ public class RocksDBVerifyReport {
     private final RocksDBVerifyMode mode;
     private final boolean complete;
     private final RocksDBVerifyCursor nextCursor;
+    private final boolean truncated;
+    private final int scannedRecordCount;
     private final int checkedRecordCount;
     private final int checkedGlobalCount;
     private final int checkedBranchCount;
@@ -39,9 +43,12 @@ public class RocksDBVerifyReport {
     private final int missingStatusIndexCount;
     private final int missingTimeoutIndexCount;
     private final int missingTransactionIdIndexCount;
+    private final int invalidGlobalCount;
+    private final int invalidBranchCount;
     private final int orphanBranchCount;
     private final int orphanLockCount;
     private final int staleLockIndexCount;
+    private final int invalidMetadataCount;
     private final int inconsistentCount;
     private final int totalErrorCount;
     private final List<String> errorMessages;
@@ -50,6 +57,8 @@ public class RocksDBVerifyReport {
         this.mode = builder.mode;
         this.complete = builder.complete;
         this.nextCursor = builder.nextCursor;
+        this.truncated = builder.truncated;
+        this.scannedRecordCount = builder.scannedRecordCount;
         this.checkedRecordCount = builder.checkedRecordCount;
         this.checkedGlobalCount = builder.checkedGlobalCount;
         this.checkedBranchCount = builder.checkedBranchCount;
@@ -61,9 +70,12 @@ public class RocksDBVerifyReport {
         this.missingStatusIndexCount = builder.missingStatusIndexCount;
         this.missingTimeoutIndexCount = builder.missingTimeoutIndexCount;
         this.missingTransactionIdIndexCount = builder.missingTransactionIdIndexCount;
+        this.invalidGlobalCount = builder.invalidGlobalCount;
+        this.invalidBranchCount = builder.invalidBranchCount;
         this.orphanBranchCount = builder.orphanBranchCount;
         this.orphanLockCount = builder.orphanLockCount;
         this.staleLockIndexCount = builder.staleLockIndexCount;
+        this.invalidMetadataCount = builder.invalidMetadataCount;
         this.inconsistentCount = builder.inconsistentCount;
         this.totalErrorCount = builder.totalErrorCount;
         this.errorMessages = Collections.unmodifiableList(new ArrayList<>(builder.errorMessages));
@@ -79,6 +91,14 @@ public class RocksDBVerifyReport {
 
     public RocksDBVerifyCursor getNextCursor() {
         return nextCursor;
+    }
+
+    public boolean isTruncated() {
+        return truncated;
+    }
+
+    public int getScannedRecordCount() {
+        return scannedRecordCount;
     }
 
     public int getCheckedRecordCount() {
@@ -125,6 +145,14 @@ public class RocksDBVerifyReport {
         return missingTransactionIdIndexCount;
     }
 
+    public int getInvalidGlobalCount() {
+        return invalidGlobalCount;
+    }
+
+    public int getInvalidBranchCount() {
+        return invalidBranchCount;
+    }
+
     public int getOrphanBranchCount() {
         return orphanBranchCount;
     }
@@ -135,6 +163,10 @@ public class RocksDBVerifyReport {
 
     public int getStaleLockIndexCount() {
         return staleLockIndexCount;
+    }
+
+    public int getInvalidMetadataCount() {
+        return invalidMetadataCount;
     }
 
     public int getInconsistentCount() {
@@ -155,8 +187,9 @@ public class RocksDBVerifyReport {
 
     @Override
     public String toString() {
-        return "RocksDBVerifyReport{" + "mode=" + mode + ", complete=" + complete + ", checkedRecords="
-                + checkedRecordCount + ", globals=" + checkedGlobalCount + ", branches=" + checkedBranchCount
+        return "RocksDBVerifyReport{" + "mode=" + mode + ", complete=" + complete + ", truncated=" + truncated
+                + ", scannedRecords=" + scannedRecordCount + ", checkedRecords=" + checkedRecordCount + ", globals="
+                + checkedGlobalCount + ", branches=" + checkedBranchCount
                 + ", locks=" + checkedLockCount + ", indexes=" + checkedIndexCount + ", inconsistencies="
                 + inconsistentCount + ", errorSamples=" + errorMessages.size() + ", clean=" + isClean() + '}';
     }
@@ -170,6 +203,8 @@ public class RocksDBVerifyReport {
         private final int maxErrorSamples;
         private boolean complete;
         private RocksDBVerifyCursor nextCursor;
+        private boolean truncated;
+        private int scannedRecordCount;
         private int checkedRecordCount;
         private int checkedGlobalCount;
         private int checkedBranchCount;
@@ -181,12 +216,16 @@ public class RocksDBVerifyReport {
         private int missingStatusIndexCount;
         private int missingTimeoutIndexCount;
         private int missingTransactionIdIndexCount;
+        private int invalidGlobalCount;
+        private int invalidBranchCount;
         private int orphanBranchCount;
         private int orphanLockCount;
         private int staleLockIndexCount;
+        private int invalidMetadataCount;
         private int inconsistentCount;
         private int totalErrorCount;
         private final List<String> errorMessages = new ArrayList<>();
+        private final Map<Long, String> globalXidsByTransactionId = new HashMap<>();
 
         private Builder(RocksDBVerifyOptions options) {
             this.mode = options.getMode();
@@ -242,6 +281,27 @@ public class RocksDBVerifyReport {
             issue(message);
         }
 
+        void scannedRecords(int scannedRecords) {
+            scannedRecordCount += scannedRecords;
+        }
+
+        void invalidBranch(String message) {
+            invalidBranchCount++;
+            issue(message);
+        }
+
+        void invalidGlobal(String message) {
+            invalidGlobalCount++;
+            issue(message);
+        }
+
+        void globalTransactionId(long transactionId, String xid) {
+            String existingXid = globalXidsByTransactionId.putIfAbsent(transactionId, xid);
+            if (existingXid != null && !existingXid.equals(xid)) {
+                invalidGlobal("duplicate global transaction id:" + transactionId);
+            }
+        }
+
         void orphanBranch(String message) {
             orphanBranchCount++;
             issue(message);
@@ -254,6 +314,11 @@ public class RocksDBVerifyReport {
 
         void staleLockIndex(String message) {
             staleLockIndexCount++;
+            issue(message);
+        }
+
+        void invalidMetadata(String message) {
+            invalidMetadataCount++;
             issue(message);
         }
 
@@ -275,6 +340,10 @@ public class RocksDBVerifyReport {
 
         void nextCursor(RocksDBVerifyCursor nextCursor) {
             this.nextCursor = nextCursor;
+        }
+
+        void truncated() {
+            this.truncated = true;
         }
 
         RocksDBVerifyReport build() {

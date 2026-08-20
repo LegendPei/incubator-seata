@@ -212,6 +212,50 @@ public final class RocksDBKeyCodec {
         return new String(xidBytes, StandardCharsets.UTF_8);
     }
 
+    /**
+     * Extract branch id from a branch session key.
+     */
+    public static long extractBranchIdFromBranchKey(byte[] key) {
+        if (key == null || key.length < INT_BYTE_SIZE + LONG_BYTE_SIZE) {
+            return -1;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(key);
+        int xidLength = buffer.getInt();
+        if (xidLength < 0 || buffer.remaining() != xidLength + LONG_BYTE_SIZE) {
+            return -1;
+        }
+        buffer.position(buffer.position() + xidLength);
+        return buffer.getLong();
+    }
+
+    /**
+     * Check whether a persisted lock-index resume cursor can be decoded.
+     *
+     * <p>The cursor is either an exact lock-branch-index key or that key followed by the single
+     * NUL byte used as an exclusive seek position.
+     */
+    public static boolean isValidLockBranchIndexSeekKey(byte[] key) {
+        if (key == null || key.length < INT_BYTE_SIZE + LONG_BYTE_SIZE + INT_BYTE_SIZE) {
+            return false;
+        }
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(key);
+            int xidLength = buffer.getInt();
+            if (xidLength < 0 || buffer.remaining() < xidLength + LONG_BYTE_SIZE + INT_BYTE_SIZE) {
+                return false;
+            }
+            buffer.position(buffer.position() + xidLength + LONG_BYTE_SIZE);
+            int lockKeyLength = buffer.getInt();
+            if (lockKeyLength < 0 || buffer.remaining() < lockKeyLength) {
+                return false;
+            }
+            buffer.position(buffer.position() + lockKeyLength);
+            return !buffer.hasRemaining() || (buffer.remaining() == 1 && buffer.get() == 0);
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     private static byte[] encodeComponent(String value) {
         byte[] valueBytes = value == null ? new byte[0] : value.getBytes(StandardCharsets.UTF_8);
         return encodeComponent(valueBytes);
