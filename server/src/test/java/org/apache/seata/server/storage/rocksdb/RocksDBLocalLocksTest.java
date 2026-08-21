@@ -38,7 +38,6 @@ class RocksDBLocalLocksTest {
         RocksDBLocalLocks locks = new RocksDBLocalLocks(1);
 
         Assertions.assertThrows(NullPointerException.class, () -> locks.lock(null));
-        Assertions.assertThrows(
-                NullPointerException.class, () -> locks.lockAll(Arrays.asList(new byte[] {1}, null)));
+        Assertions.assertThrows(NullPointerException.class, () -> locks.lockAll(Arrays.asList(new byte[] {1}, null)));
     }
 }

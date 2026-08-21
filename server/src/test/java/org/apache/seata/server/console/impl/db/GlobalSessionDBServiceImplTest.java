@@ -230,8 +230,7 @@ class GlobalSessionDBServiceImplTest extends BaseSpringBootTest {
         Assertions.assertTrue(result.isSuccess());
         ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
         verify(connection, times(2)).prepareStatement(sqlCaptor.capture());
-        Assertions.assertTrue(
-                sqlCaptor.getAllValues().stream().allMatch(sql -> sql.contains("transaction_id = ?")));
+        Assertions.assertTrue(sqlCaptor.getAllValues().stream().allMatch(sql -> sql.contains("transaction_id = ?")));
     }
 
     @Test

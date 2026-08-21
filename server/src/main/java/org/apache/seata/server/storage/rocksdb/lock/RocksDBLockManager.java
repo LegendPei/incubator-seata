@@ -17,6 +17,7 @@
 package org.apache.seata.server.storage.rocksdb.lock;
 
 import org.apache.seata.common.loader.LoadLevel;
+import org.apache.seata.common.loader.Scope;
 import org.apache.seata.core.exception.TransactionException;
 import org.apache.seata.core.lock.Locker;
 import org.apache.seata.server.lock.AbstractLockManager;
@@ -29,7 +30,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 /**
  * RocksDB lock manager for file store engine.
  */
-@LoadLevel(name = "rocksdb")
+@LoadLevel(name = "rocksdb", scope = Scope.PROTOTYPE)
 public class RocksDBLockManager extends AbstractLockManager {
 
     private final RocksDBLocker locker;
