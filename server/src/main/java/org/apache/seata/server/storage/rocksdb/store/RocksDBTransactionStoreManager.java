@@ -256,8 +256,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             if (oldValue != null) {
                 indexManager.deleteGlobalIndexes(batch, decodeGlobalSession(oldValue, true));
             }
-            storeEngine.delete(
-                    batch, RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(session.getXid()));
+            storeEngine.delete(batch, RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(session.getXid()));
             storeEngine.deleteByPrefix(
                     batch, RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(session.getXid()));
             storeEngine.write(batch);
@@ -413,11 +412,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                     break;
                 }
                 RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
-                        status,
-                        0L,
-                        effectiveMaxBeginTime,
-                        cursor,
-                        scanBudget.clamp(nextPageLimit(limit, result)));
+                        status, 0L, effectiveMaxBeginTime, cursor, scanBudget.clamp(nextPageLimit(limit, result)));
                 scanBudget.record(scanResult.getRowsScanned());
                 scanStats.record(scanResult);
                 appendMatchingSessionsBatch(sessionCondition, seenXids, result, scanResult.getEntries(), scanStats);
@@ -776,9 +771,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 index = 0;
                 return;
             }
-            int requested = scanBudget.isBounded()
-                    ? 1
-                    : Math.min(pageSize, nextPageLimit(limit, result));
+            int requested = scanBudget.isBounded() ? 1 : Math.min(pageSize, nextPageLimit(limit, result));
             RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
                     status,
                     0L,

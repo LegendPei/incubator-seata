@@ -35,13 +35,16 @@ class RocksDBCrashRecoveryHarnessTest {
     void testCleanModeReopensCleanStoreWithAllSessions() throws Exception {
         Path dbPath = tempDir.resolve("clean");
 
-        RocksDBCrashRecoveryHarness.main(new String[] {
-            "--mode=clean", "--dbPath=" + dbPath, "--warmupWrites=2", "--count=3", "--syncWrite=true"
-        });
+        RocksDBCrashRecoveryHarness.main(
+                new String[] {"--mode=clean", "--dbPath=" + dbPath, "--warmupWrites=2", "--count=3", "--syncWrite=true"
+                });
 
         try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(new RocksDBStoreConfig(dbPath.toString(), true))) {
             Assertions.assertTrue(engine.wasLastShutdownClean());
-            Assertions.assertEquals(5, engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]).size());
+            Assertions.assertEquals(
+                    5,
+                    engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])
+                            .size());
         }
     }
 

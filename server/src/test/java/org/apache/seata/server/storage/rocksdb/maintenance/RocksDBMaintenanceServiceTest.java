@@ -360,8 +360,8 @@ class RocksDBMaintenanceServiceTest {
                         xid.getBytes(StandardCharsets.UTF_8));
             }
 
-            RocksDBVerifyReport report = new RocksDBMaintenanceService(engine)
-                    .verifyCurrentState(RocksDBVerifyOptions.full(10, 0));
+            RocksDBVerifyReport report =
+                    new RocksDBMaintenanceService(engine).verifyCurrentState(RocksDBVerifyOptions.full(10, 0));
 
             Assertions.assertFalse(report.isComplete());
             Assertions.assertTrue(report.isTruncated());
@@ -488,8 +488,8 @@ class RocksDBMaintenanceServiceTest {
             GlobalSession global = globalSession("lock-without-branch", GlobalStatus.Begin);
             new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, global);
             byte[] lockKey = RocksDBKeyCodec.encodeRowLock("resource", "table", "pk-no-branch");
-            byte[] lockValue =
-                    encodeLockHolder(global.getXid(), global.getTransactionId(), 1L, "resource", "table", "pk-no-branch");
+            byte[] lockValue = encodeLockHolder(
+                    global.getXid(), global.getTransactionId(), 1L, "resource", "table", "pk-no-branch");
             byte[] indexKey = RocksDBKeyCodec.encodeLockBranchIndex(global.getXid(), 1L, lockKey);
             try (WriteBatch batch = new WriteBatch()) {
                 engine.put(batch, RocksDBColumnFamily.LOCK, lockKey, lockValue);
@@ -856,8 +856,7 @@ class RocksDBMaintenanceServiceTest {
                                     .maintenanceMode(true)
                                     .build()));
             Assertions.assertArrayEquals(
-                    beforeTransactionIndex,
-                    engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey));
+                    beforeTransactionIndex, engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey));
         }
     }
 
@@ -871,10 +870,7 @@ class RocksDBMaintenanceServiceTest {
                     RocksDBKeyCodec.encodeGlobalStatusIndex(global.getStatus(), global.getBeginTime(), global.getXid());
             byte[] rawValue = engine.get(RocksDBColumnFamily.GLOBAL_SESSION, expectedKey);
             engine.delete(RocksDBColumnFamily.GLOBAL_SESSION, expectedKey);
-            engine.put(
-                    RocksDBColumnFamily.GLOBAL_SESSION,
-                    RocksDBKeyCodec.encodeXid("different-global-key"),
-                    rawValue);
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid("different-global-key"), rawValue);
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
             RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
 
@@ -951,8 +947,8 @@ class RocksDBMaintenanceServiceTest {
                 Assertions.assertArrayEquals(
                         "blocked".getBytes(StandardCharsets.UTF_8),
                         engine.get(
-                                 RocksDBColumnFamily.METADATA,
-                                 "repair-maintenance-lock".getBytes(StandardCharsets.UTF_8)));
+                                RocksDBColumnFamily.METADATA,
+                                "repair-maintenance-lock".getBytes(StandardCharsets.UTF_8)));
             } finally {
                 releaseMaintenance.countDown();
                 executor.shutdownNow();
@@ -964,26 +960,21 @@ class RocksDBMaintenanceServiceTest {
     void testLockIndexRepairDeletesOnlyCanonicalDuplicateAndPauses() throws Exception {
         try (RocksDBStoreEngine engine = open("repair-lock-index-paused")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-paused", 1L);
-            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
-                    fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
             RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
 
             Assertions.assertTrue(plan.hasAction(RocksDBRepairPlan.Action.DELETE_STALE_LOCK_BRANCH_INDEXES));
-            RocksDBRepairReport report = service.executeRepair(
-                    plan,
-                    lockIndexRepairOptions("lock-run-paused", 1, 1));
+            RocksDBRepairReport report = service.executeRepair(plan, lockIndexRepairOptions("lock-run-paused", 1, 1));
 
             Assertions.assertEquals(RocksDBRepairReport.State.PAUSED, report.getState());
             Assertions.assertEquals(1, report.getDeletedLockIndexCount());
             Assertions.assertNotNull(report.getNextSeekKey());
             Assertions.assertNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
+            Assertions.assertArrayEquals(fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
             Assertions.assertArrayEquals(
-                    fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
-            Assertions.assertArrayEquals(
-                    fixture.lockKey,
-                    engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, fixture.canonicalIndexKey));
+                    fixture.lockKey, engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, fixture.canonicalIndexKey));
             Assertions.assertNotNull(
                     engine.get(RocksDBColumnFamily.METADATA, RocksDBMaintenanceService.LOCK_INDEX_REPAIR_PROGRESS_KEY));
         }
@@ -1000,9 +991,8 @@ class RocksDBMaintenanceServiceTest {
             RocksDBMaintenanceService firstService = new RocksDBMaintenanceService(engine);
             RocksDBRepairPlan plan = firstService.planRepair(RocksDBRepairOptions.defaults());
 
-            RocksDBRepairReport first = firstService.executeRepair(
-                    plan,
-                    lockIndexRepairOptions("lock-run-resume", 2, 1));
+            RocksDBRepairReport first =
+                    firstService.executeRepair(plan, lockIndexRepairOptions("lock-run-resume", 2, 1));
             Assertions.assertEquals(RocksDBRepairReport.State.PAUSED, first.getState());
             Assertions.assertEquals(1, first.getDeletedLockIndexCount());
             Assertions.assertNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, firstStaleKey));
@@ -1015,8 +1005,7 @@ class RocksDBMaintenanceServiceTest {
             Assertions.assertEquals(RocksDBRepairReport.State.COMPLETED, second.getState());
             Assertions.assertEquals(2, second.getDeletedLockIndexCount());
             Assertions.assertNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, secondStaleKey));
-            Assertions.assertArrayEquals(
-                    fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
+            Assertions.assertArrayEquals(fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
             Assertions.assertNull(
                     engine.get(RocksDBColumnFamily.METADATA, RocksDBMaintenanceService.LOCK_INDEX_REPAIR_PROGRESS_KEY));
         }
@@ -1026,8 +1015,7 @@ class RocksDBMaintenanceServiceTest {
     void testLockIndexRepairRejectsDifferentRunIdForPersistedCursor() throws Exception {
         try (RocksDBStoreEngine engine = open("repair-lock-index-run-id")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-run-id", 1L);
-            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
-                    fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
             RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
@@ -1044,8 +1032,7 @@ class RocksDBMaintenanceServiceTest {
                     beforeProgress,
                     engine.get(RocksDBColumnFamily.METADATA, RocksDBMaintenanceService.LOCK_INDEX_REPAIR_PROGRESS_KEY));
             Assertions.assertArrayEquals(
-                    fixture.lockKey,
-                    engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, fixture.canonicalIndexKey));
+                    fixture.lockKey, engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, fixture.canonicalIndexKey));
         }
     }
 
@@ -1054,8 +1041,7 @@ class RocksDBMaintenanceServiceTest {
         try (RocksDBStoreEngine engine = open("repair-lock-index-stopped")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-stopped", 1L);
             engine.delete(RocksDBColumnFamily.LOCK_BRANCH_INDEX, fixture.canonicalIndexKey);
-            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
-                    fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
 
@@ -1065,11 +1051,9 @@ class RocksDBMaintenanceServiceTest {
 
             Assertions.assertEquals(RocksDBRepairReport.State.STOPPED, stopped.getState());
             Assertions.assertEquals(0, stopped.getExecutedActionCount());
+            Assertions.assertArrayEquals(fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
             Assertions.assertArrayEquals(
-                    fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
-            Assertions.assertArrayEquals(
-                    fixture.lockKey,
-                    engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
+                    fixture.lockKey, engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
             Assertions.assertThrows(
                     StoreException.class,
                     () -> service.executeRepair(
@@ -1082,8 +1066,7 @@ class RocksDBMaintenanceServiceTest {
     void testLockIndexRepairStopsWhenFinalFullVerifyWorsens() throws Exception {
         try (RocksDBStoreEngine engine = open("repair-lock-index-final-verify")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-final-verify", 1L);
-            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
-                    fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             RocksDBMaintenanceService service = new FinalVerifyWorseningMaintenanceService(engine);
 
@@ -1106,8 +1089,7 @@ class RocksDBMaintenanceServiceTest {
     void testLockIndexRepairSerializesConcurrentRuns() throws Exception {
         try (RocksDBStoreEngine engine = open("repair-lock-index-concurrent")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-concurrent", 1L);
-            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
-                    fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             CountDownLatch firstVerifyEntered = new CountDownLatch(1);
             CountDownLatch releaseFirstVerify = new CountDownLatch(1);
@@ -1121,14 +1103,15 @@ class RocksDBMaintenanceServiceTest {
                 Future<RocksDBRepairReport> firstRun = executor.submit(
                         () -> first.executeRepair(plan, lockIndexRepairOptions("lock-run-concurrent", 1, 1)));
                 Assertions.assertTrue(firstVerifyEntered.await(5, TimeUnit.SECONDS));
-                Future<RocksDBRepairReport> secondRun = executor.submit(
-                        () -> second.executeRepair(
-                                second.planRepair(RocksDBRepairOptions.defaults()),
-                                lockIndexRepairOptions("lock-run-concurrent", 1, 1)));
+                Future<RocksDBRepairReport> secondRun = executor.submit(() -> second.executeRepair(
+                        second.planRepair(RocksDBRepairOptions.defaults()),
+                        lockIndexRepairOptions("lock-run-concurrent", 1, 1)));
 
                 boolean secondEnteredBeforeFirstReleased = secondVerifyEntered.await(200, TimeUnit.MILLISECONDS);
                 releaseFirstVerify.countDown();
-                Assertions.assertEquals(RocksDBRepairReport.State.PAUSED, firstRun.get(5, TimeUnit.SECONDS).getState());
+                Assertions.assertEquals(
+                        RocksDBRepairReport.State.PAUSED,
+                        firstRun.get(5, TimeUnit.SECONDS).getState());
                 Assertions.assertTrue(secondVerifyEntered.await(5, TimeUnit.SECONDS));
                 secondRun.get(5, TimeUnit.SECONDS);
                 Assertions.assertFalse(secondEnteredBeforeFirstReleased);
@@ -1143,8 +1126,7 @@ class RocksDBMaintenanceServiceTest {
     void testLockIndexRepairStopsWhenBranchSourceCannotBeDecoded() throws Exception {
         try (RocksDBStoreEngine engine = open("repair-lock-index-invalid-branch")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-invalid-branch", 1L);
-            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
-                    fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             engine.put(
                     RocksDBColumnFamily.BRANCH_SESSION,
@@ -1157,11 +1139,9 @@ class RocksDBMaintenanceServiceTest {
                     lockIndexRepairOptions("lock-run-invalid-branch", 1, 1));
 
             Assertions.assertEquals(RocksDBRepairReport.State.STOPPED, stopped.getState());
+            Assertions.assertArrayEquals(fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
             Assertions.assertArrayEquals(
-                    fixture.lockValue, engine.get(RocksDBColumnFamily.LOCK, fixture.lockKey));
-            Assertions.assertArrayEquals(
-                    fixture.lockKey,
-                    engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
+                    fixture.lockKey, engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
         }
     }
 
@@ -1226,14 +1206,12 @@ class RocksDBMaintenanceServiceTest {
     void testResetStoppedLockIndexProgressAllowsNewRunAfterVerifiedReset() throws Exception {
         try (RocksDBStoreEngine engine = open("reset-stopped-lock-index-new-run")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "reset-stopped-lock-index-new-run", 1L);
-            byte[] staleIndexKey =
-                    RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             engine.put(
                     RocksDBColumnFamily.METADATA,
                     RocksDBMaintenanceService.LOCK_INDEX_REPAIR_PROGRESS_KEY,
-                    new RocksDBLockIndexRepairProgress(
-                                    RocksDBLockIndexRepairProgress.State.STOPPED, "old-run", null, 0)
+                    new RocksDBLockIndexRepairProgress(RocksDBLockIndexRepairProgress.State.STOPPED, "old-run", null, 0)
                             .encode());
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
 
@@ -1242,13 +1220,11 @@ class RocksDBMaintenanceServiceTest {
             Assertions.assertNull(
                     engine.get(RocksDBColumnFamily.METADATA, RocksDBMaintenanceService.LOCK_INDEX_REPAIR_PROGRESS_KEY));
             RocksDBRepairReport report = service.executeRepair(
-                    service.planRepair(RocksDBRepairOptions.defaults()),
-                    lockIndexRepairOptions("new-run", 10, 1));
+                    service.planRepair(RocksDBRepairOptions.defaults()), lockIndexRepairOptions("new-run", 10, 1));
             Assertions.assertEquals(RocksDBRepairReport.State.COMPLETED, report.getState());
             Assertions.assertNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
             Assertions.assertArrayEquals(
-                    fixture.lockKey,
-                    engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, fixture.canonicalIndexKey));
+                    fixture.lockKey, engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, fixture.canonicalIndexKey));
             Assertions.assertNull(
                     engine.get(RocksDBColumnFamily.METADATA, RocksDBMaintenanceService.LOCK_INDEX_REPAIR_PROGRESS_KEY));
         }
@@ -1258,20 +1234,18 @@ class RocksDBMaintenanceServiceTest {
     void testExecuteLockIndexRepairRejectsIncompleteExecutionPreflightWithoutWriting() throws Exception {
         try (RocksDBStoreEngine engine = open("repair-lock-index-incomplete-preflight")) {
             LockIndexFixture fixture = lockIndexFixture(engine, "repair-lock-index-incomplete-preflight", 1L);
-            byte[] staleIndexKey =
-                    RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
+            byte[] staleIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), 0L, fixture.lockKey);
             engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, fixture.lockKey);
             for (long branchId = 2L; branchId < 302L; branchId++) {
                 engine.put(
                         RocksDBColumnFamily.LOCK_BRANCH_INDEX,
-                        RocksDBKeyCodec.encodeLockBranchIndex(
-                                fixture.global.getXid(), branchId, fixture.lockKey),
+                        RocksDBKeyCodec.encodeLockBranchIndex(fixture.global.getXid(), branchId, fixture.lockKey),
                         fixture.lockKey);
             }
             RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
             RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
-            int indexCountBefore =
-                    engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]).size();
+            int indexCountBefore = engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                    .size();
             byte[] progressBefore =
                     engine.get(RocksDBColumnFamily.METADATA, RocksDBMaintenanceService.LOCK_INDEX_REPAIR_PROGRESS_KEY);
 

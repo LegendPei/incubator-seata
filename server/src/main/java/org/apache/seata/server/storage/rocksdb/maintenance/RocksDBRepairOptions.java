@@ -73,6 +73,7 @@ public final class RocksDBRepairOptions {
     public int getMaxRepairEntries() {
         return maxRepairEntries;
     }
+
     public String getLockIndexRunId() {
         return lockIndexRunId;
     }
@@ -132,6 +133,7 @@ public final class RocksDBRepairOptions {
             this.maxRepairEntries = maxRepairEntries;
             return this;
         }
+
         public Builder lockIndexRunId(String lockIndexRunId) {
             this.lockIndexRunId = lockIndexRunId;
             return this;

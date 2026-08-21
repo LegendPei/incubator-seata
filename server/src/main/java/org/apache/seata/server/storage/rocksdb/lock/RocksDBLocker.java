@@ -309,8 +309,7 @@ public class RocksDBLocker extends AbstractLocker {
                 cleaned, scanResult.getStats().getRowsScanned(), limitReached, nextSeekKey);
     }
 
-    private int cleanOrphanCandidates(
-            SessionManager sessionManager, String xid, List<OrphanLockCandidate> candidates) {
+    private int cleanOrphanCandidates(SessionManager sessionManager, String xid, List<OrphanLockCandidate> candidates) {
         if (!persistentGlobalSessionExists(xid)) {
             return deleteConfirmedOrphans(xid, candidates, true);
         }
@@ -340,8 +339,7 @@ public class RocksDBLocker extends AbstractLocker {
             }
             int cleaned = 0;
             for (OrphanLockCandidate candidate : candidates) {
-                byte[] indexedLockKey =
-                        storeEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
+                byte[] indexedLockKey = storeEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
                 if (!Arrays.equals(indexedLockKey, candidate.lockKey)) {
                     continue;
                 }
@@ -486,12 +484,12 @@ public class RocksDBLocker extends AbstractLocker {
                     for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
                         // Fast path: the index key is prefixed by xid (and branchId when
                         // releasing per-branch), so ownership is already guaranteed by the
-                         // scan predicate.  Skip the per-lock verification read to save one
-                         // point-read per lock entry.
-                         byte[] lockKey = indexEntry.getValue();
+                        // scan predicate.  Skip the per-lock verification read to save one
+                        // point-read per lock entry.
+                        byte[] lockKey = indexEntry.getValue();
                         storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
                         storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
-                     }
+                    }
                     storeEngine.write(batch);
                 }
                 seekKey = nextLockBranchIndexSeekKey(indexPrefix, indexEntries);

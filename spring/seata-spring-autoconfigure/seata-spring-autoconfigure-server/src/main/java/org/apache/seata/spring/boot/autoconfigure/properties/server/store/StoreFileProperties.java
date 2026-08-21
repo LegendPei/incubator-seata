@@ -103,6 +103,13 @@ public class StoreFileProperties {
         private String dir = "sessionStore/rocksdb";
         private String blockCacheSize = "0";
         private String writeBufferSize = "0";
+        private String dbWriteBufferSize = "0";
+        private String maxTotalWalSize = "0";
+        private String globalWriteBufferSize = "0";
+        private String branchWriteBufferSize = "0";
+        private String lockWriteBufferSize = "0";
+        private String indexWriteBufferSize = "0";
+        private String metadataWriteBufferSize = "0";
         private Integer maxWriteBufferNumber = 0;
         private Integer minWriteBufferNumberToMerge = 0;
         private Integer maxBackgroundJobs = 0;
@@ -114,13 +121,21 @@ public class StoreFileProperties {
         private Boolean enableStatistics = false;
         private Boolean optimizeFiltersForHits = false;
         private String compressionType;
-        private Boolean enableRangeDelete = false;
+        private Boolean enableRangeDelete = true;
         private Boolean rangeDeleteCompactAfterDelete = false;
+        private Integer fullScanMaxLimit = 10000;
+        private Long fullScanDeadlineMillis = 5000L;
+        private Integer multiStatusScanPageSize = 256;
         private String walSyncMode = "none";
         private Integer walSyncIntervalMillis = 2000;
         private Long walSyncWriteThreshold = 10L;
         private Boolean walSyncOnShutdown = true;
         private Integer walSyncWarnThresholdMillis = 1000;
+        private Boolean orphanLockCleanEnabled = true;
+        private Long orphanLockCleanIntervalMillis = 60000L;
+        private Integer orphanLockCleanBatchLimit = 1000;
+        private Integer orphanLockCleanMaxBatches = 2;
+        private Long orphanLockCleanRoundSleepMillis = 100L;
 
         public String getDir() {
             return dir;
@@ -146,6 +161,69 @@ public class StoreFileProperties {
 
         public RocksDB setWriteBufferSize(String writeBufferSize) {
             this.writeBufferSize = writeBufferSize;
+            return this;
+        }
+
+        public String getDbWriteBufferSize() {
+            return dbWriteBufferSize;
+        }
+
+        public RocksDB setDbWriteBufferSize(String dbWriteBufferSize) {
+            this.dbWriteBufferSize = dbWriteBufferSize;
+            return this;
+        }
+
+        public String getMaxTotalWalSize() {
+            return maxTotalWalSize;
+        }
+
+        public RocksDB setMaxTotalWalSize(String maxTotalWalSize) {
+            this.maxTotalWalSize = maxTotalWalSize;
+            return this;
+        }
+
+        public String getGlobalWriteBufferSize() {
+            return globalWriteBufferSize;
+        }
+
+        public RocksDB setGlobalWriteBufferSize(String globalWriteBufferSize) {
+            this.globalWriteBufferSize = globalWriteBufferSize;
+            return this;
+        }
+
+        public String getBranchWriteBufferSize() {
+            return branchWriteBufferSize;
+        }
+
+        public RocksDB setBranchWriteBufferSize(String branchWriteBufferSize) {
+            this.branchWriteBufferSize = branchWriteBufferSize;
+            return this;
+        }
+
+        public String getLockWriteBufferSize() {
+            return lockWriteBufferSize;
+        }
+
+        public RocksDB setLockWriteBufferSize(String lockWriteBufferSize) {
+            this.lockWriteBufferSize = lockWriteBufferSize;
+            return this;
+        }
+
+        public String getIndexWriteBufferSize() {
+            return indexWriteBufferSize;
+        }
+
+        public RocksDB setIndexWriteBufferSize(String indexWriteBufferSize) {
+            this.indexWriteBufferSize = indexWriteBufferSize;
+            return this;
+        }
+
+        public String getMetadataWriteBufferSize() {
+            return metadataWriteBufferSize;
+        }
+
+        public RocksDB setMetadataWriteBufferSize(String metadataWriteBufferSize) {
+            this.metadataWriteBufferSize = metadataWriteBufferSize;
             return this;
         }
 
@@ -266,6 +344,33 @@ public class StoreFileProperties {
             return this;
         }
 
+        public Integer getFullScanMaxLimit() {
+            return fullScanMaxLimit;
+        }
+
+        public RocksDB setFullScanMaxLimit(Integer fullScanMaxLimit) {
+            this.fullScanMaxLimit = fullScanMaxLimit;
+            return this;
+        }
+
+        public Long getFullScanDeadlineMillis() {
+            return fullScanDeadlineMillis;
+        }
+
+        public RocksDB setFullScanDeadlineMillis(Long fullScanDeadlineMillis) {
+            this.fullScanDeadlineMillis = fullScanDeadlineMillis;
+            return this;
+        }
+
+        public Integer getMultiStatusScanPageSize() {
+            return multiStatusScanPageSize;
+        }
+
+        public RocksDB setMultiStatusScanPageSize(Integer multiStatusScanPageSize) {
+            this.multiStatusScanPageSize = multiStatusScanPageSize;
+            return this;
+        }
+
         public String getWalSyncMode() {
             return walSyncMode;
         }
@@ -308,6 +413,51 @@ public class StoreFileProperties {
 
         public RocksDB setWalSyncWarnThresholdMillis(Integer walSyncWarnThresholdMillis) {
             this.walSyncWarnThresholdMillis = walSyncWarnThresholdMillis;
+            return this;
+        }
+
+        public Boolean getOrphanLockCleanEnabled() {
+            return orphanLockCleanEnabled;
+        }
+
+        public RocksDB setOrphanLockCleanEnabled(Boolean orphanLockCleanEnabled) {
+            this.orphanLockCleanEnabled = orphanLockCleanEnabled;
+            return this;
+        }
+
+        public Long getOrphanLockCleanIntervalMillis() {
+            return orphanLockCleanIntervalMillis;
+        }
+
+        public RocksDB setOrphanLockCleanIntervalMillis(Long orphanLockCleanIntervalMillis) {
+            this.orphanLockCleanIntervalMillis = orphanLockCleanIntervalMillis;
+            return this;
+        }
+
+        public Integer getOrphanLockCleanBatchLimit() {
+            return orphanLockCleanBatchLimit;
+        }
+
+        public RocksDB setOrphanLockCleanBatchLimit(Integer orphanLockCleanBatchLimit) {
+            this.orphanLockCleanBatchLimit = orphanLockCleanBatchLimit;
+            return this;
+        }
+
+        public Integer getOrphanLockCleanMaxBatches() {
+            return orphanLockCleanMaxBatches;
+        }
+
+        public RocksDB setOrphanLockCleanMaxBatches(Integer orphanLockCleanMaxBatches) {
+            this.orphanLockCleanMaxBatches = orphanLockCleanMaxBatches;
+            return this;
+        }
+
+        public Long getOrphanLockCleanRoundSleepMillis() {
+            return orphanLockCleanRoundSleepMillis;
+        }
+
+        public RocksDB setOrphanLockCleanRoundSleepMillis(Long orphanLockCleanRoundSleepMillis) {
+            this.orphanLockCleanRoundSleepMillis = orphanLockCleanRoundSleepMillis;
             return this;
         }
     }

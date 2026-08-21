@@ -1399,9 +1399,7 @@ public final class RocksDBFileModeBenchmark {
                         scanStats.record(System.nanoTime() - scanStartedAt, RowMetrics.returned(sessions.size()));
                         log(
                                 "  [background.r2] round=%d returned=%d unique=%d",
-                                iteration + 1,
-                                sessions.size(),
-                                seenXids.size());
+                                iteration + 1, sessions.size(), seenXids.size());
                         if (sessions.size() < BACKGROUND_QUERY_DEFAULT_LIMIT) {
                             break;
                         }
@@ -1457,8 +1455,8 @@ public final class RocksDBFileModeBenchmark {
         Method method = DefaultCoordinator.class.getDeclaredMethod(
                 "findBackgroundSessions", GlobalStatus[].class, boolean.class);
         method.setAccessible(true);
-        return (List<GlobalSession>) method.invoke(
-                coordinator, new GlobalStatus[] {TARGET_STATUS, SECONDARY_STATUS}, true);
+        return (List<GlobalSession>)
+                method.invoke(coordinator, new GlobalStatus[] {TARGET_STATUS, SECONDARY_STATUS}, true);
     }
 
     private static SessionManager replaceRootSessionManager(SessionManager replacement) throws Exception {
@@ -1557,7 +1555,8 @@ public final class RocksDBFileModeBenchmark {
                 engine.prefixScan(RocksDBColumnFamily.LOCK, new byte[0]).isEmpty(),
                 "lock table should be empty after lifecycle global remove");
         assertTrue(
-                engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]).isEmpty(),
+                engine.prefixScan(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
+                        .isEmpty(),
                 "lock branch index should be empty after lifecycle global remove");
     }
 
@@ -1618,9 +1617,8 @@ public final class RocksDBFileModeBenchmark {
         byte[] prefix = RocksDBKeyCodec.encodeXidPrefix(session.getXid());
         boolean rangeDelete = options.enableRangeDelete && RocksDBKeyCodec.prefixEnd(prefix) != null;
         long sessionPointDeletes = globalRemovePointDeleteCount(session) + (rangeDelete ? 0L : branchCount);
-        int lockDeleteBatches = lockCount == 0
-                ? 0
-                : (lockCount + options.lockIndexScanBatchSize - 1) / options.lockIndexScanBatchSize;
+        int lockDeleteBatches =
+                lockCount == 0 ? 0 : (lockCount + options.lockIndexScanBatchSize - 1) / options.lockIndexScanBatchSize;
         return RowMetrics.lifecycleGlobalRemove(
                 rangeDelete,
                 branchCount,

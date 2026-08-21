@@ -229,8 +229,7 @@ class RocksDBOrphanLockCleanupControllerTest {
             CountDownLatch releaseBatch = new CountDownLatch(1);
             RocksDBLockManager lockManager = new RocksDBLockManager(engine) {
                 @Override
-                public CleanOrphanLocksResult cleanOrphanLocksBatches(
-                        byte[] seekKey, int batchLimit, int maxBatches) {
+                public CleanOrphanLocksResult cleanOrphanLocksBatches(byte[] seekKey, int batchLimit, int maxBatches) {
                     batchStarted.countDown();
                     boolean interrupted = false;
                     while (true) {
@@ -249,16 +248,7 @@ class RocksDBOrphanLockCleanupControllerTest {
             };
             FirstAwaitTimeoutExecutor cleanupExecutor = new FirstAwaitTimeoutExecutor();
             RocksDBOrphanLockCleanupController controller = new RocksDBOrphanLockCleanupController(
-                    lockManager,
-                    engine,
-                    50L,
-                    1,
-                    1,
-                    0L,
-                    cleanupExecutor,
-                    true,
-                    millis -> {},
-                    System::nanoTime);
+                    lockManager, engine, 50L, 1, 1, 0L, cleanupExecutor, true, millis -> {}, System::nanoTime);
             ExecutorService closeExecutor = Executors.newSingleThreadExecutor();
             CompletableFuture<Void> closeFuture = null;
             try {
@@ -266,7 +256,8 @@ class RocksDBOrphanLockCleanupControllerTest {
                 Assertions.assertTrue(batchStarted.await(5, TimeUnit.SECONDS));
 
                 closeFuture = CompletableFuture.runAsync(controller::close, closeExecutor);
-                CompletableFuture.anyOf(cleanupExecutor.secondAwaitEntered, closeFuture).get(5, TimeUnit.SECONDS);
+                CompletableFuture.anyOf(cleanupExecutor.secondAwaitEntered, closeFuture)
+                        .get(5, TimeUnit.SECONDS);
 
                 Assertions.assertTrue(
                         cleanupExecutor.secondAwaitEntered.isDone(),
@@ -300,16 +291,7 @@ class RocksDBOrphanLockCleanupControllerTest {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
             NeverTerminatingExecutor executor = new NeverTerminatingExecutor();
             RocksDBOrphanLockCleanupController controller = new RocksDBOrphanLockCleanupController(
-                    lockManager,
-                    engine,
-                    50L,
-                    1,
-                    1,
-                    0L,
-                    executor,
-                    true,
-                    millis -> {},
-                    System::nanoTime);
+                    lockManager, engine, 50L, 1, 1, 0L, executor, true, millis -> {}, System::nanoTime);
             executor.startBlocker();
             try {
                 StoreException firstFailure = Assertions.assertThrows(StoreException.class, controller::close);
@@ -331,16 +313,7 @@ class RocksDBOrphanLockCleanupControllerTest {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
             InterruptingAwaitExecutor executor = new InterruptingAwaitExecutor();
             RocksDBOrphanLockCleanupController controller = new RocksDBOrphanLockCleanupController(
-                    lockManager,
-                    engine,
-                    50L,
-                    1,
-                    1,
-                    0L,
-                    executor,
-                    true,
-                    millis -> {},
-                    System::nanoTime);
+                    lockManager, engine, 50L, 1, 1, 0L, executor, true, millis -> {}, System::nanoTime);
             try {
                 StoreException firstFailure = Assertions.assertThrows(StoreException.class, controller::close);
                 Assertions.assertTrue(Thread.currentThread().isInterrupted());

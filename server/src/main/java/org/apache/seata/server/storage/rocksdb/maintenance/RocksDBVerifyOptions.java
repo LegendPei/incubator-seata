@@ -76,7 +76,8 @@ public final class RocksDBVerifyOptions {
         return page(limit, cursor, maxErrorSamples, DEFAULT_DEADLINE_MILLIS);
     }
 
-    public static RocksDBVerifyOptions page(int limit, RocksDBVerifyCursor cursor, int maxErrorSamples, long deadlineMillis) {
+    public static RocksDBVerifyOptions page(
+            int limit, RocksDBVerifyCursor cursor, int maxErrorSamples, long deadlineMillis) {
         return new RocksDBVerifyOptions(RocksDBVerifyMode.PAGE, limit, cursor, maxErrorSamples, deadlineMillis);
     }
 

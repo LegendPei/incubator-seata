@@ -196,9 +196,7 @@ public class SessionCondition {
     public void setNextStatusScanCursor(byte[] nextStatusScanCursor) {
         this.nextStatusScanCursor =
                 nextStatusScanCursor == null ? null : Arrays.copyOf(nextStatusScanCursor, nextStatusScanCursor.length);
-        statusScanContinuation = nextStatusScanCursor == null
-                ? ScanContinuation.EXHAUSTED
-                : ScanContinuation.RESUMABLE;
+        statusScanContinuation = nextStatusScanCursor == null ? ScanContinuation.EXHAUSTED : ScanContinuation.RESUMABLE;
     }
 
     public ScanContinuation getStatusScanContinuation() {
@@ -257,9 +255,8 @@ public class SessionCondition {
         this.nextTimeoutScanCursor = nextTimeoutScanCursor == null
                 ? null
                 : Arrays.copyOf(nextTimeoutScanCursor, nextTimeoutScanCursor.length);
-        timeoutScanContinuation = nextTimeoutScanCursor == null
-                ? ScanContinuation.EXHAUSTED
-                : ScanContinuation.RESUMABLE;
+        timeoutScanContinuation =
+                nextTimeoutScanCursor == null ? ScanContinuation.EXHAUSTED : ScanContinuation.RESUMABLE;
     }
 
     public ScanContinuation getTimeoutScanContinuation() {

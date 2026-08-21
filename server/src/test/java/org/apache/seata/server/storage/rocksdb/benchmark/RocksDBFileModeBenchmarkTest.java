@@ -66,7 +66,8 @@ class RocksDBFileModeBenchmarkTest {
         options.put("walSyncIntervalMillis", "100");
         options.put("walSyncWriteThreshold", "10");
 
-        RocksDBStoreConfig config = RocksDBCrashRecoveryHarness.storeConfig(Files.createTempDirectory("r8-wal"), options);
+        RocksDBStoreConfig config =
+                RocksDBCrashRecoveryHarness.storeConfig(Files.createTempDirectory("r8-wal"), options);
 
         Assertions.assertFalse(config.isSyncWrite());
         Assertions.assertEquals(RocksDBWalSyncMode.PERIODIC, config.getWalSyncMode());
@@ -85,8 +86,8 @@ class RocksDBFileModeBenchmarkTest {
         options.put("checkpointPolicy", "afterSync");
         options.put("checkpointSyncTimeoutMillis", "5000");
 
-        List<String> arguments = RocksDBCrashRecoveryHarness.writerArguments(
-                Paths.get("db"), Paths.get("checkpoint"), options);
+        List<String> arguments =
+                RocksDBCrashRecoveryHarness.writerArguments(Paths.get("db"), Paths.get("checkpoint"), options);
 
         Assertions.assertTrue(arguments.contains("--warmupWrites=2"));
         Assertions.assertTrue(arguments.contains("--syncWrite=false"));
@@ -105,14 +106,12 @@ class RocksDBFileModeBenchmarkTest {
         options.put("checkpointPolicy", "afterSync");
 
         Assertions.assertThrows(
-                IllegalArgumentException.class,
-                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+                IllegalArgumentException.class, () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
 
         options.remove("checkpointPolicy");
         options.put("warmupWrites", "1");
         Assertions.assertThrows(
-                IllegalArgumentException.class,
-                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+                IllegalArgumentException.class, () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
     }
 
     @Test
@@ -139,13 +138,11 @@ class RocksDBFileModeBenchmarkTest {
         options.put("checkpointAfter", "6");
 
         Assertions.assertThrows(
-                IllegalArgumentException.class,
-                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+                IllegalArgumentException.class, () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
 
         options.put("checkpointAfter", "0");
         Assertions.assertThrows(
-                IllegalArgumentException.class,
-                () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
+                IllegalArgumentException.class, () -> RocksDBCrashRecoveryHarness.validateCheckpointOptions(options));
     }
 
     @Test
@@ -328,8 +325,8 @@ class RocksDBFileModeBenchmarkTest {
 
     @Test
     void testExplicitR4ComparisonInheritsBalancedNoR4TuningOnBothSides() throws Exception {
-        Object options = parseOptions(
-                "--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
+        Object options =
+                parseOptions("--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
 
         assertBalancedNoR4Tuning(comparisonBaseOptions(options));
         assertBalancedNoR4Tuning(comparisonCandidateOptions(options));
@@ -337,8 +334,8 @@ class RocksDBFileModeBenchmarkTest {
 
     @Test
     void testExplicitR4ComparisonClearsOnlyR4BudgetsOnBase() throws Exception {
-        Object options = parseOptions(
-                "--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
+        Object options =
+                parseOptions("--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
 
         Object baseline = comparisonBaseOptions(options);
 
@@ -354,8 +351,8 @@ class RocksDBFileModeBenchmarkTest {
 
     @Test
     void testExplicitR4ComparisonCandidateRetainsResolvedExplicitBudget() throws Exception {
-        Object options = parseOptions(
-                "--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
+        Object options =
+                parseOptions("--compare=explicitR4", "--tuningProfile=balanced-no-r4", "--dbWriteBufferSize=268435456");
 
         Object candidate = comparisonCandidateOptions(options);
 
@@ -516,8 +513,7 @@ class RocksDBFileModeBenchmarkTest {
         Field field = options.getClass().getDeclaredField("benchmarks");
         field.setAccessible(true);
         @SuppressWarnings("unchecked")
-        java.util.Set<String> benchmarks =
-                (java.util.Set<String>) field.get(options);
+        java.util.Set<String> benchmarks = (java.util.Set<String>) field.get(options);
 
         Assertions.assertFalse(benchmarks.contains("background"));
     }
@@ -574,7 +570,8 @@ class RocksDBFileModeBenchmarkTest {
                     "--dbPath=" + dbPath);
             Constructor<RocksDBFileModeBenchmark> constructor = RocksDBFileModeBenchmark.class.getDeclaredConstructor();
             constructor.setAccessible(true);
-            Method method = RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
+            Method method =
+                    RocksDBFileModeBenchmark.class.getDeclaredMethod("runOnce", options.getClass(), String.class);
             method.setAccessible(true);
 
             @SuppressWarnings("unchecked")

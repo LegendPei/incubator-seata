@@ -48,6 +48,7 @@ public final class RocksDBRepairReport {
         this.deletedLockIndexCount = 0;
         this.nextSeekKey = null;
     }
+
     RocksDBRepairReport(
             State state,
             int executedActionCount,
@@ -79,6 +80,7 @@ public final class RocksDBRepairReport {
     public RocksDBVerifyReport getAfterVerifyReport() {
         return afterVerifyReport;
     }
+
     public State getState() {
         return state;
     }

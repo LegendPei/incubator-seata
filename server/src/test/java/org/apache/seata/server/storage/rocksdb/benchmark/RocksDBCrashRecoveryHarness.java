@@ -86,10 +86,12 @@ public final class RocksDBCrashRecoveryHarness {
         child.destroyForcibly();
         child.waitFor();
         Map<String, String> checkpointValues = readCheckpoint(checkpoint);
-        long expected = Long.parseLong(checkpointValues.getOrDefault("expectedSessions", checkpointValues.get("sequence")));
+        long expected =
+                Long.parseLong(checkpointValues.getOrDefault("expectedSessions", checkpointValues.get("sequence")));
         try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(storeConfig(dbPath, options))) {
             RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
-            int recovered = engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]).size();
+            int recovered = engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])
+                    .size();
             boolean lastShutdownClean = engine.wasLastShutdownClean();
             System.out.println("R8_RESULT expected=" + expected + " recovered=" + recovered + " lost="
                     + Math.max(0L, expected - recovered) + " checkpointPolicy="
@@ -99,7 +101,9 @@ public final class RocksDBCrashRecoveryHarness {
                     + checkpointValues.get("latestSequence") + " checkpointUnsyncedWrites="
                     + checkpointValues.get("unsyncedWrites") + " lastShutdownClean=" + lastShutdownClean
                     + " clean=" + report.isClean());
-            if (!report.isClean() || recovered > expected || (requiresExactRecovery(options) && recovered != expected)) {
+            if (!report.isClean()
+                    || recovered > expected
+                    || (requiresExactRecovery(options) && recovered != expected)) {
                 throw new IllegalStateException("crash recovery verification failed:" + report);
             }
         }
@@ -146,11 +150,12 @@ public final class RocksDBCrashRecoveryHarness {
         }
         try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(storeConfig(dbPath, options))) {
             RocksDBVerifyReport report = new RocksDBMaintenanceService(engine).verifyCurrentState();
-            int recovered = engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]).size();
+            int recovered = engine.prefixScan(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])
+                    .size();
             boolean lastShutdownClean = engine.wasLastShutdownClean();
             int expected = warmupWrites + count;
-            System.out.println("R8_CLEAN_RESULT expected=" + expected + " recovered=" + recovered + " lastShutdownClean="
-                    + lastShutdownClean + " clean=" + report.isClean());
+            System.out.println("R8_CLEAN_RESULT expected=" + expected + " recovered=" + recovered
+                    + " lastShutdownClean=" + lastShutdownClean + " clean=" + report.isClean());
             if (!lastShutdownClean || !report.isClean() || recovered != expected) {
                 throw new IllegalStateException("clean shutdown verification failed:" + report);
             }
@@ -229,8 +234,7 @@ public final class RocksDBCrashRecoveryHarness {
         if (count <= 0) {
             throw new IllegalArgumentException("count must be positive");
         }
-        if (!CLEAN.equals(options.getOrDefault("mode", PARENT))
-                && (checkpointAfter <= 0 || checkpointAfter > count)) {
+        if (!CLEAN.equals(options.getOrDefault("mode", PARENT)) && (checkpointAfter <= 0 || checkpointAfter > count)) {
             throw new IllegalArgumentException("checkpointAfter must be within 1..count");
         }
         if ("afterSync".equals(checkpointPolicy) && !syncWrite && !walSyncMode.isPeriodic()) {
@@ -326,7 +330,8 @@ public final class RocksDBCrashRecoveryHarness {
     }
 
     private static void writeCheckpoint(
-            Path checkpoint, int sequence, int expectedSessions, String policy, RocksDBWalSyncStats stats) throws Exception {
+            Path checkpoint, int sequence, int expectedSessions, String policy, RocksDBWalSyncStats stats)
+            throws Exception {
         String values = "sequence=" + sequence + '\n'
                 + "expectedSessions=" + expectedSessions + '\n'
                 + "policy=" + policy + '\n'

@@ -468,8 +468,7 @@ class RocksDBStoreEngineTest {
                 StoreException exception = Assertions.assertThrows(
                         StoreException.class, engine::ensureLifecycleWriteLockAcquisitionAllowed);
 
-                Assertions.assertTrue(
-                        exception.getMessage().contains("read-to-write lock upgrade is not allowed"));
+                Assertions.assertTrue(exception.getMessage().contains("read-to-write lock upgrade is not allowed"));
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -489,8 +488,8 @@ class RocksDBStoreEngineTest {
                 .ensureLifecycleWriteLockAcquisitionAllowed();
 
         try {
-            StoreException exception = Assertions.assertThrows(
-                    StoreException.class, () -> engine.withMaintenanceLock(() -> null));
+            StoreException exception =
+                    Assertions.assertThrows(StoreException.class, () -> engine.withMaintenanceLock(() -> null));
 
             Assertions.assertSame(marker, exception);
             Assertions.assertFalse(lifecycleLock.isWriteLockedByCurrentThread());
@@ -529,8 +528,8 @@ class RocksDBStoreEngineTest {
                     "value".getBytes(StandardCharsets.UTF_8));
 
             engine.withMaintenanceLock(() -> {
-                engine.scanByPrefix(RocksDBColumnFamily.DEFAULT, prefix, (key, value) ->
-                        engine.withMaintenanceLock(() -> null));
+                engine.scanByPrefix(
+                        RocksDBColumnFamily.DEFAULT, prefix, (key, value) -> engine.withMaintenanceLock(() -> null));
                 return null;
             });
         }
@@ -553,8 +552,8 @@ class RocksDBStoreEngineTest {
                     .when(engine)
                     .ensureFactoryAccessAllowed();
 
-            StoreException exception = Assertions.assertThrows(
-                    StoreException.class, () -> RocksDBStoreEngineFactory.getInstance(config));
+            StoreException exception =
+                    Assertions.assertThrows(StoreException.class, () -> RocksDBStoreEngineFactory.getInstance(config));
 
             Assertions.assertSame(marker, exception);
             Assertions.assertSame(engine, factoryEngine.get(null));
@@ -628,8 +627,7 @@ class RocksDBStoreEngineTest {
 
             requestedConfig.releasePathRead();
             Future<RocksDBStoreEngine> getFuture = get;
-            RocksDBStoreEngine returned =
-                    Assertions.assertDoesNotThrow(() -> getFuture.get(5, TimeUnit.SECONDS));
+            RocksDBStoreEngine returned = Assertions.assertDoesNotThrow(() -> getFuture.get(5, TimeUnit.SECONDS));
 
             Assertions.assertSame(engine, returned);
             Assertions.assertFalse(returned.isClosed());
@@ -754,7 +752,8 @@ class RocksDBStoreEngineTest {
         byte[] value = "value".getBytes(StandardCharsets.UTF_8);
 
         try {
-            Future<?> write = lifecycleExecutor.submit(() -> engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value));
+            Future<?> write =
+                    lifecycleExecutor.submit(() -> engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, value));
             Assertions.assertTrue(currentTime.awaitAfterWrite(5, TimeUnit.SECONDS));
             Future<?> close = lifecycleExecutor.submit(() -> {
                 closeThread.set(Thread.currentThread());
@@ -842,8 +841,7 @@ class RocksDBStoreEngineTest {
         engine.close();
 
         Assertions.assertThrows(StoreException.class, () -> engine.get(RocksDBColumnFamily.DEFAULT, key));
-        Assertions.assertThrows(
-                StoreException.class, () -> engine.prefixScan(RocksDBColumnFamily.DEFAULT, prefix));
+        Assertions.assertThrows(StoreException.class, () -> engine.prefixScan(RocksDBColumnFamily.DEFAULT, prefix));
         Assertions.assertThrows(
                 StoreException.class,
                 () -> engine.scanByPrefix(
@@ -851,16 +849,14 @@ class RocksDBStoreEngineTest {
         Assertions.assertThrows(
                 StoreException.class,
                 () -> engine.scanByPrefix(RocksDBColumnFamily.DEFAULT, prefix, (entryKey, value) -> {}));
-        Assertions.assertThrows(
-                StoreException.class, () -> engine.prefixExists(RocksDBColumnFamily.DEFAULT, prefix));
+        Assertions.assertThrows(StoreException.class, () -> engine.prefixExists(RocksDBColumnFamily.DEFAULT, prefix));
 
         RocksDBStoreDiagnostics diagnostics = engine.diagnostics();
         Assertions.assertTrue(diagnostics.isClosed());
         Assertions.assertEquals(0L, engine.getLongProperty(RocksDBStoreDiagnostics.ESTIMATE_NUM_KEYS));
         Assertions.assertEquals(
                 0L,
-                engine.getLongProperty(
-                        RocksDBColumnFamily.DEFAULT, RocksDBStoreDiagnostics.CUR_SIZE_ACTIVE_MEM_TABLE));
+                engine.getLongProperty(RocksDBColumnFamily.DEFAULT, RocksDBStoreDiagnostics.CUR_SIZE_ACTIVE_MEM_TABLE));
         Assertions.assertNull(engine.getProperty("rocksdb.stats"));
         Assertions.assertNull(engine.getProperty(RocksDBColumnFamily.DEFAULT, "rocksdb.stats"));
         Assertions.assertEquals(0L, engine.getBlockCacheUsage());
@@ -878,24 +874,20 @@ class RocksDBStoreEngineTest {
             engine.put(batch, RocksDBColumnFamily.DEFAULT, key, value);
             engine.close();
 
-            Assertions.assertThrows(
-                    StoreException.class, () -> engine.put(RocksDBColumnFamily.DEFAULT, key, value));
+            Assertions.assertThrows(StoreException.class, () -> engine.put(RocksDBColumnFamily.DEFAULT, key, value));
             Assertions.assertThrows(StoreException.class, () -> engine.delete(RocksDBColumnFamily.DEFAULT, key));
             Assertions.assertThrows(
                     StoreException.class, () -> engine.put(batch, RocksDBColumnFamily.DEFAULT, key, value));
-            Assertions.assertThrows(
-                    StoreException.class, () -> engine.delete(batch, RocksDBColumnFamily.DEFAULT, key));
+            Assertions.assertThrows(StoreException.class, () -> engine.delete(batch, RocksDBColumnFamily.DEFAULT, key));
             Assertions.assertThrows(StoreException.class, () -> engine.write(batch));
             Assertions.assertThrows(
                     StoreException.class, () -> engine.deleteByPrefix(RocksDBColumnFamily.DEFAULT, prefix));
             Assertions.assertThrows(
                     StoreException.class, () -> engine.deleteRangeByPrefix(RocksDBColumnFamily.DEFAULT, prefix));
             Assertions.assertThrows(
-                    StoreException.class,
-                    () -> engine.deleteByPrefix(batch, RocksDBColumnFamily.DEFAULT, prefix));
+                    StoreException.class, () -> engine.deleteByPrefix(batch, RocksDBColumnFamily.DEFAULT, prefix));
             Assertions.assertThrows(
-                    StoreException.class,
-                    () -> engine.deleteRangeByPrefix(batch, RocksDBColumnFamily.DEFAULT, prefix));
+                    StoreException.class, () -> engine.deleteRangeByPrefix(batch, RocksDBColumnFamily.DEFAULT, prefix));
             Assertions.assertThrows(StoreException.class, () -> engine.withMaintenanceLock(() -> null));
             Assertions.assertThrows(StoreException.class, engine::flush);
         } finally {

@@ -706,8 +706,8 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
     }
 
     private List<GlobalSession> findBackgroundSessionsBySingleStatus(GlobalStatus status, boolean lazyLoadBranch) {
-        return limitBackgroundSessions(findBackgroundSessionsBySingleStatus(
-                status, lazyLoadBranch, backgroundSessionQueryLimit));
+        return limitBackgroundSessions(
+                findBackgroundSessionsBySingleStatus(status, lazyLoadBranch, backgroundSessionQueryLimit));
     }
 
     private List<GlobalSession> findBackgroundSessionsBySingleStatus(

@@ -436,18 +436,15 @@ class RocksDBTransactionStoreManagerTest {
             condition.setNextTimeoutScanCursor(new byte[] {9});
 
             Assertions.assertEquals(1, storeManager.readSession(condition).size());
-            Assertions.assertEquals(
-                    SessionCondition.ScanContinuation.RESUMABLE, condition.getStatusScanContinuation());
-            Assertions.assertEquals(
-                    SessionCondition.ScanContinuation.UNSET, condition.getTimeoutScanContinuation());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.RESUMABLE, condition.getStatusScanContinuation());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.UNSET, condition.getTimeoutScanContinuation());
             byte[] statusInputCursor = condition.getNextStatusScanCursor();
             Assertions.assertNotNull(statusInputCursor);
             condition.setStatusScanCursor(statusInputCursor);
 
             condition.setMaxTimeoutDeadlineMillis(1_000L);
             Assertions.assertEquals(1, storeManager.readSession(condition).size());
-            Assertions.assertEquals(
-                    SessionCondition.ScanContinuation.UNSET, condition.getStatusScanContinuation());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.UNSET, condition.getStatusScanContinuation());
             Assertions.assertEquals(
                     SessionCondition.ScanContinuation.RESUMABLE, condition.getTimeoutScanContinuation());
             Assertions.assertArrayEquals(statusInputCursor, condition.getStatusScanCursor());
@@ -1151,11 +1148,9 @@ class RocksDBTransactionStoreManagerTest {
 
     private void assertContinuationOutputsUnset(SessionCondition condition) {
         Assertions.assertNull(condition.getNextStatusScanCursor());
-        Assertions.assertEquals(
-                SessionCondition.ScanContinuation.UNSET, condition.getStatusScanContinuation());
+        Assertions.assertEquals(SessionCondition.ScanContinuation.UNSET, condition.getStatusScanContinuation());
         Assertions.assertNull(condition.getNextTimeoutScanCursor());
-        Assertions.assertEquals(
-                SessionCondition.ScanContinuation.UNSET, condition.getTimeoutScanContinuation());
+        Assertions.assertEquals(SessionCondition.ScanContinuation.UNSET, condition.getTimeoutScanContinuation());
     }
 
     private GlobalSession globalSession(String name, GlobalStatus status) {

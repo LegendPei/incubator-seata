@@ -516,20 +516,24 @@ class RocksDBLockManagerTest {
             }
             PausingATCore registrationCore = new PausingATCore();
             ExecutorService executor = Executors.newFixedThreadPool(2);
-            CompletableFuture<Long> registration = CompletableFuture.supplyAsync(() -> {
-                try {
-                    return registrationCore.register(globalSession, branchSession);
-                } catch (TransactionException e) {
-                    throw new CompletionException(e);
-                }
-            }, executor);
+            CompletableFuture<Long> registration = CompletableFuture.supplyAsync(
+                    () -> {
+                        try {
+                            return registrationCore.register(globalSession, branchSession);
+                        } catch (TransactionException e) {
+                            throw new CompletionException(e);
+                        }
+                    },
+                    executor);
             CompletableFuture<RocksDBLockManager.CleanOrphanLocksResult> cleanup = null;
             try {
                 Assertions.assertTrue(lockAcquired.await(5, TimeUnit.SECONDS));
-                cleanup = CompletableFuture.supplyAsync(() -> {
-                    cleanupThread.set(Thread.currentThread());
-                    return registrationLockManager.cleanOrphanLocks(1);
-                }, executor);
+                cleanup = CompletableFuture.supplyAsync(
+                        () -> {
+                            cleanupThread.set(Thread.currentThread());
+                            return registrationLockManager.cleanOrphanLocks(1);
+                        },
+                        executor);
 
                 CompletableFuture.anyOf(cleanupEnteredSessionLock, cleanup).get(5, TimeUnit.SECONDS);
                 Assertions.assertNotNull(

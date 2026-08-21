@@ -555,8 +555,8 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
             GlobalStatus.Rollbacked, GlobalStatus.TimeoutRollbacked, GlobalStatus.Committed, GlobalStatus.Finished
         };
         DefaultCoordinator coordinator = new DefaultCoordinator(remotingServer, statuses.length);
-        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(
-                new RocksDBStoreConfig(tempDir.resolve("multi-status-exhausted-cursors").toString(), true))) {
+        try (RocksDBStoreEngine engine = RocksDBStoreEngine.open(new RocksDBStoreConfig(
+                tempDir.resolve("multi-status-exhausted-cursors").toString(), true))) {
             RocksDBSessionManager delegate = new RocksDBSessionManager("multi-status-exhausted-cursors", engine);
             List<SessionCondition> conditions = new ArrayList<>();
             SessionManager sessionManager = mock(SessionManager.class);
@@ -590,8 +590,8 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
                 conditions.clear();
                 List<GlobalSession> nextRound = invokeFindBackgroundSessions(coordinator, statuses, true);
 
-                Assertions.assertTrue(nextRound.stream()
-                        .anyMatch(session -> earlier.getXid().equals(session.getXid())));
+                Assertions.assertTrue(
+                        nextRound.stream().anyMatch(session -> earlier.getXid().equals(session.getXid())));
                 SessionCondition restarted = conditions.stream()
                         .filter(condition -> condition.getStatuses()[0] == statuses[0])
                         .findFirst()
@@ -1772,7 +1772,8 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
 
                 Assertions.assertTrue(result.size() <= DefaultCoordinator.SESSION_BACKGROUND_TASK_QUERY_LIMIT);
                 for (int statusIndex = 1; statusIndex < statuses.length; statusIndex++) {
-                    Assertions.assertTrue(result.contains(laterSessions.get(statuses[statusIndex]).get(round)));
+                    Assertions.assertTrue(result.contains(
+                            laterSessions.get(statuses[statusIndex]).get(round)));
                 }
             }
         } finally {
@@ -1820,10 +1821,14 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
                 List<SessionCondition> roundConditions = conditions.subList(firstCondition, conditions.size());
 
                 Assertions.assertEquals(1, roundConditions.size());
-                Assertions.assertTrue(
-                        roundConditions.stream().mapToInt(SessionCondition::getLimit).sum() <= queryLimit);
-                Assertions.assertTrue(
-                        roundConditions.stream().mapToInt(SessionCondition::getScanLimit).sum() <= queryLimit);
+                Assertions.assertTrue(roundConditions.stream()
+                                .mapToInt(SessionCondition::getLimit)
+                                .sum()
+                        <= queryLimit);
+                Assertions.assertTrue(roundConditions.stream()
+                                .mapToInt(SessionCondition::getScanLimit)
+                                .sum()
+                        <= queryLimit);
                 GlobalStatus queriedStatus = roundConditions.get(0).getStatuses()[0];
                 Assertions.assertEquals(Collections.singletonList(sessions.get(queriedStatus)), result);
                 assertBackgroundSessionCursors(coordinator, expectedCursors);
@@ -1861,7 +1866,7 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     }
 
     private GlobalSession storedBackgroundSession(String name, GlobalStatus status, long beginTime) {
-        GlobalSession session = new GlobalSession("app", "group", name, timeout);
+        GlobalSession session = new GlobalSession("app", "group", name, TIMEOUT);
         session.setStatus(status);
         session.setBeginTime(beginTime);
         return session;
