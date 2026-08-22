@@ -435,8 +435,7 @@ class RocksDBRaftSnapshotSupportTest {
                     incompleteSnapshotDir.resolve("seata-checkpoint-metadata.txt"),
                     StandardCopyOption.REPLACE_EXISTING);
 
-            Assertions.assertThrows(
-                    StoreException.class, () -> support.loadSnapshot(incompleteSnapshotDir, targetDir));
+            Assertions.assertThrows(StoreException.class, () -> support.loadSnapshot(incompleteSnapshotDir, targetDir));
         }
 
         assertMetadataValue(targetDir, key, originalValue);
