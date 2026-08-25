@@ -20,10 +20,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -57,41 +55,29 @@ public class RocksDBLocalLocks {
         if (keys == null || keys.isEmpty()) {
             return new LockScope(Collections.emptyList());
         }
-        List<byte[]> sortedKeys = new ArrayList<>(keys.size());
+        int[] stripeIndexes = new int[keys.size()];
+        int stripeCount = 0;
         for (byte[] key : keys) {
-            sortedKeys.add(Objects.requireNonNull(key, "key must not be null"));
+            stripeIndexes[stripeCount++] = stripeIndex(Objects.requireNonNull(key, "key must not be null"));
         }
-        Collections.sort(sortedKeys, RocksDBLocalLocks::compare);
+        Arrays.sort(stripeIndexes, 0, stripeCount);
 
-        List<ReentrantLock> acquiredLocks = new ArrayList<>();
-        Set<ReentrantLock> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-        for (byte[] key : sortedKeys) {
-            ReentrantLock lock = lockFor(key);
-            if (seen.add(lock)) {
-                lock.lock();
-                acquiredLocks.add(lock);
+        List<ReentrantLock> acquiredLocks = new ArrayList<>(stripeCount);
+        int previousStripe = -1;
+        for (int i = 0; i < stripeCount; i++) {
+            int stripeIndex = stripeIndexes[i];
+            if (stripeIndex != previousStripe) {
+                locks[stripeIndex].lock();
+                acquiredLocks.add(locks[stripeIndex]);
+                previousStripe = stripeIndex;
             }
         }
         return new LockScope(acquiredLocks);
     }
 
-    private ReentrantLock lockFor(byte[] key) {
+    private int stripeIndex(byte[] key) {
         int hash = Arrays.hashCode(key);
-        return locks[Math.floorMod(hash, locks.length)];
-    }
-
-    private static int compare(byte[] left, byte[] right) {
-        if (left == right) {
-            return 0;
-        }
-        int length = Math.min(left.length, right.length);
-        for (int i = 0; i < length; i++) {
-            int result = Byte.compare(left[i], right[i]);
-            if (result != 0) {
-                return result;
-            }
-        }
-        return Integer.compare(left.length, right.length);
+        return Math.floorMod(hash, locks.length);
     }
 
     /**
