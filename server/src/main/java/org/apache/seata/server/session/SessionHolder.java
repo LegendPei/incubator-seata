@@ -245,7 +245,7 @@ public class SessionHolder {
         RocksDBSessionManager.RecoveryCursor cursor = RocksDBSessionManager.RecoveryCursor.initial();
         while (true) {
             RocksDBSessionManager.RecoveryPage page = sessionManager.readStartupRecoveryPage(cursor);
-            reload(page.getSessions(), sessionMode);
+            reload(page.getSessions(), sessionMode, true, true);
             if (page.isExhausted()) {
                 return;
             }
@@ -258,6 +258,11 @@ public class SessionHolder {
     }
 
     public static void reload(Collection<GlobalSession> allSessions, SessionMode storeMode, boolean acquireLock) {
+        reload(allSessions, storeMode, acquireLock, false);
+    }
+
+    private static void reload(
+            Collection<GlobalSession> allSessions, SessionMode storeMode, boolean acquireLock, boolean failFast) {
         if ((SessionMode.FILE == storeMode || SessionMode.RAFT == storeMode)
                 && CollectionUtils.isNotEmpty(allSessions)) {
             long currentTimeMillis = System.currentTimeMillis();
@@ -273,6 +278,7 @@ public class SessionHolder {
                                     "Could not handle the global session, xid: {},error: {}",
                                     globalSession.getXid(),
                                     e.getMessage());
+                            throwIfRocksDBStartupReloadFailed(globalSession, e, failFast);
                         }
                         break;
                     case Committed:
@@ -283,6 +289,7 @@ public class SessionHolder {
                                     "Could not handle the global session, xid: {},error: {}",
                                     globalSession.getXid(),
                                     e.getMessage());
+                            throwIfRocksDBStartupReloadFailed(globalSession, e, failFast);
                         }
                         break;
                     case Finished:
@@ -292,7 +299,7 @@ public class SessionHolder {
                     case TimeoutRollbackFailed:
                     case CommitRetryTimeout:
                     case RollbackRetryTimeout:
-                        removeInErrorState(globalSession);
+                        removeInErrorState(globalSession, failFast);
                         break;
                     case AsyncCommitting:
                     case Committing:
@@ -386,7 +393,18 @@ public class SessionHolder {
         }
     }
 
+    private static void throwIfRocksDBStartupReloadFailed(
+            GlobalSession globalSession, TransactionException cause, boolean failFast) {
+        if (failFast) {
+            throw new StoreException(cause, "RocksDB startup reload failed, xid: " + globalSession.getXid());
+        }
+    }
+
     private static void removeInErrorState(GlobalSession globalSession) {
+        removeInErrorState(globalSession, false);
+    }
+
+    private static void removeInErrorState(GlobalSession globalSession, boolean failFast) {
         try {
             LOGGER.warn(
                     "The global session should NOT be {}, remove it. xid = {}",
@@ -405,6 +423,9 @@ public class SessionHolder {
                     globalSession.getXid(),
                     globalSession.getStatus(),
                     e);
+            if (failFast) {
+                throw new StoreException(e, "RocksDB startup reload failed, xid: " + globalSession.getXid());
+            }
         }
     }
 

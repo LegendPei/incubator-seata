@@ -48,6 +48,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -225,13 +226,21 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return scanGlobalSessions(sessionCondition);
     }
 
-    public RecoveryScanPage readRecoveryPage(GlobalStatus[] statuses, Map<GlobalStatus, byte[]> statusScanCursors) {
-        if (statuses == null || statuses.length == 0) {
-            return new RecoveryScanPage(Collections.emptyList(), Collections.emptyMap(), true, false);
+    public RecoveryScanPage readRecoveryPage(GlobalStatus[] statuses, RecoveryCursor cursor) {
+        GlobalStatus[] requestedStatuses = copyAndValidateRecoveryStatuses(statuses);
+        RecoveryCursor effectiveCursor;
+        if (cursor == null) {
+            effectiveCursor = new RecoveryCursor(requestedStatuses, Collections.emptyMap());
+        } else {
+            if (!sameRecoveryStatuses(requestedStatuses, cursor.statuses)) {
+                throw new IllegalArgumentException("recovery cursor statuses do not match requested statuses");
+            }
+            effectiveCursor = cursor;
         }
-        SessionCondition sessionCondition = new SessionCondition(statuses);
+        SessionCondition sessionCondition =
+                new SessionCondition(Arrays.copyOf(effectiveCursor.statuses, effectiveCursor.statuses.length));
         sessionCondition.setLazyLoadBranch(false);
-        sessionCondition.setStatusScanCursors(statusScanCursors);
+        sessionCondition.setStatusScanCursors(effectiveCursor.statusScanCursors);
         SessionScanStatsAccumulator scanStats = new SessionScanStatsAccumulator();
         long deadlineNanos = fullScanDeadlineMillis > 0
                 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fullScanDeadlineMillis)
@@ -241,10 +250,63 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         if (result.isDeadlineReached()) {
             logStatusScanDeadline(sessionCondition, result.getSessions().size());
         }
-        Map<GlobalStatus, byte[]> nextStatusScanCursors =
-                result.isFullyExhausted() ? Collections.emptyMap() : result.getNextStatusScanCursors();
+        RecoveryCursor continuation = result.isFullyExhausted()
+                ? null
+                : new RecoveryCursor(effectiveCursor.statuses, result.getNextStatusScanCursors());
         return new RecoveryScanPage(
-                result.getSessions(), nextStatusScanCursors, result.isFullyExhausted(), result.isDeadlineReached());
+                result.getSessions(), continuation, result.isFullyExhausted(), result.isDeadlineReached());
+    }
+
+    private static GlobalStatus[] copyAndValidateRecoveryStatuses(GlobalStatus[] statuses) {
+        if (statuses == null || statuses.length == 0) {
+            throw new IllegalArgumentException("recovery statuses must not be empty");
+        }
+        GlobalStatus[] copy = Arrays.copyOf(statuses, statuses.length);
+        EnumSet<GlobalStatus> seen = EnumSet.noneOf(GlobalStatus.class);
+        for (GlobalStatus status : copy) {
+            if (status == null) {
+                throw new IllegalArgumentException("recovery statuses must not contain null");
+            }
+            if (!seen.add(status)) {
+                throw new IllegalArgumentException("recovery statuses must not contain duplicates");
+            }
+        }
+        return copy;
+    }
+
+    private static boolean sameRecoveryStatuses(GlobalStatus[] requestedStatuses, GlobalStatus[] cursorStatuses) {
+        if (requestedStatuses.length != cursorStatuses.length) {
+            return false;
+        }
+        EnumSet<GlobalStatus> requested = EnumSet.noneOf(GlobalStatus.class);
+        requested.addAll(Arrays.asList(requestedStatuses));
+        EnumSet<GlobalStatus> owned = EnumSet.noneOf(GlobalStatus.class);
+        owned.addAll(Arrays.asList(cursorStatuses));
+        return requested.equals(owned);
+    }
+
+    private static Map<GlobalStatus, byte[]> copyAndValidateRecoveryCursors(
+            GlobalStatus[] statuses, Map<GlobalStatus, byte[]> statusScanCursors) {
+        if (statusScanCursors == null || statusScanCursors.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        EnumSet<GlobalStatus> ownedStatuses = EnumSet.noneOf(GlobalStatus.class);
+        ownedStatuses.addAll(Arrays.asList(statuses));
+        Map<GlobalStatus, byte[]> copies = new EnumMap<>(GlobalStatus.class);
+        for (Map.Entry<GlobalStatus, byte[]> entry : statusScanCursors.entrySet()) {
+            GlobalStatus status = entry.getKey();
+            byte[] statusScanCursor = entry.getValue();
+            if (status == null || !ownedStatuses.contains(status)) {
+                throw new IllegalStateException("recovery cursor contains an unowned status");
+            }
+            if (statusScanCursor == null
+                    || !RocksDBKeyCodec.startsWith(
+                            statusScanCursor, RocksDBKeyCodec.encodeGlobalStatusPrefix(status))) {
+                throw new IllegalStateException("recovery cursor status prefix does not match its status");
+            }
+            copies.put(status, Arrays.copyOf(statusScanCursor, statusScanCursor.length));
+        }
+        return Collections.unmodifiableMap(copies);
     }
 
     @Override
@@ -494,9 +556,13 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             }
         }
         boolean madeProgress = false;
+        boolean deadlineReachedWhileMakingProgress = false;
         while (!queue.isEmpty() && !isLimitReached(limit, result)) {
-            if (isDeadlineReached(deadlineNanos) && (!requireProgressAfterDeadline || madeProgress)) {
-                return multiStatusScanResult(result, cursors, initialCursors, true, false);
+            if (isDeadlineReached(deadlineNanos)) {
+                deadlineReachedWhileMakingProgress = true;
+                if (!requireProgressAfterDeadline || madeProgress) {
+                    return multiStatusScanResult(result, cursors, initialCursors, true, false);
+                }
             }
             StatusScanCursor cursor = queue.poll();
             RocksDBIndexManager.StatusIndexEntry entry = cursor.current();
@@ -511,6 +577,9 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             boolean limitReached = isLimitReached(limit, result);
             cursor.advance(limit, result, scanStats, !limitReached);
             madeProgress = true;
+            if (requireProgressAfterDeadline && isDeadlineReached(deadlineNanos)) {
+                deadlineReachedWhileMakingProgress = true;
+            }
             if (limitReached) {
                 break;
             }
@@ -518,7 +587,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 queue.offer(cursor);
             }
         }
-        return multiStatusScanResult(result, cursors, initialCursors, false, true);
+        return multiStatusScanResult(result, cursors, initialCursors, deadlineReachedWhileMakingProgress, true);
     }
 
     private MultiStatusScanResult multiStatusScanResult(
@@ -857,19 +926,26 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
     }
 
+    public static final class RecoveryCursor {
+        private final GlobalStatus[] statuses;
+        private final Map<GlobalStatus, byte[]> statusScanCursors;
+
+        private RecoveryCursor(GlobalStatus[] statuses, Map<GlobalStatus, byte[]> statusScanCursors) {
+            this.statuses = copyAndValidateRecoveryStatuses(statuses);
+            this.statusScanCursors = copyAndValidateRecoveryCursors(this.statuses, statusScanCursors);
+        }
+    }
+
     public static final class RecoveryScanPage {
         private final List<GlobalSession> sessions;
-        private final Map<GlobalStatus, byte[]> nextStatusScanCursors;
+        private final RecoveryCursor continuation;
         private final boolean exhausted;
         private final boolean deadlineReached;
 
         private RecoveryScanPage(
-                List<GlobalSession> sessions,
-                Map<GlobalStatus, byte[]> nextStatusScanCursors,
-                boolean exhausted,
-                boolean deadlineReached) {
+                List<GlobalSession> sessions, RecoveryCursor continuation, boolean exhausted, boolean deadlineReached) {
             this.sessions = sessions;
-            this.nextStatusScanCursors = nextStatusScanCursors;
+            this.continuation = continuation;
             this.exhausted = exhausted;
             this.deadlineReached = deadlineReached;
         }
@@ -878,8 +954,8 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             return sessions;
         }
 
-        public Map<GlobalStatus, byte[]> getNextStatusScanCursors() {
-            return nextStatusScanCursors;
+        public RecoveryCursor getContinuation() {
+            return continuation;
         }
 
         public boolean isExhausted() {

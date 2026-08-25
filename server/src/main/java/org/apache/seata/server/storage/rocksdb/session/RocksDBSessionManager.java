@@ -30,9 +30,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 
 /**
  * RocksDB-backed session manager for file store engine.
@@ -108,9 +106,8 @@ public class RocksDBSessionManager extends AbstractSessionManager {
     public RecoveryPage readStartupRecoveryPage(RecoveryCursor cursor) {
         RocksDBTransactionStoreManager.RecoveryScanPage scanPage = ((RocksDBTransactionStoreManager)
                         transactionStoreManager)
-                .readRecoveryPage(RECOVERY_STATUSES, cursor.statusScanCursors);
-        RecoveryCursor continuation =
-                scanPage.isExhausted() ? null : new RecoveryCursor(scanPage.getNextStatusScanCursors());
+                .readRecoveryPage(RECOVERY_STATUSES, cursor.storeCursor);
+        RecoveryCursor continuation = scanPage.isExhausted() ? null : new RecoveryCursor(scanPage.getContinuation());
         return new RecoveryPage(scanPage.getSessions(), continuation, scanPage.isExhausted());
     }
 
@@ -133,14 +130,14 @@ public class RocksDBSessionManager extends AbstractSessionManager {
     }
 
     public static final class RecoveryCursor {
-        private final Map<GlobalStatus, byte[]> statusScanCursors;
+        private final RocksDBTransactionStoreManager.RecoveryCursor storeCursor;
 
-        private RecoveryCursor(Map<GlobalStatus, byte[]> statusScanCursors) {
-            this.statusScanCursors = statusScanCursors;
+        private RecoveryCursor(RocksDBTransactionStoreManager.RecoveryCursor storeCursor) {
+            this.storeCursor = storeCursor;
         }
 
         public static RecoveryCursor initial() {
-            return new RecoveryCursor(Collections.emptyMap());
+            return new RecoveryCursor(null);
         }
     }
 

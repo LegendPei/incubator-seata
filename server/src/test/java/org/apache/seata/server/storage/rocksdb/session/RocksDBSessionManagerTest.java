@@ -296,7 +296,8 @@ class RocksDBSessionManagerTest {
 
             Assertions.assertTrue(pageCount > 1);
             Assertions.assertEquals(
-                    Set.of(begin.getXid(), committing.getXid(), rollbacking.getXid()), recoveryCounts.keySet());
+                    new HashSet<>(Arrays.asList(begin.getXid(), committing.getXid(), rollbacking.getXid())),
+                    recoveryCounts.keySet());
             Assertions.assertTrue(recoveryCounts.values().stream().allMatch(count -> count == 1));
         }
     }

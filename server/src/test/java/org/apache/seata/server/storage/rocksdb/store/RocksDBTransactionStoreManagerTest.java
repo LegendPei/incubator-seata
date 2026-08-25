@@ -43,12 +43,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.mock.env.MockEnvironment;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -881,13 +884,13 @@ class RocksDBTransactionStoreManagerTest {
                 storeManager.writeSession(LogOperation.GLOBAL_ADD, session);
             }
 
-            Map<GlobalStatus, byte[]> cursors = Collections.emptyMap();
+            RocksDBTransactionStoreManager.RecoveryCursor cursor = null;
             List<String> recoveredXids = new ArrayList<>();
             int deadlinePages = 0;
             boolean exhausted = false;
             for (int pageNumber = 0; pageNumber < 10; pageNumber++) {
                 RocksDBTransactionStoreManager.RecoveryScanPage page = storeManager.readRecoveryPage(
-                        new GlobalStatus[] {GlobalStatus.Committed, GlobalStatus.Rollbacked}, cursors);
+                        new GlobalStatus[] {GlobalStatus.Committed, GlobalStatus.Rollbacked}, cursor);
                 recoveredXids.addAll(
                         page.getSessions().stream().map(GlobalSession::getXid).collect(Collectors.toList()));
                 if (page.isDeadlineReached()) {
@@ -895,10 +898,11 @@ class RocksDBTransactionStoreManagerTest {
                 }
                 if (page.isExhausted()) {
                     exhausted = true;
+                    Assertions.assertNull(page.getContinuation());
                     break;
                 }
-                Assertions.assertFalse(page.getNextStatusScanCursors().isEmpty());
-                cursors = page.getNextStatusScanCursors();
+                Assertions.assertNotNull(page.getContinuation());
+                cursor = page.getContinuation();
             }
 
             Assertions.assertTrue(exhausted);
@@ -910,6 +914,109 @@ class RocksDBTransactionStoreManagerTest {
                             committedSecond.getXid(),
                             rollbackedSecond.getXid()),
                     recoveredXids);
+        }
+    }
+
+    @Test
+    void testRecoveryCursorDefensivelyCopiesCallerStatuses() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("recovery-cursor-status-copy")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("tx-recovery-copy-first", GlobalStatus.Committed);
+            GlobalSession second = globalSession("tx-recovery-copy-second", GlobalStatus.Committed);
+            first.setBeginTime(100L);
+            second.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+            GlobalStatus[] statuses = {GlobalStatus.Committed};
+
+            RocksDBTransactionStoreManager.RecoveryScanPage firstPage = storeManager.readRecoveryPage(statuses, null);
+            statuses[0] = GlobalStatus.Rollbacked;
+            RocksDBTransactionStoreManager.RecoveryScanPage secondPage = storeManager.readRecoveryPage(
+                    new GlobalStatus[] {GlobalStatus.Committed}, firstPage.getContinuation());
+
+            Assertions.assertEquals(
+                    first.getXid(), firstPage.getSessions().get(0).getXid());
+            Assertions.assertEquals(
+                    second.getXid(), secondPage.getSessions().get(0).getXid());
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testRecoveryCursorDeepCopiesPrivateState() throws Exception {
+        Constructor<RocksDBTransactionStoreManager.RecoveryCursor> constructor =
+                RocksDBTransactionStoreManager.RecoveryCursor.class.getDeclaredConstructor(
+                        GlobalStatus[].class, Map.class);
+        Assertions.assertTrue(Modifier.isPrivate(constructor.getModifiers()));
+        constructor.setAccessible(true);
+        GlobalStatus[] statuses = {GlobalStatus.Committed};
+        byte[] cursorValue = RocksDBKeyCodec.encodeGlobalStatusIndex(GlobalStatus.Committed, 100L, "tx-cursor-copy");
+        byte[] expectedCursorValue = Arrays.copyOf(cursorValue, cursorValue.length);
+        Map<GlobalStatus, byte[]> cursorValues = new EnumMap<>(GlobalStatus.class);
+        cursorValues.put(GlobalStatus.Committed, cursorValue);
+
+        RocksDBTransactionStoreManager.RecoveryCursor cursor = constructor.newInstance(statuses, cursorValues);
+        statuses[0] = GlobalStatus.Rollbacked;
+        cursorValue[cursorValue.length - 1] ^= 1;
+        cursorValues.clear();
+
+        Field statusesField = RocksDBTransactionStoreManager.RecoveryCursor.class.getDeclaredField("statuses");
+        statusesField.setAccessible(true);
+        Assertions.assertArrayEquals(
+                new GlobalStatus[] {GlobalStatus.Committed}, (GlobalStatus[]) statusesField.get(cursor));
+        Field cursorValuesField =
+                RocksDBTransactionStoreManager.RecoveryCursor.class.getDeclaredField("statusScanCursors");
+        cursorValuesField.setAccessible(true);
+        Map<GlobalStatus, byte[]> copiedCursorValues = (Map<GlobalStatus, byte[]>) cursorValuesField.get(cursor);
+        Assertions.assertArrayEquals(expectedCursorValue, copiedCursorValues.get(GlobalStatus.Committed));
+        Assertions.assertNotSame(cursorValue, copiedCursorValues.get(GlobalStatus.Committed));
+        Assertions.assertThrows(UnsupportedOperationException.class, copiedCursorValues::clear);
+    }
+
+    @Test
+    void testRecoveryCursorRejectsStatusMismatch() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("recovery-cursor-status-mismatch")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("tx-recovery-mismatch-first", GlobalStatus.Committed);
+            GlobalSession second = globalSession("tx-recovery-mismatch-second", GlobalStatus.Committed);
+            first.setBeginTime(100L);
+            second.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+            RocksDBTransactionStoreManager.RecoveryScanPage firstPage =
+                    storeManager.readRecoveryPage(new GlobalStatus[] {GlobalStatus.Committed}, null);
+
+            IllegalArgumentException exception = Assertions.assertThrows(
+                    IllegalArgumentException.class,
+                    () -> storeManager.readRecoveryPage(
+                            new GlobalStatus[] {GlobalStatus.Rollbacked}, firstPage.getContinuation()));
+
+            Assertions.assertEquals("recovery cursor statuses do not match requested statuses", exception.getMessage());
+        }
+    }
+
+    @Test
+    void testRecoveryPageRecordsExpiredDeadlineAfterMandatoryProgress() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "2");
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("recovery-expired-deadline-progress")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            replaceIndexManager(storeManager, new SlowIndexManager(engine));
+            GlobalSession committed = globalSession("tx-recovery-expired-deadline", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+
+            RocksDBTransactionStoreManager.RecoveryScanPage page =
+                    storeManager.readRecoveryPage(new GlobalStatus[] {GlobalStatus.Committed}, null);
+
+            Assertions.assertEquals(1, page.getSessions().size());
+            Assertions.assertTrue(page.isExhausted());
+            Assertions.assertTrue(page.isDeadlineReached());
         }
     }
 

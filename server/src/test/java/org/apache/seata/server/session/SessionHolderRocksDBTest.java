@@ -23,9 +23,11 @@ import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.common.store.SessionMode;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.constants.ConfigurationKeys;
+import org.apache.seata.core.exception.TransactionException;
 import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
 import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.coordinator.DefaultCoordinator;
 import org.apache.seata.server.lock.LockManager;
 import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
@@ -184,6 +186,82 @@ class SessionHolderRocksDBTest {
         Assertions.assertEquals(first.getXid(), recoveredBranch.getValue().getXid());
     }
 
+    @Test
+    void testRocksDBFileEngineFailsWhenLaterPageTerminalReloadFails() throws Exception {
+        DefaultCoordinator originalCoordinator = getDefaultCoordinator();
+        try {
+            configurePagedRocksDBFileMode(1, 1);
+            setDefaultCoordinator(Mockito.mock(DefaultCoordinator.class));
+            LockManager lockManager = recordingLockManager();
+            setLockManager(lockManager);
+            RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance();
+            RocksDBSessionManager writer = new RocksDBSessionManager("strict-reload-writer", engine);
+            BranchSession firstBranch = branchSession(5001L, 5001L, "t_order:first-strict");
+            GlobalSession first = globalSession(firstBranch);
+            first.setBeginTime(100L);
+            GlobalSession committed = globalSession(5002L);
+            committed.setBeginTime(200L);
+            committed.setStatus(GlobalStatus.Committed);
+            writer.addGlobalSession(first);
+            writer.addBranchSession(first, firstBranch);
+            writer.addGlobalSession(committed);
+            Mockito.when(lockManager.releaseGlobalSessionLock(
+                            Mockito.argThat(session -> committed.getXid().equals(session.getXid()))))
+                    .thenThrow(new TransactionException("terminal cleanup failure"));
+            markMigrationCompleted(engine);
+
+            StoreException exception =
+                    Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+            Assertions.assertTrue(exception.getMessage().contains("RocksDB startup reload failed"));
+
+            Mockito.verify(lockManager, Mockito.times(1))
+                    .acquireLock(
+                            Mockito.argThat(branch -> first.getXid().equals(branch.getXid())),
+                            Mockito.eq(true),
+                            Mockito.eq(false));
+            Mockito.verify(lockManager, Mockito.times(1))
+                    .releaseGlobalSessionLock(
+                            Mockito.argThat(session -> committed.getXid().equals(session.getXid())));
+        } finally {
+            setDefaultCoordinator(originalCoordinator);
+        }
+    }
+
+    @Test
+    void testRocksDBFileEngineFailsWhenLaterPageErrorStateRemovalFails() throws Exception {
+        configurePagedRocksDBFileMode(1, 1);
+        LockManager lockManager = recordingLockManager();
+        setLockManager(lockManager);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance();
+        RocksDBSessionManager writer = new RocksDBSessionManager("strict-error-removal-writer", engine);
+        BranchSession firstBranch = branchSession(5101L, 5101L, "t_order:first-error-removal");
+        GlobalSession first = globalSession(firstBranch);
+        first.setBeginTime(100L);
+        GlobalSession finished = globalSession(5102L);
+        finished.setBeginTime(200L);
+        finished.setStatus(GlobalStatus.Finished);
+        writer.addGlobalSession(first);
+        writer.addBranchSession(first, firstBranch);
+        writer.addGlobalSession(finished);
+        Mockito.when(lockManager.releaseGlobalSessionLock(
+                        Mockito.argThat(session -> finished.getXid().equals(session.getXid()))))
+                .thenThrow(new TransactionException("error-state removal failure"));
+        markMigrationCompleted(engine);
+
+        StoreException exception =
+                Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+        Assertions.assertTrue(exception.getMessage().contains("RocksDB startup reload failed"));
+
+        Mockito.verify(lockManager, Mockito.times(1))
+                .acquireLock(
+                        Mockito.argThat(branch -> first.getXid().equals(branch.getXid())),
+                        Mockito.eq(true),
+                        Mockito.eq(false));
+        Mockito.verify(lockManager, Mockito.times(1))
+                .releaseGlobalSessionLock(
+                        Mockito.argThat(session -> finished.getXid().equals(session.getXid())));
+    }
+
     private void configureRocksDBFileMode() {
         System.setProperty(
                 ConfigurationKeys.STORE_FILE_DIR, tempDir.resolve("file").toString());
@@ -212,6 +290,18 @@ class SessionHolderRocksDBTest {
         Field field = LockerManagerFactory.class.getDeclaredField("LOCK_MANAGER");
         field.setAccessible(true);
         field.set(null, lockManager);
+    }
+
+    private void setDefaultCoordinator(DefaultCoordinator coordinator) throws Exception {
+        Field field = DefaultCoordinator.class.getDeclaredField("instance");
+        field.setAccessible(true);
+        field.set(null, coordinator);
+    }
+
+    private DefaultCoordinator getDefaultCoordinator() throws Exception {
+        Field field = DefaultCoordinator.class.getDeclaredField("instance");
+        field.setAccessible(true);
+        return (DefaultCoordinator) field.get(null);
     }
 
     private void markMigrationCompleted(RocksDBStoreEngine engine) {
