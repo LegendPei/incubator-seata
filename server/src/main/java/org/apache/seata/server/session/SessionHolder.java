@@ -42,6 +42,7 @@ import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBOrphanLockCleanupController;
 import org.apache.seata.server.storage.rocksdb.migration.RocksDBMigrationService;
+import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.store.FileStoreEngine;
 import org.apache.seata.server.store.StoreConfig;
 import org.apache.seata.server.store.VGroupMappingStoreManager;
@@ -163,7 +164,7 @@ public class SessionHolder {
                             new Object[] {ROOT_SESSION_MANAGER_NAME});
                     cleanRocksDBOrphanLocks();
                     startRocksDBOrphanLockCleanup(rocksDBStoreEngine);
-                    reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
+                    reloadRocksDBSessions((RocksDBSessionManager) ROOT_SESSION_MANAGER, sessionMode);
                 } else {
                     ROOT_SESSION_MANAGER =
                             EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
@@ -237,6 +238,18 @@ public class SessionHolder {
             reload(ROOT_SESSION_MANAGER.allSessions(), sessionMode);
         } else {
             reload(null, sessionMode);
+        }
+    }
+
+    private static void reloadRocksDBSessions(RocksDBSessionManager sessionManager, SessionMode sessionMode) {
+        RocksDBSessionManager.RecoveryCursor cursor = RocksDBSessionManager.RecoveryCursor.initial();
+        while (true) {
+            RocksDBSessionManager.RecoveryPage page = sessionManager.readStartupRecoveryPage(cursor);
+            reload(page.getSessions(), sessionMode);
+            if (page.isExhausted()) {
+                return;
+            }
+            cursor = page.getContinuation();
         }
     }
 

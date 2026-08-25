@@ -51,7 +51,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 class RocksDBTransactionStoreManagerTest {
 
@@ -859,6 +861,59 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testRecoveryPagesContinueAfterDeadlineUntilExhaustedWithoutDuplicates() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "3");
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("recovery-deadline-pages")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            replaceIndexManager(storeManager, new SlowIndexManager(engine));
+            GlobalSession committedFirst = globalSession("tx-recovery-committed-first", GlobalStatus.Committed);
+            GlobalSession rollbackedFirst = globalSession("tx-recovery-rollbacked-first", GlobalStatus.Rollbacked);
+            GlobalSession committedSecond = globalSession("tx-recovery-committed-second", GlobalStatus.Committed);
+            GlobalSession rollbackedSecond = globalSession("tx-recovery-rollbacked-second", GlobalStatus.Rollbacked);
+            committedFirst.setBeginTime(100L);
+            rollbackedFirst.setBeginTime(200L);
+            committedSecond.setBeginTime(300L);
+            rollbackedSecond.setBeginTime(400L);
+            for (GlobalSession session :
+                    Arrays.asList(committedFirst, rollbackedFirst, committedSecond, rollbackedSecond)) {
+                storeManager.writeSession(LogOperation.GLOBAL_ADD, session);
+            }
+
+            Map<GlobalStatus, byte[]> cursors = Collections.emptyMap();
+            List<String> recoveredXids = new ArrayList<>();
+            int deadlinePages = 0;
+            boolean exhausted = false;
+            for (int pageNumber = 0; pageNumber < 10; pageNumber++) {
+                RocksDBTransactionStoreManager.RecoveryScanPage page = storeManager.readRecoveryPage(
+                        new GlobalStatus[] {GlobalStatus.Committed, GlobalStatus.Rollbacked}, cursors);
+                recoveredXids.addAll(
+                        page.getSessions().stream().map(GlobalSession::getXid).collect(Collectors.toList()));
+                if (page.isDeadlineReached()) {
+                    deadlinePages++;
+                }
+                if (page.isExhausted()) {
+                    exhausted = true;
+                    break;
+                }
+                Assertions.assertFalse(page.getNextStatusScanCursors().isEmpty());
+                cursors = page.getNextStatusScanCursors();
+            }
+
+            Assertions.assertTrue(exhausted);
+            Assertions.assertTrue(deadlinePages > 1);
+            Assertions.assertEquals(
+                    Arrays.asList(
+                            committedFirst.getXid(),
+                            rollbackedFirst.getXid(),
+                            committedSecond.getXid(),
+                            rollbackedSecond.getXid()),
+                    recoveredXids);
+        }
+    }
+
+    @Test
     void testMultiStatusScanPageSizeUsesConfiguredValue() throws Exception {
         environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "64");
         ConfigurationCache.clear();
@@ -1260,6 +1315,25 @@ class RocksDBTransactionStoreManagerTest {
         public StatusScanResult scanXidsByStatus(
                 GlobalStatus status, long minBeginTimeInclusive, long maxBeginTimeInclusive, byte[] cursor, int limit) {
             pagedStatusScanCalls++;
+            return super.scanXidsByStatus(status, minBeginTimeInclusive, maxBeginTimeInclusive, cursor, limit);
+        }
+    }
+
+    private static final class SlowIndexManager extends RocksDBIndexManager {
+
+        private SlowIndexManager(RocksDBStoreEngine storeEngine) {
+            super(storeEngine);
+        }
+
+        @Override
+        public StatusScanResult scanXidsByStatus(
+                GlobalStatus status, long minBeginTimeInclusive, long maxBeginTimeInclusive, byte[] cursor, int limit) {
+            try {
+                TimeUnit.MILLISECONDS.sleep(2);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
             return super.scanXidsByStatus(status, minBeginTimeInclusive, maxBeginTimeInclusive, cursor, limit);
         }
     }

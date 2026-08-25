@@ -225,6 +225,28 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         return scanGlobalSessions(sessionCondition);
     }
 
+    public RecoveryScanPage readRecoveryPage(GlobalStatus[] statuses, Map<GlobalStatus, byte[]> statusScanCursors) {
+        if (statuses == null || statuses.length == 0) {
+            return new RecoveryScanPage(Collections.emptyList(), Collections.emptyMap(), true, false);
+        }
+        SessionCondition sessionCondition = new SessionCondition(statuses);
+        sessionCondition.setLazyLoadBranch(false);
+        sessionCondition.setStatusScanCursors(statusScanCursors);
+        SessionScanStatsAccumulator scanStats = new SessionScanStatsAccumulator();
+        long deadlineNanos = fullScanDeadlineMillis > 0
+                ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fullScanDeadlineMillis)
+                : 0L;
+        MultiStatusScanResult result = readByStatusesWithKWayMerge(
+                sessionCondition, null, multiStatusScanPageSize, new ScanBudget(null), deadlineNanos, scanStats, true);
+        if (result.isDeadlineReached()) {
+            logStatusScanDeadline(sessionCondition, result.getSessions().size());
+        }
+        Map<GlobalStatus, byte[]> nextStatusScanCursors =
+                result.isFullyExhausted() ? Collections.emptyMap() : result.getNextStatusScanCursors();
+        return new RecoveryScanPage(
+                result.getSessions(), nextStatusScanCursors, result.isFullyExhausted(), result.isDeadlineReached());
+    }
+
     @Override
     public void shutdown() {
         if (factoryManaged) {
@@ -434,6 +456,18 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             ScanBudget scanBudget,
             long deadlineNanos,
             SessionScanStatsAccumulator scanStats) {
+        return readByStatusesWithKWayMerge(
+                sessionCondition, maxBeginTime, limit, scanBudget, deadlineNanos, scanStats, false);
+    }
+
+    private MultiStatusScanResult readByStatusesWithKWayMerge(
+            SessionCondition sessionCondition,
+            Long maxBeginTime,
+            Integer limit,
+            ScanBudget scanBudget,
+            long deadlineNanos,
+            SessionScanStatsAccumulator scanStats,
+            boolean requireProgressAfterDeadline) {
         Set<String> seenXids = new LinkedHashSet<>();
         List<GlobalSession> result = new ArrayList<>();
         PriorityQueue<StatusScanCursor> queue =
@@ -443,7 +477,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         List<StatusScanCursor> cursors = new ArrayList<>();
         Map<GlobalStatus, byte[]> initialCursors = sessionCondition.getStatusScanCursors();
         for (GlobalStatus status : sessionCondition.getStatuses()) {
-            if (isDeadlineReached(deadlineNanos)) {
+            if (!requireProgressAfterDeadline && isDeadlineReached(deadlineNanos)) {
                 return multiStatusScanResult(result, cursors, initialCursors, true, false);
             }
             StatusScanCursor cursor = new StatusScanCursor(
@@ -459,8 +493,9 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 queue.offer(cursor);
             }
         }
+        boolean madeProgress = false;
         while (!queue.isEmpty() && !isLimitReached(limit, result)) {
-            if (isDeadlineReached(deadlineNanos)) {
+            if (isDeadlineReached(deadlineNanos) && (!requireProgressAfterDeadline || madeProgress)) {
                 return multiStatusScanResult(result, cursors, initialCursors, true, false);
             }
             StatusScanCursor cursor = queue.poll();
@@ -475,6 +510,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                     scanStats);
             boolean limitReached = isLimitReached(limit, result);
             cursor.advance(limit, result, scanStats, !limitReached);
+            madeProgress = true;
             if (limitReached) {
                 break;
             }
@@ -491,11 +527,11 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
             Map<GlobalStatus, byte[]> initialCursors,
             boolean deadlineReached,
             boolean passMayBeComplete) {
-        if (passMayBeComplete
-                && sessions.isEmpty()
+        boolean fullyExhausted = passMayBeComplete
                 && !cursors.isEmpty()
-                && cursors.stream().allMatch(StatusScanCursor::isFullyExhausted)) {
-            return new MultiStatusScanResult(sessions, Collections.emptyMap(), deadlineReached);
+                && cursors.stream().allMatch(StatusScanCursor::isFullyExhausted);
+        if (fullyExhausted && sessions.isEmpty()) {
+            return new MultiStatusScanResult(sessions, Collections.emptyMap(), deadlineReached, true);
         }
         Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
         nextCursors.putAll(initialCursors);
@@ -505,7 +541,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                 nextCursors.put(cursor.status(), resumeCursor);
             }
         }
-        return new MultiStatusScanResult(sessions, nextCursors, deadlineReached);
+        return new MultiStatusScanResult(sessions, nextCursors, deadlineReached, fullyExhausted);
     }
 
     private boolean isDeadlineReached(long deadlineNanos) {
@@ -791,14 +827,17 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         private final List<GlobalSession> sessions;
         private final Map<GlobalStatus, byte[]> nextStatusScanCursors;
         private final boolean deadlineReached;
+        private final boolean fullyExhausted;
 
         private MultiStatusScanResult(
                 List<GlobalSession> sessions,
                 Map<GlobalStatus, byte[]> nextStatusScanCursors,
-                boolean deadlineReached) {
+                boolean deadlineReached,
+                boolean fullyExhausted) {
             this.sessions = sessions;
             this.nextStatusScanCursors = nextStatusScanCursors;
             this.deadlineReached = deadlineReached;
+            this.fullyExhausted = fullyExhausted;
         }
 
         private List<GlobalSession> getSessions() {
@@ -810,6 +849,44 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         }
 
         private boolean isDeadlineReached() {
+            return deadlineReached;
+        }
+
+        private boolean isFullyExhausted() {
+            return fullyExhausted;
+        }
+    }
+
+    public static final class RecoveryScanPage {
+        private final List<GlobalSession> sessions;
+        private final Map<GlobalStatus, byte[]> nextStatusScanCursors;
+        private final boolean exhausted;
+        private final boolean deadlineReached;
+
+        private RecoveryScanPage(
+                List<GlobalSession> sessions,
+                Map<GlobalStatus, byte[]> nextStatusScanCursors,
+                boolean exhausted,
+                boolean deadlineReached) {
+            this.sessions = sessions;
+            this.nextStatusScanCursors = nextStatusScanCursors;
+            this.exhausted = exhausted;
+            this.deadlineReached = deadlineReached;
+        }
+
+        public List<GlobalSession> getSessions() {
+            return sessions;
+        }
+
+        public Map<GlobalStatus, byte[]> getNextStatusScanCursors() {
+            return nextStatusScanCursors;
+        }
+
+        public boolean isExhausted() {
+            return exhausted;
+        }
+
+        public boolean isDeadlineReached() {
             return deadlineReached;
         }
     }

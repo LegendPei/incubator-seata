@@ -16,6 +16,7 @@
  */
 package org.apache.seata.server.storage.rocksdb.session;
 
+import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
@@ -38,6 +39,7 @@ import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -51,11 +53,13 @@ class RocksDBSessionManagerTest {
     Path tempDir;
 
     private Object originalEnvironment;
+    private MockEnvironment environment;
 
     @BeforeEach
     void beforeEach() {
         originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
-        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
+        environment = new MockEnvironment();
+        ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, environment);
         ConfigurationCache.clear();
     }
 
@@ -253,6 +257,47 @@ class RocksDBSessionManagerTest {
                     timeoutRollbacked.getXid(),
                     committed.getXid(),
                     finished.getXid());
+        }
+    }
+
+    @Test
+    void testStartupRecoveryPagesRetainContinuationUntilEveryXidIsExhausted() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "1");
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("startup-recovery-pages")) {
+            RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine);
+            GlobalSession begin = globalSession("tx-recovery-begin", GlobalStatus.Begin);
+            GlobalSession committing = globalSession("tx-recovery-committing", GlobalStatus.Committing);
+            GlobalSession rollbacking = globalSession("tx-recovery-rollbacking", GlobalStatus.Rollbacking);
+            begin.setBeginTime(100L);
+            committing.setBeginTime(200L);
+            rollbacking.setBeginTime(300L);
+            sessionManager.addGlobalSession(begin);
+            sessionManager.addGlobalSession(committing);
+            sessionManager.addGlobalSession(rollbacking);
+
+            RocksDBSessionManager.RecoveryCursor cursor = RocksDBSessionManager.RecoveryCursor.initial();
+            Map<String, Integer> recoveryCounts = new HashMap<>();
+            int pageCount = 0;
+            while (true) {
+                RocksDBSessionManager.RecoveryPage page = sessionManager.readStartupRecoveryPage(cursor);
+                pageCount++;
+                Assertions.assertTrue(page.getSessions().size() <= 1);
+                page.getSessions().forEach(session -> recoveryCounts.merge(session.getXid(), 1, Integer::sum));
+                if (page.isExhausted()) {
+                    Assertions.assertNull(page.getContinuation());
+                    break;
+                }
+                Assertions.assertNotNull(page.getContinuation());
+                cursor = page.getContinuation();
+                Assertions.assertTrue(pageCount < 20, "recovery pages must make forward progress");
+            }
+
+            Assertions.assertTrue(pageCount > 1);
+            Assertions.assertEquals(
+                    Set.of(begin.getXid(), committing.getXid(), rollbacking.getXid()), recoveryCounts.keySet());
+            Assertions.assertTrue(recoveryCounts.values().stream().allMatch(count -> count == 1));
         }
     }
 

@@ -18,6 +18,7 @@ package org.apache.seata.server.session;
 
 import org.apache.seata.common.Constants;
 import org.apache.seata.common.XID;
+import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.common.store.SessionMode;
 import org.apache.seata.config.ConfigurationCache;
@@ -25,9 +26,14 @@ import org.apache.seata.core.constants.ConfigurationKeys;
 import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
 import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.lock.LockManager;
 import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
+import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
+import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
+import org.apache.seata.server.storage.rocksdb.migration.RocksDBMigrationService;
 import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.store.SessionStorable;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
@@ -36,16 +42,23 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 class SessionHolderRocksDBTest {
 
@@ -66,6 +79,8 @@ class SessionHolderRocksDBTest {
         System.clearProperty(ConfigurationKeys.STORE_FILE_DIR);
         System.clearProperty(ConfigurationKeys.STORE_FILE_ENGINE);
         System.clearProperty(ConfigurationKeys.STORE_FILE_ROCKSDB_DIR);
+        System.clearProperty(ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS);
+        System.clearProperty(ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE);
         SessionHolder.destroy();
         LockerManagerFactory.destroy();
         RocksDBStoreEngineFactory.destroy();
@@ -110,6 +125,65 @@ class SessionHolderRocksDBTest {
         Assertions.assertEquals(globalSession.getXid(), actual.getXid());
     }
 
+    @Test
+    void testRocksDBFileEngineRecoversEverySessionExactlyOnceAcrossDeadlinePages() throws Exception {
+        configurePagedRocksDBFileMode(2, 1);
+        LockManager lockManager = recordingLockManager();
+        setLockManager(lockManager);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance();
+        RocksDBSessionManager writer = new RocksDBSessionManager("recovery-writer", engine);
+        List<String> expectedXids = new ArrayList<>();
+        int sessionCount = 12;
+        for (int i = 0; i < sessionCount; i++) {
+            long transactionId = 3000L + i;
+            BranchSession branchSession = branchSession(transactionId, transactionId, "t_order:" + i);
+            GlobalSession globalSession = globalSession(branchSession);
+            globalSession.setBeginTime(100L + i);
+            writer.addGlobalSession(globalSession);
+            writer.addBranchSession(globalSession, branchSession);
+            expectedXids.add(globalSession.getXid());
+        }
+        markMigrationCompleted(engine);
+
+        SessionHolder.init(SessionMode.FILE);
+
+        ArgumentCaptor<BranchSession> recoveredBranches = ArgumentCaptor.forClass(BranchSession.class);
+        Mockito.verify(lockManager, Mockito.times(sessionCount))
+                .acquireLock(recoveredBranches.capture(), Mockito.eq(true), Mockito.eq(false));
+        Map<String, Long> recoveryCounts = recoveredBranches.getAllValues().stream()
+                .collect(Collectors.groupingBy(BranchSession::getXid, Collectors.counting()));
+        Assertions.assertEquals(new HashSet<>(expectedXids), recoveryCounts.keySet());
+        Assertions.assertTrue(recoveryCounts.values().stream().allMatch(count -> count == 1L));
+    }
+
+    @Test
+    void testRocksDBFileEngineFailsAfterReloadedPageWhenIntermediatePageReadFails() throws Exception {
+        configurePagedRocksDBFileMode(1, 1);
+        LockManager lockManager = recordingLockManager();
+        setLockManager(lockManager);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance();
+        RocksDBSessionManager writer = new RocksDBSessionManager("failing-recovery-writer", engine);
+        BranchSession firstBranch = branchSession(4001L, 4001L, "t_order:first");
+        GlobalSession first = globalSession(firstBranch);
+        first.setBeginTime(100L);
+        GlobalSession corrupt = globalSession(4002L);
+        corrupt.setBeginTime(200L);
+        writer.addGlobalSession(first);
+        writer.addBranchSession(first, firstBranch);
+        writer.addGlobalSession(corrupt);
+        engine.put(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(corrupt.getXid()), new byte[] {0});
+        markMigrationCompleted(engine);
+
+        StoreException exception =
+                Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+        Assertions.assertEquals("invalid RocksDB value header", exception.getMessage());
+
+        ArgumentCaptor<BranchSession> recoveredBranch = ArgumentCaptor.forClass(BranchSession.class);
+        Mockito.verify(lockManager, Mockito.times(1))
+                .acquireLock(recoveredBranch.capture(), Mockito.eq(true), Mockito.eq(false));
+        Assertions.assertEquals(first.getXid(), recoveredBranch.getValue().getXid());
+    }
+
     private void configureRocksDBFileMode() {
         System.setProperty(
                 ConfigurationKeys.STORE_FILE_DIR, tempDir.resolve("file").toString());
@@ -117,6 +191,34 @@ class SessionHolderRocksDBTest {
         System.setProperty(
                 ConfigurationKeys.STORE_FILE_ROCKSDB_DIR,
                 tempDir.resolve("rocksdb").toString());
+    }
+
+    private void configurePagedRocksDBFileMode(int pageSize, long deadlineMillis) {
+        configureRocksDBFileMode();
+        System.setProperty(ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, String.valueOf(pageSize));
+        System.setProperty(
+                ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, String.valueOf(deadlineMillis));
+        ConfigurationCache.clear();
+    }
+
+    private LockManager recordingLockManager() throws Exception {
+        LockManager lockManager = Mockito.mock(LockManager.class);
+        Mockito.when(lockManager.acquireLock(Mockito.any(BranchSession.class), Mockito.eq(true), Mockito.eq(false)))
+                .thenReturn(true);
+        return lockManager;
+    }
+
+    private void setLockManager(LockManager lockManager) throws Exception {
+        Field field = LockerManagerFactory.class.getDeclaredField("LOCK_MANAGER");
+        field.setAccessible(true);
+        field.set(null, lockManager);
+    }
+
+    private void markMigrationCompleted(RocksDBStoreEngine engine) {
+        engine.put(
+                RocksDBColumnFamily.METADATA,
+                RocksDBMigrationService.MIGRATION_STATUS_KEY.getBytes(StandardCharsets.UTF_8),
+                RocksDBMigrationService.MIGRATION_STATUS_COMPLETED.getBytes(StandardCharsets.UTF_8));
     }
 
     private GlobalSession globalSession(BranchSession branchSession) {

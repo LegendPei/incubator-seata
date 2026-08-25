@@ -30,13 +30,39 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * RocksDB-backed session manager for file store engine.
  */
 @LoadLevel(name = "rocksdb", scope = Scope.PROTOTYPE)
 public class RocksDBSessionManager extends AbstractSessionManager {
+
+    private static final GlobalStatus[] RECOVERY_STATUSES = {
+        GlobalStatus.UnKnown,
+        GlobalStatus.Begin,
+        GlobalStatus.Committing,
+        GlobalStatus.CommitRetrying,
+        GlobalStatus.Rollbacking,
+        GlobalStatus.RollbackRetrying,
+        GlobalStatus.TimeoutRollbacking,
+        GlobalStatus.TimeoutRollbackRetrying,
+        GlobalStatus.AsyncCommitting,
+        GlobalStatus.Committed,
+        GlobalStatus.CommitFailed,
+        GlobalStatus.CommitRetryTimeout,
+        GlobalStatus.Rollbacked,
+        GlobalStatus.RollbackFailed,
+        GlobalStatus.RollbackRetryTimeout,
+        GlobalStatus.TimeoutRollbacked,
+        GlobalStatus.TimeoutRollbackFailed,
+        GlobalStatus.Finished,
+        GlobalStatus.StopRollbackOrRollbackRetry,
+        GlobalStatus.StopCommitOrCommitRetry,
+        GlobalStatus.Deleting
+    };
 
     private final RocksDBLocalLocks xidLocks;
 
@@ -76,28 +102,16 @@ public class RocksDBSessionManager extends AbstractSessionManager {
 
     @Override
     public Collection<GlobalSession> allSessions() {
-        return findGlobalSessions(new SessionCondition(
-                GlobalStatus.UnKnown,
-                GlobalStatus.Begin,
-                GlobalStatus.Committing,
-                GlobalStatus.CommitRetrying,
-                GlobalStatus.Rollbacking,
-                GlobalStatus.RollbackRetrying,
-                GlobalStatus.TimeoutRollbacking,
-                GlobalStatus.TimeoutRollbackRetrying,
-                GlobalStatus.AsyncCommitting,
-                GlobalStatus.Committed,
-                GlobalStatus.CommitFailed,
-                GlobalStatus.CommitRetryTimeout,
-                GlobalStatus.Rollbacked,
-                GlobalStatus.RollbackFailed,
-                GlobalStatus.RollbackRetryTimeout,
-                GlobalStatus.TimeoutRollbacked,
-                GlobalStatus.TimeoutRollbackFailed,
-                GlobalStatus.Finished,
-                GlobalStatus.StopRollbackOrRollbackRetry,
-                GlobalStatus.StopCommitOrCommitRetry,
-                GlobalStatus.Deleting));
+        return findGlobalSessions(new SessionCondition(RECOVERY_STATUSES));
+    }
+
+    public RecoveryPage readStartupRecoveryPage(RecoveryCursor cursor) {
+        RocksDBTransactionStoreManager.RecoveryScanPage scanPage = ((RocksDBTransactionStoreManager)
+                        transactionStoreManager)
+                .readRecoveryPage(RECOVERY_STATUSES, cursor.statusScanCursors);
+        RecoveryCursor continuation =
+                scanPage.isExhausted() ? null : new RecoveryCursor(scanPage.getNextStatusScanCursors());
+        return new RecoveryPage(scanPage.getSessions(), continuation, scanPage.isExhausted());
     }
 
     @Override
@@ -116,5 +130,41 @@ public class RocksDBSessionManager extends AbstractSessionManager {
     @Override
     public void destroy() {
         transactionStoreManager.shutdown();
+    }
+
+    public static final class RecoveryCursor {
+        private final Map<GlobalStatus, byte[]> statusScanCursors;
+
+        private RecoveryCursor(Map<GlobalStatus, byte[]> statusScanCursors) {
+            this.statusScanCursors = statusScanCursors;
+        }
+
+        public static RecoveryCursor initial() {
+            return new RecoveryCursor(Collections.emptyMap());
+        }
+    }
+
+    public static final class RecoveryPage {
+        private final List<GlobalSession> sessions;
+        private final RecoveryCursor continuation;
+        private final boolean exhausted;
+
+        private RecoveryPage(List<GlobalSession> sessions, RecoveryCursor continuation, boolean exhausted) {
+            this.sessions = sessions;
+            this.continuation = continuation;
+            this.exhausted = exhausted;
+        }
+
+        public List<GlobalSession> getSessions() {
+            return sessions;
+        }
+
+        public RecoveryCursor getContinuation() {
+            return continuation;
+        }
+
+        public boolean isExhausted() {
+            return exhausted;
+        }
     }
 }
