@@ -34,6 +34,7 @@ import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
+import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.SessionStorable;
 import org.apache.seata.server.store.StoreConfig;
@@ -166,6 +167,12 @@ class RocksDBMigrationServiceTest {
                     RocksDBKeyCodec.encodeGlobalTimeoutIndex(
                             stale.getBeginTime() + stale.getTimeout(), stale.getXid())));
             Assertions.assertNotNull(storeManager.readSession(active.getXid(), true));
+            Assertions.assertArrayEquals(
+                    active.getXid().getBytes(StandardCharsets.UTF_8),
+                    engine.get(
+                            RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                            RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                                    RocksDBIndexManager.timeoutDeadlineMillis(active), active.getXid())));
             Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_COMPLETED, getMigrationStatus(engine));
         }
     }
