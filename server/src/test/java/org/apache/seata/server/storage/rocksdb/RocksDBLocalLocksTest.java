@@ -36,48 +36,14 @@ class RocksDBLocalLocksTest {
     @Test
     void testLockAllOrdersStripesConsistently() throws Exception {
         RocksDBLocalLocks locks = new RocksDBLocalLocks(1024);
-        ReentrantLock[] stripes = lockStripes(locks);
-        RocksDBLocalLocks.LockScope stripe31Blocker = locks.lock(new byte[] {0});
-        RocksDBLocalLocks.LockScope stripe961Blocker = locks.lock(new byte[] {0, 0});
-        CountDownLatch firstStart = new CountDownLatch(1);
-        CountDownLatch secondStart = new CountDownLatch(1);
-        CountDownLatch completed = new CountDownLatch(2);
-        AtomicReference<Throwable> failure = new AtomicReference<>();
-        Thread first = lockAllWorker(
-                locks, Arrays.asList(new byte[] {0}, new byte[] {0, 0}), firstStart, completed, failure, "31-961");
-        Thread second = lockAllWorker(
-                locks, Arrays.asList(new byte[] {0, 0}, new byte[] {3, 1}), secondStart, completed, failure, "961-31");
+        int firstStripe = firstQueuedStripe(locks, Arrays.asList(new byte[] {0}, new byte[] {0, 0}), "31-961");
+        int secondStripe = firstQueuedStripe(locks, Arrays.asList(new byte[] {0, 0}, new byte[] {3, 1}), "961-31");
 
-        try {
-            first.start();
-            second.start();
-            firstStart.countDown();
-            awaitCondition(
-                    () -> stripes[31].hasQueuedThread(first), "First worker did not queue for stripe 31 in time");
-            secondStart.countDown();
-            awaitCondition(
-                    () -> stripes[31].hasQueuedThread(second) || stripes[961].hasQueuedThread(second),
-                    "Second worker did not queue for its first stripe in time");
-
-            stripe31Blocker.close();
-            stripe31Blocker = null;
-            awaitCondition(
-                    () -> stripes[961].hasQueuedThread(first), "First worker did not queue for stripe 961 in time");
-            stripe961Blocker.close();
-            stripe961Blocker = null;
-
-            Assertions.assertTrue(
-                    completed.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
-                    "Both workers must complete; timeout suggests a possible ABBA deadlock between stripes 31 and 961");
-            Assertions.assertNull(failure.get(), "Lock worker failed: " + failure.get());
-        } finally {
-            if (stripe961Blocker != null) {
-                stripe961Blocker.close();
-            }
-            if (stripe31Blocker != null) {
-                stripe31Blocker.close();
-            }
-        }
+        Assertions.assertEquals(31, firstStripe, "Key set [0], [0,0] must acquire stripe 31 before stripe 961");
+        Assertions.assertEquals(
+                31,
+                secondStripe,
+                "Key set [0,0], [3,1] must acquire stripe 31 first; stripe 961 first permits a 961 -> 31 / 31 -> 961 ABBA deadlock");
     }
 
     @Test
@@ -110,6 +76,7 @@ class RocksDBLocalLocksTest {
     @Test
     void testLockScopeReleasesLockWhenProtectedWorkThrows() throws Exception {
         RocksDBLocalLocks locks = new RocksDBLocalLocks(1);
+        ReentrantLock stripe = lockStripes(locks)[0];
 
         Assertions.assertThrows(IllegalStateException.class, () -> {
             try (RocksDBLocalLocks.LockScope ignored = locks.lock(new byte[] {1})) {
@@ -131,19 +98,55 @@ class RocksDBLocalLocksTest {
         worker.setDaemon(true);
         worker.start();
 
-        Assertions.assertTrue(
-                acquired.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
-                "Lock scope did not release its lock after protected work threw");
-        worker.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+        boolean acquiredInTime = false;
+        try {
+            acquiredInTime = acquired.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } finally {
+            while (stripe.isHeldByCurrentThread()) {
+                stripe.unlock();
+            }
+            worker.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+        }
+        Assertions.assertTrue(acquiredInTime, "Lock scope did not release its lock after protected work threw");
         Assertions.assertFalse(worker.isAlive(), "Worker did not finish after acquiring the released lock");
         Assertions.assertNull(failure.get(), "Lock worker failed: " + failure.get());
+    }
+
+    private static int firstQueuedStripe(RocksDBLocalLocks locks, Collection<byte[]> keys, String name)
+            throws Exception {
+        ReentrantLock[] stripes = lockStripes(locks);
+        RocksDBLocalLocks.LockScope stripe31Blocker = locks.lock(new byte[] {0});
+        RocksDBLocalLocks.LockScope stripe961Blocker = locks.lock(new byte[] {0, 0});
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread worker = lockAllWorker(locks, keys, start, failure, name);
+        int firstStripe;
+
+        try {
+            worker.start();
+            start.countDown();
+            awaitCondition(
+                    () -> stripes[31].hasQueuedThread(worker) || stripes[961].hasQueuedThread(worker),
+                    "Worker did not queue for stripe 31 or 961 in time");
+            firstStripe = stripes[31].hasQueuedThread(worker) ? 31 : 961;
+        } finally {
+            start.countDown();
+            stripe961Blocker.close();
+            stripe31Blocker.close();
+            if (worker.getState() != Thread.State.NEW) {
+                worker.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            }
+        }
+
+        Assertions.assertFalse(worker.isAlive(), "Lock worker did not finish after blockers were released");
+        Assertions.assertNull(failure.get(), "Lock worker failed: " + failure.get());
+        return firstStripe;
     }
 
     private static Thread lockAllWorker(
             RocksDBLocalLocks locks,
             Collection<byte[]> keys,
             CountDownLatch start,
-            CountDownLatch completed,
             AtomicReference<Throwable> failure,
             String name) {
         Thread worker = new Thread(
@@ -155,8 +158,6 @@ class RocksDBLocalLocksTest {
                         try (RocksDBLocalLocks.LockScope ignored = locks.lockAll(keys)) {}
                     } catch (Throwable throwable) {
                         failure.compareAndSet(null, throwable);
-                    } finally {
-                        completed.countDown();
                     }
                 },
                 "lock-order-" + name);
