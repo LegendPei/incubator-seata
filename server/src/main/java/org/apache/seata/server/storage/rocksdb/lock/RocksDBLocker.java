@@ -139,18 +139,13 @@ public class RocksDBLocker extends AbstractLocker {
         try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(toLockKeys(lockDOs));
                 WriteBatch batch = new WriteBatch()) {
             for (LockDO lockDO : lockDOs) {
-                LockDO existingLock = readLock(lockDO);
-                if (existingLock == null
-                        || !StringUtils.equals(existingLock.getXid(), lockDO.getXid())
-                        || !Objects.equals(lockDO.getBranchId(), existingLock.getBranchId())) {
+                byte[] lockKey = encodeLockKey(lockDO);
+                byte[] indexKey = RocksDBKeyCodec.encodeLockBranchIndex(lockDO.getXid(), lockDO.getBranchId(), lockKey);
+                if (readOwnedLock(lockKey, indexKey, lockDO.getXid(), lockDO.getBranchId()) == null) {
                     continue;
                 }
-                byte[] lockKey = encodeLockKey(lockDO);
                 storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
-                storeEngine.delete(
-                        batch,
-                        RocksDBColumnFamily.LOCK_BRANCH_INDEX,
-                        RocksDBKeyCodec.encodeLockBranchIndex(lockDO.getXid(), lockDO.getBranchId(), lockKey));
+                storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexKey);
             }
             storeEngine.write(batch);
             return true;
@@ -343,16 +338,8 @@ public class RocksDBLocker extends AbstractLocker {
                 if (!Arrays.equals(indexedLockKey, candidate.lockKey)) {
                     continue;
                 }
-                byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, candidate.lockKey);
-                if (lockValue == null) {
-                    storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
-                    cleaned++;
-                    continue;
-                }
-                LockDO currentLock = decodeLock(lockValue);
-                byte[] expectedIndexKey = RocksDBKeyCodec.encodeLockBranchIndex(
-                        currentLock.getXid(), currentLock.getBranchId(), candidate.lockKey);
-                if (!Arrays.equals(expectedIndexKey, candidate.indexKey)) {
+                LockDO currentLock = readOwnedLock(candidate.lockKey, candidate.indexKey, xid, null);
+                if (currentLock == null) {
                     storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, candidate.indexKey);
                     cleaned++;
                     continue;
@@ -482,12 +469,10 @@ public class RocksDBLocker extends AbstractLocker {
                 try (RocksDBLocalLocks.LockScope ignored = localLocks.lockAll(indexValues(indexEntries));
                         WriteBatch batch = new WriteBatch()) {
                     for (RocksDBStoreEngine.RocksDBEntry indexEntry : indexEntries) {
-                        // Fast path: the index key is prefixed by xid (and branchId when
-                        // releasing per-branch), so ownership is already guaranteed by the
-                        // scan predicate.  Skip the per-lock verification read to save one
-                        // point-read per lock entry.
                         byte[] lockKey = indexEntry.getValue();
-                        storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
+                        if (readOwnedLock(lockKey, indexEntry.getKey(), xid, branchId) != null) {
+                            storeEngine.delete(batch, RocksDBColumnFamily.LOCK, lockKey);
+                        }
                         storeEngine.delete(batch, RocksDBColumnFamily.LOCK_BRANCH_INDEX, indexEntry.getKey());
                     }
                     storeEngine.write(batch);
@@ -498,6 +483,22 @@ public class RocksDBLocker extends AbstractLocker {
         } catch (RocksDBException e) {
             throw new StoreException(e, "release RocksDB locks failed");
         }
+    }
+
+    private LockDO readOwnedLock(byte[] lockKey, byte[] indexKey, String xid, Long branchId) {
+        byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
+        if (lockValue == null) {
+            return null;
+        }
+        LockDO currentLock = decodeLock(lockValue);
+        byte[] expectedIndexKey =
+                RocksDBKeyCodec.encodeLockBranchIndex(currentLock.getXid(), currentLock.getBranchId(), lockKey);
+        if (!StringUtils.equals(currentLock.getXid(), xid)
+                || branchId != null && !Objects.equals(currentLock.getBranchId(), branchId)
+                || !Arrays.equals(expectedIndexKey, indexKey)) {
+            return null;
+        }
+        return currentLock;
     }
 
     private LockDO readLock(LockDO lockDO) {

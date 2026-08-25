@@ -120,6 +120,28 @@ class RocksDBLockManagerTest {
     }
 
     @Test
+    void testReleaseBranchLockRemovesStaleIndexWithoutDeletingCurrentOwner() throws Exception {
+        try (RocksDBStoreEngine engine = open("release-branch-stale-index")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession staleOwner = branchSession(1001L, 1L, "t_order:1");
+            BranchSession currentOwner = branchSession(1002L, 2L, "t_order:1");
+            byte[] lockKey = RocksDBKeyCodec.encodeRowLock(currentOwner.getResourceId(), "t_order", "1");
+            byte[] staleIndexKey =
+                    RocksDBKeyCodec.encodeLockBranchIndex(staleOwner.getXid(), staleOwner.getBranchId(), lockKey);
+            byte[] currentIndexKey =
+                    RocksDBKeyCodec.encodeLockBranchIndex(currentOwner.getXid(), currentOwner.getBranchId(), lockKey);
+
+            Assertions.assertTrue(lockManager.acquireLock(currentOwner));
+            engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, lockKey);
+
+            Assertions.assertTrue(lockManager.releaseLock(staleOwner));
+            Assertions.assertNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
+            Assertions.assertNotNull(engine.get(RocksDBColumnFamily.LOCK, lockKey));
+            Assertions.assertNotNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, currentIndexKey));
+        }
+    }
+
+    @Test
     void testReleaseSameXidDifferentBranchDoesNotReleaseHolder() throws Exception {
         try (RocksDBStoreEngine engine = open("release-same-xid-branch")) {
             RocksDBLockManager lockManager = new RocksDBLockManager(engine);
@@ -173,6 +195,30 @@ class RocksDBLockManagerTest {
 
             Assertions.assertTrue(lockManager.releaseGlobalSessionLock(globalSession));
             Assertions.assertTrue(lockManager.acquireLock(next));
+        }
+    }
+
+    @Test
+    void testReleaseGlobalSessionLockRemovesStaleIndexWithoutDeletingCurrentOwner() throws Exception {
+        try (RocksDBStoreEngine engine = open("release-global-stale-index")) {
+            RocksDBLockManager lockManager = new RocksDBLockManager(engine);
+            BranchSession staleOwner = branchSession(1001L, 1L, "t_order:1");
+            BranchSession currentOwner = branchSession(1002L, 2L, "t_order:1");
+            GlobalSession staleGlobal = new GlobalSession("app", "group", "tx", 60000);
+            staleGlobal.setXid(staleOwner.getXid());
+            byte[] lockKey = RocksDBKeyCodec.encodeRowLock(currentOwner.getResourceId(), "t_order", "1");
+            byte[] staleIndexKey =
+                    RocksDBKeyCodec.encodeLockBranchIndex(staleOwner.getXid(), staleOwner.getBranchId(), lockKey);
+            byte[] currentIndexKey =
+                    RocksDBKeyCodec.encodeLockBranchIndex(currentOwner.getXid(), currentOwner.getBranchId(), lockKey);
+
+            Assertions.assertTrue(lockManager.acquireLock(currentOwner));
+            engine.put(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey, lockKey);
+
+            Assertions.assertTrue(lockManager.releaseGlobalSessionLock(staleGlobal));
+            Assertions.assertNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, staleIndexKey));
+            Assertions.assertNotNull(engine.get(RocksDBColumnFamily.LOCK, lockKey));
+            Assertions.assertNotNull(engine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, currentIndexKey));
         }
     }
 
