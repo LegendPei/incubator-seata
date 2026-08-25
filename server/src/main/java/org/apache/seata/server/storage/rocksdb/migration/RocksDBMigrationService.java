@@ -34,6 +34,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -49,6 +50,15 @@ public class RocksDBMigrationService {
     public static final String MIGRATION_STATUS_COMPLETED = "completed";
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBMigrationService.class);
+
+    private static final EnumSet<RocksDBColumnFamily> CURRENT_STATE_COLUMN_FAMILIES = EnumSet.of(
+            RocksDBColumnFamily.GLOBAL_SESSION,
+            RocksDBColumnFamily.BRANCH_SESSION,
+            RocksDBColumnFamily.LOCK,
+            RocksDBColumnFamily.LOCK_BRANCH_INDEX,
+            RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
+            RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+            RocksDBColumnFamily.TRANSACTION_ID_INDEX);
 
     private final FileSessionLogReplayer fileSessionLogReplayer;
 
@@ -261,21 +271,12 @@ public class RocksDBMigrationService {
     }
 
     private boolean hasCurrentState(RocksDBStoreEngine storeEngine) {
-        return storeEngine.prefixExists(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0])
-                || storeEngine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, new byte[0])
-                || storeEngine.prefixExists(RocksDBColumnFamily.LOCK, new byte[0])
-                || storeEngine.prefixExists(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0])
-                || storeEngine.prefixExists(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, new byte[0])
-                || storeEngine.prefixExists(RocksDBColumnFamily.TRANSACTION_ID_INDEX, new byte[0]);
+        return CURRENT_STATE_COLUMN_FAMILIES.stream()
+                .anyMatch(columnFamily -> storeEngine.prefixExists(columnFamily, new byte[0]));
     }
 
     private void clearCurrentState(RocksDBStoreEngine storeEngine) {
-        storeEngine.deleteByPrefix(RocksDBColumnFamily.GLOBAL_SESSION, new byte[0]);
-        storeEngine.deleteByPrefix(RocksDBColumnFamily.BRANCH_SESSION, new byte[0]);
-        storeEngine.deleteByPrefix(RocksDBColumnFamily.LOCK, new byte[0]);
-        storeEngine.deleteByPrefix(RocksDBColumnFamily.LOCK_BRANCH_INDEX, new byte[0]);
-        storeEngine.deleteByPrefix(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, new byte[0]);
-        storeEngine.deleteByPrefix(RocksDBColumnFamily.TRANSACTION_ID_INDEX, new byte[0]);
+        CURRENT_STATE_COLUMN_FAMILIES.forEach(columnFamily -> storeEngine.deleteByPrefix(columnFamily, new byte[0]));
     }
 
     private String getMetadata(RocksDBStoreEngine storeEngine, String key) {

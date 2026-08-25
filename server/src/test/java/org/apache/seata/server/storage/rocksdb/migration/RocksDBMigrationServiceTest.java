@@ -30,6 +30,7 @@ import org.apache.seata.server.session.SessionCondition;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
 import org.apache.seata.server.storage.file.store.FileSessionLogReplayer;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
+import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
@@ -151,11 +152,19 @@ class RocksDBMigrationServiceTest {
         try (RocksDBStoreEngine engine = open("rocksdb-replay")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
             storeManager.writeSession(LogOperation.GLOBAL_ADD, stale);
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                    RocksDBKeyCodec.encodeGlobalTimeoutIndex(stale.getBeginTime() + stale.getTimeout(), stale.getXid()),
+                    stale.getXid().getBytes(StandardCharsets.UTF_8));
             putMigrationStatus(engine, RocksDBMigrationService.MIGRATION_STATUS_IN_PROGRESS);
 
             Assertions.assertTrue(new RocksDBMigrationService().migrate(fileLog, engine));
 
             Assertions.assertNull(storeManager.readSession(stale.getXid(), true));
+            Assertions.assertNull(engine.get(
+                    RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
+                    RocksDBKeyCodec.encodeGlobalTimeoutIndex(
+                            stale.getBeginTime() + stale.getTimeout(), stale.getXid())));
             Assertions.assertNotNull(storeManager.readSession(active.getXid(), true));
             Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_COMPLETED, getMigrationStatus(engine));
         }
