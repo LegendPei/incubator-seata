@@ -18,21 +18,29 @@ package org.apache.seata.server.storage.rocksdb.session;
 
 import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.Constants;
+import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.holder.ObjectHolder;
 import org.apache.seata.config.ConfigurationCache;
 import org.apache.seata.core.model.BranchStatus;
 import org.apache.seata.core.model.BranchType;
 import org.apache.seata.core.model.GlobalStatus;
+import org.apache.seata.server.lock.LockManager;
+import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
+import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
+import org.rocksdb.WriteBatch;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.lang.reflect.Field;
@@ -45,6 +53,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 class RocksDBSessionManagerTest {
@@ -53,11 +62,13 @@ class RocksDBSessionManagerTest {
     Path tempDir;
 
     private Object originalEnvironment;
+    private LockManager originalLockManager;
     private MockEnvironment environment;
 
     @BeforeEach
-    void beforeEach() {
+    void beforeEach() throws Exception {
         originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
+        originalLockManager = (LockManager) lockerManagerField().get(null);
         environment = new MockEnvironment();
         ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, environment);
         ConfigurationCache.clear();
@@ -65,6 +76,7 @@ class RocksDBSessionManagerTest {
 
     @AfterEach
     void afterEach() throws Exception {
+        lockerManagerField().set(null, originalLockManager);
         ConfigurationCache.clear();
         restoreEnvironment();
     }
@@ -319,6 +331,78 @@ class RocksDBSessionManagerTest {
         }
     }
 
+    @Test
+    void testTerminalRemovalFailureIsRecoverableWithoutDeletingNewOwnerLock() throws Exception {
+        String databaseName = "terminal-removal-recovery";
+        GlobalSession terminalGlobal = globalSession("tx-terminal", GlobalStatus.Committed);
+        BranchSession terminalBranch = branchSession(terminalGlobal, 1L);
+        GlobalSession newGlobal = globalSession("tx-new-owner", GlobalStatus.Begin);
+        BranchSession newBranch = branchSession(newGlobal, 2L);
+        byte[] lockKey = RocksDBKeyCodec.encodeRowLock(newBranch.getResourceId(), "t_order", "1");
+        byte[] terminalIndexKey =
+                RocksDBKeyCodec.encodeLockBranchIndex(terminalGlobal.getXid(), terminalBranch.getBranchId(), lockKey);
+        byte[] newOwnerIndexKey =
+                RocksDBKeyCodec.encodeLockBranchIndex(newGlobal.getXid(), newBranch.getBranchId(), lockKey);
+
+        try (RocksDBStoreEngine engine = open(databaseName)) {
+            RocksDBSessionManager setupSessionManager = new RocksDBSessionManager("root.data", engine);
+            RocksDBLockManager setupLockManager = new RocksDBLockManager(engine);
+            installLockManager(setupLockManager);
+            setupSessionManager.addGlobalSession(terminalGlobal);
+            setupSessionManager.addBranchSession(terminalGlobal, terminalBranch);
+            Assertions.assertTrue(setupLockManager.acquireLock(terminalBranch));
+
+            RocksDBStoreEngine spyEngine = Mockito.spy(engine);
+            AtomicInteger writes = new AtomicInteger();
+            Mockito.doAnswer(invocation -> {
+                        if (writes.incrementAndGet() == 2) {
+                            throw new StoreException("injected GLOBAL_REMOVE failure");
+                        }
+                        return invocation.callRealMethod();
+                    })
+                    .when(spyEngine)
+                    .write(Mockito.any(WriteBatch.class));
+
+            RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", spyEngine);
+            RocksDBLockManager lockManager = new RocksDBLockManager(spyEngine);
+            installLockManager(lockManager);
+
+            Assertions.assertThrows(StoreException.class, () -> sessionManager.removeGlobalSession(terminalGlobal));
+            Assertions.assertNotNull(sessionManager.findGlobalSession(terminalGlobal.getXid(), true));
+            Assertions.assertNull(spyEngine.get(RocksDBColumnFamily.LOCK, lockKey));
+            Assertions.assertNull(spyEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, terminalIndexKey));
+
+            sessionManager.addGlobalSession(newGlobal);
+            sessionManager.addBranchSession(newGlobal, newBranch);
+            Assertions.assertTrue(lockManager.acquireLock(newBranch));
+            Assertions.assertNotNull(spyEngine.get(RocksDBColumnFamily.LOCK, lockKey));
+            Assertions.assertNotNull(spyEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, newOwnerIndexKey));
+        }
+
+        try (RocksDBStoreEngine reopenedEngine = open(databaseName)) {
+            RocksDBSessionManager reopenedSessionManager = new RocksDBSessionManager("root.data", reopenedEngine);
+            RocksDBLockManager reopenedLockManager = new RocksDBLockManager(reopenedEngine);
+            installLockManager(reopenedLockManager);
+
+            GlobalSession recoveredTerminal = reopenedSessionManager.findGlobalSession(terminalGlobal.getXid(), true);
+            Assertions.assertNotNull(recoveredTerminal);
+            Assertions.assertEquals(1, recoveredTerminal.getBranchSessions().size());
+            Assertions.assertEquals(
+                    terminalBranch.getBranchId(),
+                    recoveredTerminal.getBranchSessions().get(0).getBranchId());
+            reopenedSessionManager.removeGlobalSession(recoveredTerminal);
+
+            Assertions.assertNull(reopenedSessionManager.findGlobalSession(terminalGlobal.getXid(), true));
+            Assertions.assertTrue(reopenedEngine
+                    .prefixScan(
+                            RocksDBColumnFamily.BRANCH_SESSION,
+                            RocksDBKeyCodec.encodeXidPrefix(terminalGlobal.getXid()))
+                    .isEmpty());
+            Assertions.assertNotNull(reopenedEngine.get(RocksDBColumnFamily.LOCK, lockKey));
+            Assertions.assertNotNull(reopenedEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, newOwnerIndexKey));
+        }
+    }
+
     private RocksDBStoreEngine open(String name) {
         return RocksDBStoreEngine.open(
                 new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
@@ -349,6 +433,16 @@ class RocksDBSessionManagerTest {
         Assertions.assertEquals(xids.length, sessions.size());
         Set<String> actual = sessions.stream().map(GlobalSession::getXid).collect(Collectors.toSet());
         Assertions.assertEquals(new HashSet<>(Arrays.asList(xids)), actual);
+    }
+
+    private void installLockManager(LockManager lockManager) throws Exception {
+        lockerManagerField().set(null, lockManager);
+    }
+
+    private Field lockerManagerField() throws Exception {
+        Field field = LockerManagerFactory.class.getDeclaredField("LOCK_MANAGER");
+        field.setAccessible(true);
+        return field;
     }
 
     @SuppressWarnings("unchecked")
