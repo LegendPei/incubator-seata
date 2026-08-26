@@ -31,7 +31,6 @@ import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -153,7 +152,7 @@ public class RocksDBSessionManager extends AbstractSessionManager {
                     throw new IllegalStateException("status scan continuation state is unset");
                 }
                 byte[] nextCursor = condition.getNextStatusScanCursor();
-                if (nextCursor == null || Arrays.equals(cursor, nextCursor)) {
+                if (!hasStrictCursorProgress(cursor, nextCursor)) {
                     throw new IllegalStateException("status scan continuation did not advance");
                 }
                 condition.setStatusScanCursor(nextCursor);
@@ -213,7 +212,7 @@ public class RocksDBSessionManager extends AbstractSessionManager {
                     throw new IllegalStateException("timeout scan continuation state is unset");
                 }
                 byte[] nextCursor = condition.getNextTimeoutScanCursor();
-                if (nextCursor == null || Arrays.equals(cursor, nextCursor)) {
+                if (!hasStrictCursorProgress(cursor, nextCursor)) {
                     throw new IllegalStateException("timeout scan continuation did not advance");
                 }
                 condition.setTimeoutScanCursor(nextCursor);
@@ -275,6 +274,12 @@ public class RocksDBSessionManager extends AbstractSessionManager {
             }
         }
         return advanced;
+    }
+
+    private boolean hasStrictCursorProgress(byte[] currentCursor, byte[] nextCursor) {
+        return nextCursor != null
+                && nextCursor.length > 0
+                && (currentCursor == null || compareUnsigned(nextCursor, currentCursor) > 0);
     }
 
     private int compareUnsigned(byte[] left, byte[] right) {

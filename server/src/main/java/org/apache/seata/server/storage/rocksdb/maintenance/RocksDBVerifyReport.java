@@ -336,6 +336,27 @@ public class RocksDBVerifyReport {
             this.truncated = true;
         }
 
+        boolean isComplete() {
+            return complete;
+        }
+
+        boolean requiresGlobalSecondaryIndexRebuild() {
+            return staleStatusIndexCount > 0
+                    || staleTimeoutIndexCount > 0
+                    || staleTransactionIdIndexCount > 0
+                    || missingStatusIndexCount > 0
+                    || missingTimeoutIndexCount > 0
+                    || missingTransactionIdIndexCount > 0;
+        }
+
+        boolean hasUnrepairableSourceViolation() {
+            return invalidGlobalCount > 0
+                    || invalidBranchCount > 0
+                    || orphanBranchCount > 0
+                    || orphanLockCount > 0
+                    || invalidMetadataCount > 0;
+        }
+
         RocksDBVerifyReport build() {
             return new RocksDBVerifyReport(this);
         }

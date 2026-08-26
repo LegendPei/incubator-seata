@@ -513,6 +513,36 @@ class RocksDBSessionManagerTest {
     }
 
     @Test
+    void testStatusCursorCannotRegressAfterUnsignedProgress() {
+        try (RocksDBStoreEngine engine = open("scripted-regressed-status-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            byte[] callerCursor = new byte[] {0x7f};
+            condition.setStatusScanCursor(callerCursor);
+            AtomicInteger pages = new AtomicInteger();
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                int page = pages.getAndIncrement();
+                if (page == 0) {
+                    condition.setNextStatusScanCursor(new byte[] {(byte) 0x80});
+                } else if (page == 1) {
+                    condition.setNextStatusScanCursor(new byte[] {0x7f});
+                } else {
+                    throw new AssertionError("regressing status cursor was accepted");
+                }
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("status scan continuation did not advance", exception.getMessage());
+            Assertions.assertArrayEquals(callerCursor, condition.getStatusScanCursor());
+            Mockito.verify(storeManager, Mockito.times(2)).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
     void testClonedEqualMultiStatusCursorMapFailsImmediately() {
         try (RocksDBStoreEngine engine = open("scripted-stalled-multi-continuation")) {
             TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
@@ -560,6 +590,37 @@ class RocksDBSessionManagerTest {
             Assertions.assertEquals("timeout scan continuation did not advance", exception.getMessage());
             Assertions.assertArrayEquals(callerCursor, condition.getTimeoutScanCursor());
             Mockito.verify(storeManager).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testTimeoutCursorCannotRegressAfterUnsignedProgress() {
+        try (RocksDBStoreEngine engine = open("scripted-regressed-timeout-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setMaxTimeoutDeadlineMillis(1_000L);
+            byte[] callerCursor = new byte[] {0x7f};
+            condition.setTimeoutScanCursor(callerCursor);
+            AtomicInteger pages = new AtomicInteger();
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                int page = pages.getAndIncrement();
+                if (page == 0) {
+                    condition.setNextTimeoutScanCursor(new byte[] {(byte) 0x80});
+                } else if (page == 1) {
+                    condition.setNextTimeoutScanCursor(new byte[] {0x7f});
+                } else {
+                    throw new AssertionError("regressing timeout cursor was accepted");
+                }
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("timeout scan continuation did not advance", exception.getMessage());
+            Assertions.assertArrayEquals(callerCursor, condition.getTimeoutScanCursor());
+            Mockito.verify(storeManager, Mockito.times(2)).readSession(Mockito.same(condition));
         }
     }
 

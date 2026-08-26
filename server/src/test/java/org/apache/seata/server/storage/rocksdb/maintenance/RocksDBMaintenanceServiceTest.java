@@ -919,6 +919,88 @@ class RocksDBMaintenanceServiceTest {
     }
 
     @Test
+    void testPlanRepairRejectsDuplicateTransactionIdSourceWhenIndexIsMissing() {
+        try (RocksDBStoreEngine engine = open("repair-duplicate-transaction-id-missing-index")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("repair-duplicate-missing-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("repair-duplicate-missing-second", GlobalStatus.Begin);
+            second.setTransactionId(first.getTransactionId());
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+            engine.delete(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(first.getTransactionId()));
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.hasAction(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES));
+            Assertions.assertTrue(plan.hasUnrepairableSourceViolation());
+            Assertions.assertEquals(1, plan.getBeforeVerifyReport().getInvalidGlobalCount());
+            StoreException exception = Assertions.assertThrows(
+                    StoreException.class,
+                    () -> service.executeRepair(
+                            plan,
+                            RocksDBRepairOptions.builder()
+                                    .dryRun(false)
+                                    .confirm(true)
+                                    .maintenanceMode(true)
+                                    .build()));
+            Assertions.assertTrue(exception.getMessage().contains("unrepairable violations"));
+        }
+    }
+
+    @Test
+    void testPlanRepairRejectsDuplicateTransactionIdSourceWhenIndexPointsToUnrelatedGlobal() {
+        try (RocksDBStoreEngine engine = open("repair-duplicate-transaction-id-unrelated-index")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("repair-duplicate-unrelated-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("repair-duplicate-unrelated-second", GlobalStatus.Begin);
+            GlobalSession unrelated = globalSession("repair-duplicate-unrelated-target", GlobalStatus.Begin);
+            second.setTransactionId(first.getTransactionId());
+            Assertions.assertNotEquals(first.getTransactionId(), unrelated.getTransactionId());
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, unrelated);
+            engine.put(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(first.getTransactionId()),
+                    unrelated.getXid().getBytes(StandardCharsets.UTF_8));
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.hasAction(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES));
+            Assertions.assertTrue(plan.hasUnrepairableSourceViolation());
+            Assertions.assertEquals(1, plan.getBeforeVerifyReport().getInvalidGlobalCount());
+            Assertions.assertEquals(2, plan.getBeforeVerifyReport().getMissingTransactionIdIndexCount());
+            Assertions.assertEquals(1, plan.getBeforeVerifyReport().getStaleTransactionIdIndexCount());
+        }
+    }
+
+    @Test
+    void testRepairSourceUniquenessPreflightHonorsMaxRepairEntries() {
+        try (RocksDBStoreEngine engine = open("repair-source-preflight-limit")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("repair-limit-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("repair-limit-second", GlobalStatus.Begin);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+            engine.delete(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(first.getTransactionId()));
+
+            StoreException exception =
+                    Assertions.assertThrows(StoreException.class, () -> new RocksDBMaintenanceService(engine)
+                            .planRepair(RocksDBRepairOptions.builder()
+                                    .maxRepairEntries(1)
+                                    .build()));
+
+            Assertions.assertTrue(exception.getMessage().contains("maxRepairEntries:1"));
+        }
+    }
+
+    @Test
     void testExecuteRepairRejectsGlobalSessionKeyPayloadMismatch() {
         try (RocksDBStoreEngine engine = open("repair-global-key-payload-mismatch")) {
             GlobalSession global = globalSession("repair-global-key-payload-mismatch", GlobalStatus.Begin);

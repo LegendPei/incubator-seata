@@ -43,6 +43,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -140,6 +141,10 @@ public class RocksDBMaintenanceService {
      * Verify the current state without retaining full database-sized reference sets.
      */
     public RocksDBVerifyReport verifyCurrentState(RocksDBVerifyOptions options) {
+        return verifyCurrentState(options, 0);
+    }
+
+    private RocksDBVerifyReport verifyCurrentState(RocksDBVerifyOptions options, int maxRepairEntries) {
         return storeEngine.withSnapshot(view -> {
             RocksDBVerifyReport.Builder report = RocksDBVerifyReport.builder(options);
             verifyMetadata(view, report);
@@ -156,10 +161,51 @@ public class RocksDBMaintenanceService {
                     verifyFull(view, deadlineNanos, report);
                     break;
             }
+            if (maxRepairEntries > 0
+                    && report.isComplete()
+                    && report.requiresGlobalSecondaryIndexRebuild()
+                    && !report.hasUnrepairableSourceViolation()) {
+                verifyRepairSourceUniqueness(view, deadlineNanos, maxRepairEntries, report);
+            }
             RocksDBVerifyReport result = report.build();
             LOGGER.info("RocksDB verify completed, {}", result);
             return result;
         });
+    }
+
+    private void verifyRepairSourceUniqueness(
+            SnapshotReadView view, long deadlineNanos, int maxRepairEntries, RocksDBVerifyReport.Builder report) {
+        Set<Long> transactionIds = new HashSet<>();
+        long[] rows = new long[1];
+        boolean[] limitExceeded = new boolean[1];
+        RocksDBStoreEngine.ScanStats stats = view.scanByPrefix(
+                RocksDBColumnFamily.GLOBAL_SESSION,
+                EMPTY_PREFIX,
+                EMPTY_PREFIX,
+                0,
+                deadlineNanos,
+                (key, value) -> {
+                    if (++rows[0] > maxRepairEntries) {
+                        limitExceeded[0] = true;
+                        return false;
+                    }
+                    return true;
+                },
+                (key, value) -> {
+                    GlobalVerifyEntry global = decodeGlobal(value, null, "global session");
+                    if (global != null && !transactionIds.add(global.transactionId)) {
+                        report.invalidGlobal(
+                                "duplicate global transaction id:" + global.transactionId + ", xid:" + global.xid);
+                    }
+                });
+        if (stats.isDeadlineReached()) {
+            report.truncated();
+            report.complete(false);
+            return;
+        }
+        if (limitExceeded[0]) {
+            throw new StoreException("RocksDB repair exceeds maxRepairEntries:" + maxRepairEntries);
+        }
     }
 
     private void verifyMetadata(SnapshotReadView view, RocksDBVerifyReport.Builder report) {
@@ -553,8 +599,8 @@ public class RocksDBMaintenanceService {
      */
     public RocksDBRepairPlan planRepair(RocksDBRepairOptions options) {
         Objects.requireNonNull(options, "repair options must not be null");
-        RocksDBVerifyReport beforeVerifyReport =
-                verifyCurrentState(RocksDBVerifyOptions.full(100, options.getVerifyDeadlineMillis()));
+        RocksDBVerifyReport beforeVerifyReport = verifyCurrentState(
+                RocksDBVerifyOptions.full(100, options.getVerifyDeadlineMillis()), options.getMaxRepairEntries());
         Set<RocksDBRepairPlan.Action> actions = EnumSet.noneOf(RocksDBRepairPlan.Action.class);
         if (requiresGlobalSecondaryIndexRebuild(beforeVerifyReport)) {
             actions.add(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES);
@@ -861,8 +907,8 @@ public class RocksDBMaintenanceService {
     }
 
     private RocksDBRepairReport executeRepairInMaintenanceWindow(RocksDBRepairPlan plan, RocksDBRepairOptions options) {
-        RocksDBVerifyReport beforeVerifyReport =
-                verifyCurrentState(RocksDBVerifyOptions.full(100, options.getVerifyDeadlineMillis()));
+        RocksDBVerifyReport beforeVerifyReport = verifyCurrentState(
+                RocksDBVerifyOptions.full(100, options.getVerifyDeadlineMillis()), options.getMaxRepairEntries());
         if (!beforeVerifyReport.isComplete()) {
             throw new StoreException("RocksDB repair requires a complete pre-repair verification");
         }

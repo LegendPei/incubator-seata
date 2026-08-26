@@ -47,6 +47,7 @@ public class RocksDBMigrationService {
 
     public static final String MIGRATION_STATUS_KEY = "migration_status";
     public static final String MIGRATION_STATUS_IN_PROGRESS = "in_progress";
+    public static final String MIGRATION_STATUS_GUARDING_EMPTY = "guarding_empty";
     public static final String MIGRATION_STATUS_COMPLETED = "completed";
 
     private static final String REMOVED_XID_METADATA_PREFIX = "migration_removed_xid:";
@@ -88,6 +89,10 @@ public class RocksDBMigrationService {
             putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
             return false;
         }
+        if (MIGRATION_STATUS_GUARDING_EMPTY.equals(migrationStatus)) {
+            completeEmptySourceGuard(fileSessionLogPath, storeEngine);
+            return false;
+        }
         if (StringUtils.isBlank(migrationStatus) && fileSessionLogReplayer.hasMigrationMarker(fileSessionLogPath)) {
             throw new StoreException("file session logs were already migrated to RocksDB, but RocksDB migration "
                     + "metadata is missing. Restore the RocksDB directory or remove the migration marker explicitly, "
@@ -105,7 +110,8 @@ public class RocksDBMigrationService {
             throw new StoreException("RocksDB current state exists without migration status");
         }
         if (!hasFileLogs) {
-            putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
+            putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_GUARDING_EMPTY);
+            completeEmptySourceGuard(fileSessionLogPath, storeEngine);
             return false;
         }
 
@@ -177,8 +183,23 @@ public class RocksDBMigrationService {
 
     private void removeGlobalAndWriteTombstone(
             GlobalSession globalSession, RocksDBStoreEngine storeEngine, RocksDBTransactionStoreManager storeManager) {
-        storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession);
         storeEngine.put(RocksDBColumnFamily.METADATA, removedGlobalMetadataKey(globalSession.getXid()), new byte[] {1});
+        storeEngine.deleteByPrefix(
+                RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(globalSession.getXid()));
+        storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession);
+    }
+
+    private void completeEmptySourceGuard(Path fileSessionLogPath, RocksDBStoreEngine storeEngine) {
+        if (fileSessionLogReplayer.hasSessionLogs(fileSessionLogPath)) {
+            throw new StoreException("RocksDB migration was guarding empty legacy source, but source file logs exist");
+        }
+        if (hasCurrentState(storeEngine)) {
+            throw new StoreException(
+                    "RocksDB migration was guarding empty legacy source, but RocksDB current state exists");
+        }
+        storeEngine.flush();
+        fileSessionLogReplayer.markMigrated(fileSessionLogPath);
+        putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
     }
 
     private void applyBranchUpdate(

@@ -104,7 +104,17 @@ class RocksDBStoreEngineTest {
                 });
 
                 engine.withSnapshot(view -> {
-                    Assertions.assertArrayEquals(oldGlobal, view.get(RocksDBColumnFamily.GLOBAL_SESSION, globalKey));
+                    List<byte[]> snapshotGlobals = new ArrayList<>();
+                    view.scanByPrefix(
+                            RocksDBColumnFamily.GLOBAL_SESSION,
+                            globalKey,
+                            globalKey,
+                            1,
+                            0L,
+                            null,
+                            (key, value) -> snapshotGlobals.add(value));
+                    Assertions.assertEquals(1, snapshotGlobals.size());
+                    Assertions.assertArrayEquals(oldGlobal, snapshotGlobals.get(0));
                     snapshotRead.countDown();
                     try {
                         Assertions.assertTrue(updateComplete.await(5, TimeUnit.SECONDS));
@@ -115,6 +125,17 @@ class RocksDBStoreEngineTest {
                     Assertions.assertArrayEquals(oldGlobal, view.get(RocksDBColumnFamily.GLOBAL_SESSION, globalKey));
                     Assertions.assertArrayEquals(
                             oldIndex, view.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey));
+                    List<byte[]> snapshotIndexes = new ArrayList<>();
+                    view.scanByPrefix(
+                            RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                            transactionIdKey,
+                            transactionIdKey,
+                            1,
+                            0L,
+                            null,
+                            (key, value) -> snapshotIndexes.add(value));
+                    Assertions.assertEquals(1, snapshotIndexes.size());
+                    Assertions.assertArrayEquals(oldIndex, snapshotIndexes.get(0));
                     return null;
                 });
                 update.get(5, TimeUnit.SECONDS);
@@ -126,6 +147,16 @@ class RocksDBStoreEngineTest {
             Assertions.assertArrayEquals(newGlobal, engine.get(RocksDBColumnFamily.GLOBAL_SESSION, globalKey));
             Assertions.assertArrayEquals(
                     newIndex, engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey));
+            List<byte[]> liveGlobals = new ArrayList<>();
+            engine.scanByPrefix(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    globalKey,
+                    globalKey,
+                    1,
+                    null,
+                    (key, value) -> liveGlobals.add(value));
+            Assertions.assertEquals(1, liveGlobals.size());
+            Assertions.assertArrayEquals(newGlobal, liveGlobals.get(0));
         }
     }
 

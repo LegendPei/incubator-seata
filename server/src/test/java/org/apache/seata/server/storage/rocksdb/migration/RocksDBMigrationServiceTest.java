@@ -53,8 +53,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.Map;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.spy;
 
@@ -142,6 +146,93 @@ class RocksDBMigrationServiceTest {
             StoreException exception = Assertions.assertThrows(StoreException.class, () -> new RocksDBMigrationService()
                     .migrate(tempDir.resolve("missing").resolve("root.data"), engine));
             Assertions.assertTrue(exception.getMessage().contains("without migration status"));
+        }
+    }
+
+    @Test
+    void testEmptyLegacySourceCreatesOneWayGuardBeforeCompleting() {
+        Path fileLog = tempDir.resolve("empty-file").resolve("root.data");
+        FileSessionLogReplayer replayer = new FileSessionLogReplayer();
+
+        try (RocksDBStoreEngine engine = open("rocksdb-empty-source-guard")) {
+            Assertions.assertFalse(new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_COMPLETED, getMigrationStatus(engine));
+            Assertions.assertTrue(Files.isRegularFile(migrationMarker(fileLog)));
+            Assertions.assertThrows(StoreException.class, () -> replayer.ensureLegacyFileModeAllowed(fileLog));
+        }
+    }
+
+    @Test
+    void testEmptySourceGuardRecoversAfterMarkerBeforeCompletedStatus() {
+        Path fileLog = tempDir.resolve("guarded-empty-file").resolve("root.data");
+        FileSessionLogReplayer replayer = new FileSessionLogReplayer();
+
+        try (RocksDBStoreEngine engine = open("rocksdb-empty-source-guard-recovery")) {
+            putMigrationStatus(engine, RocksDBMigrationService.MIGRATION_STATUS_GUARDING_EMPTY);
+            engine.flush();
+            replayer.markMigrated(fileLog);
+
+            Assertions.assertFalse(new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_COMPLETED, getMigrationStatus(engine));
+            Assertions.assertThrows(StoreException.class, () -> replayer.ensureLegacyFileModeAllowed(fileLog));
+        }
+    }
+
+    @Test
+    void testEmptySourceGuardFlushFailureRemainsRetryableBeforeMarker() {
+        Path fileLog = tempDir.resolve("guard-flush-failure").resolve("root.data");
+
+        try (RocksDBStoreEngine engine = spy(open("rocksdb-empty-source-guard-flush-failure"))) {
+            doThrow(new StoreException("flush failed"))
+                    .doCallRealMethod()
+                    .when(engine)
+                    .flush();
+            RocksDBMigrationService service = new RocksDBMigrationService();
+
+            Assertions.assertThrows(StoreException.class, () -> service.migrate(fileLog, engine));
+
+            Assertions.assertEquals(
+                    RocksDBMigrationService.MIGRATION_STATUS_GUARDING_EMPTY, getMigrationStatus(engine));
+            Assertions.assertFalse(Files.exists(migrationMarker(fileLog)));
+
+            Assertions.assertFalse(service.migrate(fileLog, engine));
+            Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_COMPLETED, getMigrationStatus(engine));
+            Assertions.assertTrue(Files.isRegularFile(migrationMarker(fileLog)));
+        }
+    }
+
+    @Test
+    void testEmptySourceGuardRejectsUnexpectedLegacyLogs() throws Exception {
+        Path fileLog = tempDir.resolve("guard-with-source").resolve("root.data");
+        appendLog(fileLog, globalSession("tx-unexpected-source", GlobalStatus.Begin), LogOperation.GLOBAL_ADD);
+
+        try (RocksDBStoreEngine engine = open("rocksdb-empty-source-guard-with-source")) {
+            putMigrationStatus(engine, RocksDBMigrationService.MIGRATION_STATUS_GUARDING_EMPTY);
+
+            StoreException exception = Assertions.assertThrows(
+                    StoreException.class, () -> new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertTrue(exception.getMessage().contains("guarding empty legacy source"));
+            Assertions.assertTrue(exception.getMessage().contains("source file logs exist"));
+        }
+    }
+
+    @Test
+    void testEmptySourceGuardRejectsUnexpectedCurrentState() {
+        Path fileLog = tempDir.resolve("guard-with-current-state").resolve("root.data");
+
+        try (RocksDBStoreEngine engine = open("rocksdb-empty-source-guard-with-current-state")) {
+            putMigrationStatus(engine, RocksDBMigrationService.MIGRATION_STATUS_GUARDING_EMPTY);
+            new RocksDBTransactionStoreManager(engine)
+                    .writeSession(LogOperation.GLOBAL_ADD, globalSession("tx-unexpected-state", GlobalStatus.Begin));
+
+            StoreException exception = Assertions.assertThrows(
+                    StoreException.class, () -> new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertTrue(exception.getMessage().contains("guarding empty legacy source"));
+            Assertions.assertTrue(exception.getMessage().contains("RocksDB current state exists"));
         }
     }
 
@@ -246,6 +337,43 @@ class RocksDBMigrationServiceTest {
             Assertions.assertFalse(engine.prefixExists(
                     RocksDBColumnFamily.METADATA, REMOVED_XID_METADATA_PREFIX.getBytes(StandardCharsets.UTF_8)));
         }
+    }
+
+    @Test
+    void testMigrationGlobalRemoveDeletesHighFanOutBranchesInBoundedBatches() throws Exception {
+        Path fileLog = tempDir.resolve("fan-out-file").resolve("root.data");
+        GlobalSession removed = globalSession("tx-high-fan-out", GlobalStatus.Begin);
+        byte[] branchPrefix = RocksDBKeyCodec.encodeXidPrefix(removed.getXid());
+        appendLog(fileLog, removed, LogOperation.GLOBAL_ADD);
+        for (int i = 0; i < 1025; i++) {
+            appendLog(fileLog, branchSession(removed, i + 1L), LogOperation.BRANCH_ADD);
+        }
+        appendLog(fileLog, removed, LogOperation.GLOBAL_REMOVE);
+
+        try (RocksDBStoreEngine engine = spy(open("rocksdb-high-fan-out-remove"))) {
+            doAnswer(invocation -> {
+                        byte[] prefix = invocation.getArgument(1);
+                        if (engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, prefix)) {
+                            throw new AssertionError("migration attempted an unbounded branch prefix scan");
+                        }
+                        return invocation.callRealMethod();
+                    })
+                    .when(engine)
+                    .prefixScan(eq(RocksDBColumnFamily.BRANCH_SESSION), any(byte[].class));
+
+            Assertions.assertTrue(new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertNull(new RocksDBTransactionStoreManager(engine).readSession(removed.getXid(), true));
+            Assertions.assertFalse(engine.prefixExists(RocksDBColumnFamily.BRANCH_SESSION, branchPrefix));
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.METADATA, REMOVED_XID_METADATA_PREFIX.getBytes(StandardCharsets.UTF_8)));
+        }
+    }
+
+    @Test
+    void testMigrationReplayDoesNotReintroduceDatabaseSizedStateHolder() {
+        Assertions.assertFalse(Arrays.stream(RocksDBMigrationService.class.getDeclaredClasses())
+                .anyMatch(type -> "MigrationState".equals(type.getSimpleName())));
     }
 
     @Test
