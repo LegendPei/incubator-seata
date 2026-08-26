@@ -17,16 +17,16 @@
 package org.apache.seata.server.storage.rocksdb;
 
 import org.apache.seata.common.exception.StoreException;
-import org.apache.seata.common.thread.NamedThreadFactory;
+import org.apache.seata.common.thread.ThreadPoolExecutorFactory;
 import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -47,10 +47,12 @@ final class RocksDBWalSyncController implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBWalSyncController.class);
     private static final RocksDBWalSyncController DISABLED = new RocksDBWalSyncController();
-    private static final ThreadFactory WAL_SYNC_THREAD_FACTORY = new NamedThreadFactory("rocksdb-wal-sync", true);
+    private static final ThreadFactory WAL_SYNC_THREAD_FACTORY =
+            ThreadPoolExecutorFactory.newThreadFactory("rocksdb-wal-sync", 1, true);
     private static final ThreadFactory WAL_SHUTDOWN_THREAD_FACTORY =
-            new NamedThreadFactory("rocksdb-wal-shutdown", true);
-    private static final ThreadFactory WAL_CLEANUP_THREAD_FACTORY = new NamedThreadFactory("rocksdb-wal-cleanup", true);
+            ThreadPoolExecutorFactory.newThreadFactory("rocksdb-wal-shutdown", 1, true);
+    private static final ThreadFactory WAL_CLEANUP_THREAD_FACTORY =
+            ThreadPoolExecutorFactory.newThreadFactory("rocksdb-wal-cleanup", 1, true);
 
     private final RocksDBWalSyncMode mode;
     private final WalSyncer syncer;
@@ -166,7 +168,7 @@ final class RocksDBWalSyncController implements AutoCloseable {
             return disabled();
         }
         WalSyncer syncer = new RocksDBWalSyncer(db);
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(WAL_SYNC_THREAD_FACTORY);
+        ScheduledExecutorService executor = new ScheduledThreadPoolExecutor(1, WAL_SYNC_THREAD_FACTORY);
         return new RocksDBWalSyncController(
                 config.getWalSyncMode(),
                 syncer,

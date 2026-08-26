@@ -212,8 +212,11 @@ public class RocksDBRaftSnapshotSupport {
             Files.createDirectory(stagingDir);
             copyDirectoryContents(realSnapshotDir, stagingDir);
             validateRequiredColumnFamilies(stagingDir);
-            try (RocksDBStoreEngine ignored = openFromSnapshot(stagingDir, true)) {
-                // Opening every column family is the snapshot integrity check before replacement.
+            try (RocksDBStoreEngine validationEngine = openFromSnapshot(stagingDir, true)) {
+                LOGGER.debug(
+                        "validated RocksDB snapshot before replacement, path:{}, columnFamilies:{}",
+                        stagingDir,
+                        validationEngine.getColumnFamilyNames());
             }
 
             moveDirectory(realTargetDbDir, backupDir);

@@ -155,7 +155,9 @@ class RocksDBLocalLocksTest {
                         if (!start.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                             throw new AssertionError("Worker was not started in time");
                         }
-                        try (RocksDBLocalLocks.LockScope ignored = locks.lockAll(keys)) {}
+                        try (RocksDBLocalLocks.LockScope scope = locks.lockAll(keys)) {
+                            Assertions.assertNotNull(scope);
+                        }
                     } catch (Throwable throwable) {
                         failure.compareAndSet(null, throwable);
                     }

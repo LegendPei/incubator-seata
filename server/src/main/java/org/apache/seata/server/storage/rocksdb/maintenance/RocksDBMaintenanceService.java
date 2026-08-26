@@ -679,7 +679,9 @@ public class RocksDBMaintenanceService {
 
     private RocksDBLockIndexRepairProgress loadLockIndexProgress(String runId) {
         RocksDBLockIndexRepairProgress progress = readLockIndexProgress();
-        if (progress == null) return null;
+        if (progress == null) {
+            return null;
+        }
         if (progress.state == RocksDBLockIndexRepairProgress.State.STOPPED || !runId.equals(progress.runId)) {
             throw new StoreException("lock index repair cannot resume persisted run");
         }
@@ -688,7 +690,9 @@ public class RocksDBMaintenanceService {
 
     private RocksDBLockIndexRepairProgress readLockIndexProgress() {
         byte[] raw = storeEngine.get(RocksDBColumnFamily.METADATA, LOCK_INDEX_REPAIR_PROGRESS_KEY);
-        if (raw == null) return null;
+        if (raw == null) {
+            return null;
+        }
         try {
             return RocksDBLockIndexRepairProgress.decode(raw);
         } catch (IllegalArgumentException e) {
@@ -730,7 +734,9 @@ public class RocksDBMaintenanceService {
                 stopLockIndexRepair(runId, seek, deletedBefore);
                 return new LockIndexBatchResult(seek, deletedBefore, true);
             }
-            if (deletable) deletions.add(entry.getKey());
+            if (deletable) {
+                deletions.add(entry.getKey());
+            }
         }
         int deleted = deletedBefore + deletions.size();
         try (WriteBatch batch = new WriteBatch()) {
@@ -766,11 +772,17 @@ public class RocksDBMaintenanceService {
 
     private Boolean isDeletableStaleLockIndex(byte[] indexKey, byte[] lockKey) {
         byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
-        if (lockValue == null) return Boolean.TRUE;
+        if (lockValue == null) {
+            return Boolean.TRUE;
+        }
         LockVerifyEntry lock = decodeLock(lockValue);
-        if (lock == null || !hasValidLockSource(lock)) return null;
+        if (lock == null || !hasValidLockSource(lock)) {
+            return null;
+        }
         byte[] expected = RocksDBKeyCodec.encodeLockBranchIndex(lock.xid, lock.branchId, lockKey);
-        if (Arrays.equals(indexKey, expected)) return Boolean.FALSE;
+        if (Arrays.equals(indexKey, expected)) {
+            return Boolean.FALSE;
+        }
         return Arrays.equals(lockKey, storeEngine.get(RocksDBColumnFamily.LOCK_BRANCH_INDEX, expected))
                 ? Boolean.TRUE
                 : null;

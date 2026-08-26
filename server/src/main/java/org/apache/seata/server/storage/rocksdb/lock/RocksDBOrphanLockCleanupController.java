@@ -18,6 +18,7 @@ package org.apache.seata.server.storage.rocksdb.lock;
 
 import org.apache.seata.common.ConfigurationKeys;
 import org.apache.seata.common.exception.StoreException;
+import org.apache.seata.common.thread.ThreadPoolExecutorFactory;
 import org.apache.seata.config.Configuration;
 import org.apache.seata.config.ConfigurationFactory;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
@@ -26,10 +27,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -180,7 +180,8 @@ public class RocksDBOrphanLockCleanupController implements AutoCloseable {
                         ConfigurationKeys.STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS,
                         DEFAULT_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS),
                 ConfigurationKeys.STORE_FILE_ROCKSDB_ORPHAN_LOCK_CLEAN_ROUND_SLEEP_MILLIS);
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(new CleanupThreadFactory());
+        ScheduledExecutorService executor = new ScheduledThreadPoolExecutor(
+                1, ThreadPoolExecutorFactory.newThreadFactory("rocksdb-orphan-lock-cleanup", 1, true));
         return new RocksDBOrphanLockCleanupController(
                 lockManager,
                 storeEngine,
@@ -470,14 +471,5 @@ public class RocksDBOrphanLockCleanupController implements AutoCloseable {
     @FunctionalInterface
     interface Sleeper {
         void sleep(long millis) throws InterruptedException;
-    }
-
-    private static final class CleanupThreadFactory implements ThreadFactory {
-        @Override
-        public Thread newThread(Runnable task) {
-            Thread thread = new Thread(task, "rocksdb-orphan-lock-cleanup");
-            thread.setDaemon(true);
-            return thread;
-        }
     }
 }

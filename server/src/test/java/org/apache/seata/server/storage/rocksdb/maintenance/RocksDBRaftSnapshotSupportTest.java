@@ -426,7 +426,10 @@ class RocksDBRaftSnapshotSupportTest {
             support.saveSnapshot(validSnapshotDir, false);
             try (Options options = new Options().setCreateIfMissing(true);
                     RocksDB ignored = RocksDB.open(options, incompleteSnapshotDir.toString())) {
-                // A raw RocksDB contains only the default column family.
+                Assertions.assertEquals(
+                        1,
+                        RocksDB.listColumnFamilies(options, incompleteSnapshotDir.toString())
+                                .size());
             } catch (org.rocksdb.RocksDBException e) {
                 Assertions.fail(e);
             }
