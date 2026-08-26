@@ -23,6 +23,7 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine.SnapshotReadView;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.RocksDBValueCodec;
 import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
@@ -139,29 +140,30 @@ public class RocksDBMaintenanceService {
      * Verify the current state without retaining full database-sized reference sets.
      */
     public RocksDBVerifyReport verifyCurrentState(RocksDBVerifyOptions options) {
-        RocksDBVerifyReport.Builder report = RocksDBVerifyReport.builder(options);
-        verifyMetadata(report);
-        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(options.getDeadlineMillis());
-        switch (options.getMode()) {
-            case SAMPLE:
-                verifySample(deadlineNanos, options, report);
-                break;
-            case PAGE:
-                verifyPage(deadlineNanos, options, report);
-                break;
-            case FULL:
-            default:
-                verifyFull(deadlineNanos, report);
-                break;
-        }
-        RocksDBVerifyReport result = report.build();
-        LOGGER.info("RocksDB verify completed, {}", result);
-        return result;
+        return storeEngine.withSnapshot(view -> {
+            RocksDBVerifyReport.Builder report = RocksDBVerifyReport.builder(options);
+            verifyMetadata(view, report);
+            long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(options.getDeadlineMillis());
+            switch (options.getMode()) {
+                case SAMPLE:
+                    verifySample(view, deadlineNanos, options, report);
+                    break;
+                case PAGE:
+                    verifyPage(view, deadlineNanos, options, report);
+                    break;
+                case FULL:
+                default:
+                    verifyFull(view, deadlineNanos, report);
+                    break;
+            }
+            RocksDBVerifyReport result = report.build();
+            LOGGER.info("RocksDB verify completed, {}", result);
+            return result;
+        });
     }
 
-    private void verifyMetadata(RocksDBVerifyReport.Builder report) {
-        byte[] versionBytes =
-                storeEngine.get(RocksDBColumnFamily.METADATA, "format_version".getBytes(StandardCharsets.UTF_8));
+    private void verifyMetadata(SnapshotReadView view, RocksDBVerifyReport.Builder report) {
+        byte[] versionBytes = view.get(RocksDBColumnFamily.METADATA, "format_version".getBytes(StandardCharsets.UTF_8));
         String expected = Integer.toString(RocksDBStoreEngine.FORMAT_VERSION);
         if (versionBytes == null) {
             report.error("missing format_version in metadata");
@@ -169,19 +171,19 @@ public class RocksDBMaintenanceService {
             report.error("format_version mismatch, expected:" + expected + ", found:"
                     + new String(versionBytes, StandardCharsets.UTF_8));
         }
-        byte[] cleanShutdown = storeEngine.get(RocksDBColumnFamily.METADATA, CLEAN_SHUTDOWN_KEY);
+        byte[] cleanShutdown = view.get(RocksDBColumnFamily.METADATA, CLEAN_SHUTDOWN_KEY);
         if (!Arrays.equals(cleanShutdown, CLEAN_SHUTDOWN_TRUE) && !Arrays.equals(cleanShutdown, CLEAN_SHUTDOWN_FALSE)) {
             report.invalidMetadata("invalid clean_shutdown metadata");
         }
-        byte[] orphanCleanupCursor = storeEngine.get(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY);
+        byte[] orphanCleanupCursor = view.get(RocksDBColumnFamily.METADATA, ORPHAN_LOCK_CLEAN_CURSOR_KEY);
         if (orphanCleanupCursor != null && !RocksDBKeyCodec.isValidLockBranchIndexSeekKey(orphanCleanupCursor)) {
             report.invalidMetadata("invalid orphan lock cleanup cursor metadata");
         }
     }
 
-    private void verifyFull(long deadlineNanos, RocksDBVerifyReport.Builder report) {
+    private void verifyFull(SnapshotReadView view, long deadlineNanos, RocksDBVerifyReport.Builder report) {
         for (RocksDBColumnFamily columnFamily : VERIFY_COLUMN_FAMILIES) {
-            VerifyScanResult result = scanFamily(columnFamily, EMPTY_PREFIX, 0, deadlineNanos, report);
+            VerifyScanResult result = scanFamily(view, columnFamily, EMPTY_PREFIX, 0, deadlineNanos, report);
             if (result.stats.isDeadlineReached()) {
                 truncate(report, columnFamily, result.lastKey, EMPTY_PREFIX);
                 return;
@@ -190,9 +192,14 @@ public class RocksDBMaintenanceService {
         report.complete(true);
     }
 
-    private void verifySample(long deadlineNanos, RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
+    private void verifySample(
+            SnapshotReadView view,
+            long deadlineNanos,
+            RocksDBVerifyOptions options,
+            RocksDBVerifyReport.Builder report) {
         for (RocksDBColumnFamily columnFamily : VERIFY_COLUMN_FAMILIES) {
-            VerifyScanResult result = scanFamily(columnFamily, EMPTY_PREFIX, options.getLimit(), deadlineNanos, report);
+            VerifyScanResult result =
+                    scanFamily(view, columnFamily, EMPTY_PREFIX, options.getLimit(), deadlineNanos, report);
             if (result.stats.isDeadlineReached()) {
                 truncate(report, columnFamily, result.lastKey, EMPTY_PREFIX);
                 return;
@@ -201,7 +208,11 @@ public class RocksDBMaintenanceService {
         report.complete(false);
     }
 
-    private void verifyPage(long deadlineNanos, RocksDBVerifyOptions options, RocksDBVerifyReport.Builder report) {
+    private void verifyPage(
+            SnapshotReadView view,
+            long deadlineNanos,
+            RocksDBVerifyOptions options,
+            RocksDBVerifyReport.Builder report) {
         RocksDBVerifyCursor cursor = options.getCursor();
         int familyIndex = cursor == null ? 0 : familyIndex(cursor.getColumnFamily());
         int remaining = options.getLimit();
@@ -209,7 +220,7 @@ public class RocksDBMaintenanceService {
             RocksDBColumnFamily columnFamily = VERIFY_COLUMN_FAMILIES[i];
             byte[] seekKey =
                     cursor != null && cursor.getColumnFamily() == columnFamily ? cursor.getSeekKey() : EMPTY_PREFIX;
-            VerifyScanResult result = scanFamily(columnFamily, seekKey, remaining, deadlineNanos, report);
+            VerifyScanResult result = scanFamily(view, columnFamily, seekKey, remaining, deadlineNanos, report);
             remaining -= result.stats.getRowsReturned();
             if (result.stats.isDeadlineReached()) {
                 truncate(report, columnFamily, result.lastKey, seekKey);
@@ -227,16 +238,17 @@ public class RocksDBMaintenanceService {
     }
 
     private VerifyScanResult scanFamily(
+            SnapshotReadView view,
             RocksDBColumnFamily columnFamily,
             byte[] seekKey,
             int limit,
             long deadlineNanos,
             RocksDBVerifyReport.Builder report) {
         byte[][] lastKey = new byte[1][];
-        RocksDBStoreEngine.ScanStats stats = storeEngine.scanByPrefix(
-                columnFamily, seekKey, EMPTY_PREFIX, limit, deadlineNanos, null, (key, value) -> {
+        RocksDBStoreEngine.ScanStats stats =
+                view.scanByPrefix(columnFamily, seekKey, EMPTY_PREFIX, limit, deadlineNanos, null, (key, value) -> {
                     lastKey[0] = key;
-                    verifyEntry(columnFamily, key, value, report);
+                    verifyEntry(view, columnFamily, key, value, report);
                 });
         report.scannedRecords(stats.getRowsScanned());
         return new VerifyScanResult(stats, lastKey[0]);
@@ -250,36 +262,40 @@ public class RocksDBMaintenanceService {
     }
 
     private void verifyEntry(
-            RocksDBColumnFamily columnFamily, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+            SnapshotReadView view,
+            RocksDBColumnFamily columnFamily,
+            byte[] key,
+            byte[] value,
+            RocksDBVerifyReport.Builder report) {
         report.checkedRecord(isIndex(columnFamily));
         switch (columnFamily) {
             case GLOBAL_SESSION:
-                verifyGlobal(key, value, report);
+                verifyGlobal(view, key, value, report);
                 break;
             case BRANCH_SESSION:
-                verifyBranch(key, value, report);
+                verifyBranch(view, key, value, report);
                 break;
             case LOCK:
-                verifyLock(key, value, report);
+                verifyLock(view, key, value, report);
                 break;
             case GLOBAL_STATUS_INDEX:
-                verifyStatusIndex(key, value, report);
+                verifyStatusIndex(view, key, value, report);
                 break;
             case GLOBAL_TIMEOUT_INDEX:
-                verifyTimeoutIndex(key, value, report);
+                verifyTimeoutIndex(view, key, value, report);
                 break;
             case TRANSACTION_ID_INDEX:
-                verifyTransactionIdIndex(key, value, report);
+                verifyTransactionIdIndex(view, key, value, report);
                 break;
             case LOCK_BRANCH_INDEX:
-                verifyLockIndex(key, value, report);
+                verifyLockIndex(view, key, value, report);
                 break;
             default:
                 break;
         }
     }
 
-    private void verifyGlobal(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+    private void verifyGlobal(SnapshotReadView view, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
         report.checkedGlobal();
         GlobalVerifyEntry global = decodeGlobal(value, report, "global session");
         if (global == null) {
@@ -288,22 +304,29 @@ public class RocksDBMaintenanceService {
         if (!Arrays.equals(key, RocksDBKeyCodec.encodeXid(global.xid))) {
             report.invalidGlobal("global session key mismatch, xid:" + global.xid);
         }
-        report.globalTransactionId(global.transactionId, global.xid);
         byte[] xidBytes = global.xid.getBytes(StandardCharsets.UTF_8);
-        byte[] statusValue = storeEngine.get(
+        byte[] statusValue = view.get(
                 RocksDBColumnFamily.GLOBAL_STATUS_INDEX,
                 RocksDBKeyCodec.encodeGlobalStatusIndex(global.status, global.beginTime, global.xid));
         if (!Arrays.equals(xidBytes, statusValue)) {
             report.missingStatusIndex("missing global status index, xid:" + global.xid);
         }
-        byte[] transactionValue = storeEngine.get(
+        byte[] transactionValue = view.get(
                 RocksDBColumnFamily.TRANSACTION_ID_INDEX,
                 RocksDBKeyCodec.encodeTransactionIdIndex(global.transactionId));
-        if (!Arrays.equals(xidBytes, transactionValue)) {
+        if (transactionValue == null) {
             report.missingTransactionIdIndex("missing transaction id index, xid:" + global.xid);
+        } else if (!Arrays.equals(xidBytes, transactionValue)) {
+            String indexedXid = new String(transactionValue, StandardCharsets.UTF_8);
+            GlobalVerifyEntry indexedGlobal = readGlobal(view, indexedXid);
+            if (indexedGlobal != null && indexedGlobal.transactionId == global.transactionId) {
+                report.invalidGlobal("duplicate global transaction id:" + global.transactionId + ", xid:" + global.xid);
+            } else {
+                report.missingTransactionIdIndex("missing valid transaction id index, xid:" + global.xid);
+            }
         }
         if (global.status == GlobalStatus.Begin) {
-            byte[] timeoutValue = storeEngine.get(
+            byte[] timeoutValue = view.get(
                     RocksDBColumnFamily.GLOBAL_TIMEOUT_INDEX,
                     RocksDBKeyCodec.encodeGlobalTimeoutIndex(global.deadlineMillis(), global.xid));
             if (!Arrays.equals(xidBytes, timeoutValue)) {
@@ -312,7 +335,7 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private void verifyBranch(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+    private void verifyBranch(SnapshotReadView view, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
         report.checkedBranch();
         String xid = RocksDBKeyCodec.extractXidFromBranchKey(key);
         long branchId = RocksDBKeyCodec.extractBranchIdFromBranchKey(key);
@@ -320,7 +343,7 @@ public class RocksDBMaintenanceService {
             report.invalidBranch("invalid branch session key");
             return;
         }
-        if (storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid)) == null) {
+        if (view.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid)) == null) {
             report.orphanBranch("orphan branch session, xid:" + xid);
         }
         BranchVerifyEntry branch = decodeBranch(value, report);
@@ -332,19 +355,18 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private void verifyLock(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+    private void verifyLock(SnapshotReadView view, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
         report.checkedLock();
         LockVerifyEntry lock = decodeLock(value);
-        if (lock == null
-                || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null) {
+        if (lock == null || view.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null) {
             report.orphanLock("orphan or invalid lock holder");
             return;
         }
-        if (storeEngine.get(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch(lock.xid, lock.branchId))
+        if (view.get(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch(lock.xid, lock.branchId))
                 == null) {
             report.orphanLock("lock holder references missing branch session, xid:" + lock.xid);
         }
-        byte[] indexValue = storeEngine.get(
+        byte[] indexValue = view.get(
                 RocksDBColumnFamily.LOCK_BRANCH_INDEX,
                 RocksDBKeyCodec.encodeLockBranchIndex(lock.xid, lock.branchId, key));
         if (!Arrays.equals(key, indexValue)) {
@@ -352,10 +374,11 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private void verifyStatusIndex(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+    private void verifyStatusIndex(
+            SnapshotReadView view, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
         try {
             String xid = RocksDBKeyCodec.extractXidFromStatusIndexKey(key);
-            GlobalVerifyEntry global = readGlobal(xid);
+            GlobalVerifyEntry global = readGlobal(view, xid);
             byte[] expectedKey = global == null
                     ? null
                     : RocksDBKeyCodec.encodeGlobalStatusIndex(global.status, global.beginTime, global.xid);
@@ -369,10 +392,11 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private void verifyTimeoutIndex(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+    private void verifyTimeoutIndex(
+            SnapshotReadView view, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
         try {
             String xid = new String(value, StandardCharsets.UTF_8);
-            GlobalVerifyEntry global = readGlobal(xid);
+            GlobalVerifyEntry global = readGlobal(view, xid);
             byte[] expectedKey = global == null
                     ? null
                     : RocksDBKeyCodec.encodeGlobalTimeoutIndex(global.deadlineMillis(), global.xid);
@@ -384,10 +408,11 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private void verifyTransactionIdIndex(byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
+    private void verifyTransactionIdIndex(
+            SnapshotReadView view, byte[] key, byte[] value, RocksDBVerifyReport.Builder report) {
         try {
             String xid = new String(value, StandardCharsets.UTF_8);
-            GlobalVerifyEntry global = readGlobal(xid);
+            GlobalVerifyEntry global = readGlobal(view, xid);
             byte[] expectedKey = global == null ? null : RocksDBKeyCodec.encodeTransactionIdIndex(global.transactionId);
             if (global == null || !Arrays.equals(key, expectedKey)) {
                 report.staleTransactionIdIndex("stale transaction id index, xid:" + xid);
@@ -397,27 +422,26 @@ public class RocksDBMaintenanceService {
         }
     }
 
-    private void verifyLockIndex(byte[] key, byte[] lockKey, RocksDBVerifyReport.Builder report) {
-        byte[] lockValue = storeEngine.get(RocksDBColumnFamily.LOCK, lockKey);
+    private void verifyLockIndex(
+            SnapshotReadView view, byte[] key, byte[] lockKey, RocksDBVerifyReport.Builder report) {
+        byte[] lockValue = view.get(RocksDBColumnFamily.LOCK, lockKey);
         LockVerifyEntry lock = decodeLock(lockValue);
         byte[] expectedKey =
                 lock == null ? null : RocksDBKeyCodec.encodeLockBranchIndex(lock.xid, lock.branchId, lockKey);
         if (lock == null
-                || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null
-                || storeEngine.get(
-                                RocksDBColumnFamily.BRANCH_SESSION,
-                                RocksDBKeyCodec.encodeBranch(lock.xid, lock.branchId))
+                || view.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(lock.xid)) == null
+                || view.get(RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeBranch(lock.xid, lock.branchId))
                         == null
                 || !Arrays.equals(key, expectedKey)) {
             report.staleLockIndex("stale lock branch index");
         }
     }
 
-    private GlobalVerifyEntry readGlobal(String xid) {
+    private GlobalVerifyEntry readGlobal(SnapshotReadView view, String xid) {
         if (xid == null) {
             return null;
         }
-        byte[] value = storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid));
+        byte[] value = view.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid));
         return value == null ? null : decodeGlobal(value, null, "global session");
     }
 

@@ -32,6 +32,7 @@ import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.Snapshot;
 import org.rocksdb.Statistics;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
@@ -52,6 +53,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -390,6 +392,46 @@ public class RocksDBStoreEngine implements AutoCloseable {
     }
 
     /**
+     * Runs an action against a consistent RocksDB snapshot while preventing engine shutdown.
+     *
+     * @param action action that reads through the snapshot view
+     * @param <T> result type
+     * @return action result
+     */
+    public <T> T withSnapshot(Function<SnapshotReadView, T> action) {
+        Objects.requireNonNull(action, "snapshot action must not be null");
+        maintenanceLock.readLock().lock();
+        Snapshot snapshot = null;
+        ReadOptions snapshotReadOptions = null;
+        SnapshotReadViewImpl snapshotReadView = null;
+        try {
+            ensureOpen();
+            snapshot = db.getSnapshot();
+            snapshotReadOptions = new ReadOptions();
+            snapshotReadOptions.setSnapshot(snapshot);
+            snapshotReadView = new SnapshotReadViewImpl(snapshotReadOptions, Thread.currentThread());
+            return action.apply(snapshotReadView);
+        } finally {
+            try {
+                if (snapshotReadView != null) {
+                    snapshotReadView.deactivate();
+                }
+                if (snapshotReadOptions != null) {
+                    snapshotReadOptions.close();
+                }
+            } finally {
+                try {
+                    if (snapshot != null) {
+                        db.releaseSnapshot(snapshot);
+                    }
+                } finally {
+                    maintenanceLock.readLock().unlock();
+                }
+            }
+        }
+    }
+
+    /**
      * Batch get multiple keys from the same column family.
      * Returns a list of values in the same order as keys; null for missing keys.
      * <p>
@@ -589,41 +631,53 @@ public class RocksDBStoreEngine implements AutoCloseable {
         maintenanceLock.readLock().lock();
         try {
             ensureOpen();
-            int rowsScanned = 0;
-            int rowsReturned = 0;
-            boolean limitReached = false;
-            boolean deadlineReached = false;
-            try (RocksIterator iterator = db.newIterator(handle(columnFamily), readOptions)) {
-                for (iterator.seek(seekKey); iterator.isValid(); iterator.next()) {
-                    byte[] key = iterator.key();
-                    if (!RocksDBKeyCodec.startsWith(key, prefix)) {
-                        break;
-                    }
-                    byte[] value = iterator.value();
-                    rowsScanned++;
-                    if (deadlineNanos > 0
-                            && (rowsScanned & (DEADLINE_CHECK_INTERVAL - 1)) == 0
-                            && System.nanoTime() >= deadlineNanos) {
-                        deadlineReached = true;
-                        break;
-                    }
-                    if (filter != null && !filter.shouldContinue(key, value)) {
-                        break;
-                    }
-                    consumer.accept(copy(key), copy(value));
-                    rowsReturned++;
-                    if (limit > 0 && rowsReturned >= limit) {
-                        limitReached = true;
-                        break;
-                    }
-                }
-                iterator.status();
-                return new ScanStats(rowsScanned, rowsReturned, limitReached, deadlineReached);
-            } catch (RocksDBException e) {
-                throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
-            }
+            return scanByPrefix(readOptions, columnFamily, seekKey, prefix, limit, deadlineNanos, filter, consumer);
         } finally {
             maintenanceLock.readLock().unlock();
+        }
+    }
+
+    private ScanStats scanByPrefix(
+            ReadOptions options,
+            RocksDBColumnFamily columnFamily,
+            byte[] seekKey,
+            byte[] prefix,
+            int limit,
+            long deadlineNanos,
+            RocksDBEntryFilter filter,
+            RocksDBEntryConsumer consumer) {
+        int rowsScanned = 0;
+        int rowsReturned = 0;
+        boolean limitReached = false;
+        boolean deadlineReached = false;
+        try (RocksIterator iterator = db.newIterator(handle(columnFamily), options)) {
+            for (iterator.seek(seekKey); iterator.isValid(); iterator.next()) {
+                byte[] key = iterator.key();
+                if (!RocksDBKeyCodec.startsWith(key, prefix)) {
+                    break;
+                }
+                byte[] value = iterator.value();
+                rowsScanned++;
+                if (deadlineNanos > 0
+                        && (rowsScanned & (DEADLINE_CHECK_INTERVAL - 1)) == 0
+                        && System.nanoTime() >= deadlineNanos) {
+                    deadlineReached = true;
+                    break;
+                }
+                if (filter != null && !filter.shouldContinue(key, value)) {
+                    break;
+                }
+                consumer.accept(copy(key), copy(value));
+                rowsReturned++;
+                if (limit > 0 && rowsReturned >= limit) {
+                    limitReached = true;
+                    break;
+                }
+            }
+            iterator.status();
+            return new ScanStats(rowsScanned, rowsReturned, limitReached, deadlineReached);
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "scan RocksDB prefix failed, columnFamily:" + columnFamily.getName());
         }
     }
 
@@ -1305,6 +1359,74 @@ public class RocksDBStoreEngine implements AutoCloseable {
 
         public byte[] getValue() {
             return copy(value);
+        }
+    }
+
+    /**
+     * Read-only view of one RocksDB sequence. Instances are valid only during {@link #withSnapshot(Function)}.
+     */
+    public interface SnapshotReadView {
+
+        byte[] get(RocksDBColumnFamily columnFamily, byte[] key);
+
+        ScanStats scanByPrefix(
+                RocksDBColumnFamily columnFamily,
+                byte[] seekKey,
+                byte[] prefix,
+                int limit,
+                long deadlineNanos,
+                RocksDBEntryFilter filter,
+                RocksDBEntryConsumer consumer);
+    }
+
+    private final class SnapshotReadViewImpl implements SnapshotReadView {
+        private final ReadOptions snapshotReadOptions;
+        private final Thread ownerThread;
+        private volatile boolean active = true;
+
+        private SnapshotReadViewImpl(ReadOptions snapshotReadOptions, Thread ownerThread) {
+            this.snapshotReadOptions = snapshotReadOptions;
+            this.ownerThread = ownerThread;
+        }
+
+        @Override
+        public byte[] get(RocksDBColumnFamily columnFamily, byte[] key) {
+            ensureAccessible();
+            try {
+                return db.get(handle(columnFamily), snapshotReadOptions, key);
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "read RocksDB snapshot failed, columnFamily:" + columnFamily.getName());
+            }
+        }
+
+        @Override
+        public ScanStats scanByPrefix(
+                RocksDBColumnFamily columnFamily,
+                byte[] seekKey,
+                byte[] prefix,
+                int limit,
+                long deadlineNanos,
+                RocksDBEntryFilter filter,
+                RocksDBEntryConsumer consumer) {
+            ensureAccessible();
+            Objects.requireNonNull(seekKey, "seekKey must not be null");
+            Objects.requireNonNull(prefix, "prefix must not be null");
+            Objects.requireNonNull(consumer, "consumer must not be null");
+            return RocksDBStoreEngine.this.scanByPrefix(
+                    snapshotReadOptions, columnFamily, seekKey, prefix, limit, deadlineNanos, filter, consumer);
+        }
+
+        private void ensureAccessible() {
+            if (!active) {
+                throw new IllegalStateException("RocksDB snapshot read view is no longer active");
+            }
+            if (Thread.currentThread() != ownerThread) {
+                throw new IllegalStateException("RocksDB snapshot read view is restricted to its callback thread");
+            }
+        }
+
+        private void deactivate() {
+            active = false;
         }
     }
 

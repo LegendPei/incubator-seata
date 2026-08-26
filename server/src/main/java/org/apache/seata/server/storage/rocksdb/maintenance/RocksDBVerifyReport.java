@@ -18,9 +18,7 @@ package org.apache.seata.server.storage.rocksdb.maintenance;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Immutable report produced by RocksDB consistency verification.
@@ -225,7 +223,6 @@ public class RocksDBVerifyReport {
         private int inconsistentCount;
         private int totalErrorCount;
         private final List<String> errorMessages = new ArrayList<>();
-        private final Map<Long, String> globalXidsByTransactionId = new HashMap<>();
 
         private Builder(RocksDBVerifyOptions options) {
             this.mode = options.getMode();
@@ -293,13 +290,6 @@ public class RocksDBVerifyReport {
         void invalidGlobal(String message) {
             invalidGlobalCount++;
             issue(message);
-        }
-
-        void globalTransactionId(long transactionId, String xid) {
-            String existingXid = globalXidsByTransactionId.putIfAbsent(transactionId, xid);
-            if (existingXid != null && !existingXid.equals(xid)) {
-                invalidGlobal("duplicate global transaction id:" + transactionId);
-            }
         }
 
         void orphanBranch(String message) {

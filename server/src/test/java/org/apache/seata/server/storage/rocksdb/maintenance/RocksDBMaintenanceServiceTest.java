@@ -221,6 +221,31 @@ class RocksDBMaintenanceServiceTest {
     }
 
     @Test
+    void testPagedVerifyDetectsDuplicateTransactionIdWithOneRecordPages() {
+        try (RocksDBStoreEngine engine = open("verify-page-duplicate-transaction-id")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession first = globalSession("page-duplicate-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("page-duplicate-second", GlobalStatus.Begin);
+            second.setTransactionId(first.getTransactionId());
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, first);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, second);
+
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+            RocksDBVerifyCursor cursor = null;
+            boolean foundInvalidGlobal = false;
+            int pages = 0;
+            do {
+                RocksDBVerifyReport page = service.verifyCurrentState(RocksDBVerifyOptions.page(1, cursor, 10));
+                foundInvalidGlobal |= page.getInvalidGlobalCount() > 0;
+                cursor = page.getNextCursor();
+                Assertions.assertTrue(++pages <= 16, "paged verify did not reach completion");
+            } while (cursor != null);
+
+            Assertions.assertTrue(foundInvalidGlobal, "a duplicate global must be reported from its own page");
+        }
+    }
+
+    @Test
     void testSampleVerifyBoundsEachColumnFamily() {
         try (RocksDBStoreEngine engine = open("verify-sample")) {
             RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
@@ -705,11 +730,9 @@ class RocksDBMaintenanceServiceTest {
             byte[] statusKey =
                     RocksDBKeyCodec.encodeGlobalStatusIndex(global.getStatus(), global.getBeginTime(), global.getXid());
             byte[] transactionKey = RocksDBKeyCodec.encodeTransactionIdIndex(global.getTransactionId());
+            byte[] wrongXid = "wrong-xid".getBytes(StandardCharsets.UTF_8);
             engine.delete(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey);
-            engine.put(
-                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
-                    transactionKey,
-                    "wrong-xid".getBytes(StandardCharsets.UTF_8));
+            engine.put(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey, wrongXid);
 
             RocksDBRepairPlan plan = new RocksDBMaintenanceService(engine).planRepair(RocksDBRepairOptions.defaults());
 
@@ -719,8 +742,7 @@ class RocksDBMaintenanceServiceTest {
             Assertions.assertEquals(3, plan.getBeforeVerifyReport().getInconsistentCount());
             Assertions.assertNull(engine.get(RocksDBColumnFamily.GLOBAL_STATUS_INDEX, statusKey));
             Assertions.assertArrayEquals(
-                    "wrong-xid".getBytes(StandardCharsets.UTF_8),
-                    engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey));
+                    wrongXid, engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionKey));
         }
     }
 
@@ -805,6 +827,42 @@ class RocksDBMaintenanceServiceTest {
             Assertions.assertEquals(1, report.getExecutedActionCount());
             Assertions.assertTrue(
                     new RocksDBMaintenanceService(engine).verifyCurrentState().isClean());
+        }
+    }
+
+    @Test
+    void testExecuteRepairTreatsTransactionIdIndexPointingToDifferentTransactionAsStale() {
+        try (RocksDBStoreEngine engine = open("repair-stale-transaction-id-index")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession current = globalSession("repair-stale-transaction-current", GlobalStatus.Begin);
+            GlobalSession other = globalSession("repair-stale-transaction-other", GlobalStatus.Begin);
+            Assertions.assertNotEquals(current.getTransactionId(), other.getTransactionId());
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, current);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, other);
+            engine.put(
+                    RocksDBColumnFamily.TRANSACTION_ID_INDEX,
+                    RocksDBKeyCodec.encodeTransactionIdIndex(current.getTransactionId()),
+                    other.getXid().getBytes(StandardCharsets.UTF_8));
+            RocksDBMaintenanceService service = new RocksDBMaintenanceService(engine);
+
+            RocksDBRepairPlan plan = service.planRepair(RocksDBRepairOptions.defaults());
+
+            Assertions.assertTrue(plan.hasAction(RocksDBRepairPlan.Action.REBUILD_GLOBAL_SECONDARY_INDEXES));
+            Assertions.assertFalse(plan.hasUnrepairableSourceViolation());
+            Assertions.assertEquals(0, plan.getBeforeVerifyReport().getInvalidGlobalCount());
+            Assertions.assertEquals(1, plan.getBeforeVerifyReport().getMissingTransactionIdIndexCount());
+            Assertions.assertEquals(1, plan.getBeforeVerifyReport().getStaleTransactionIdIndexCount());
+
+            RocksDBRepairReport report = service.executeRepair(
+                    plan,
+                    RocksDBRepairOptions.builder()
+                            .dryRun(false)
+                            .confirm(true)
+                            .maintenanceMode(true)
+                            .build());
+
+            Assertions.assertTrue(report.getAfterVerifyReport().isClean());
+            Assertions.assertTrue(service.verifyCurrentState().isClean());
         }
     }
 

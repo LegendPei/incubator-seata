@@ -75,6 +75,141 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testWithSnapshotReadsOneSequenceAcrossConcurrentGlobalAndIndexUpdate() throws Exception {
+        try (RocksDBStoreEngine engine = open("snapshot-consistent-read", true)) {
+            byte[] globalKey = RocksDBKeyCodec.encodeXid("snapshot-xid");
+            byte[] transactionIdKey = RocksDBKeyCodec.encodeTransactionIdIndex(101L);
+            byte[] oldGlobal = "old-global".getBytes(StandardCharsets.UTF_8);
+            byte[] newGlobal = "new-global".getBytes(StandardCharsets.UTF_8);
+            byte[] oldIndex = "old-xid".getBytes(StandardCharsets.UTF_8);
+            byte[] newIndex = "new-xid".getBytes(StandardCharsets.UTF_8);
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, globalKey, oldGlobal);
+            engine.put(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey, oldIndex);
+
+            CountDownLatch snapshotRead = new CountDownLatch(1);
+            CountDownLatch updateComplete = new CountDownLatch(1);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<?> update = executor.submit(() -> {
+                    try {
+                        Assertions.assertTrue(snapshotRead.await(5, TimeUnit.SECONDS));
+                        engine.put(RocksDBColumnFamily.GLOBAL_SESSION, globalKey, newGlobal);
+                        engine.put(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey, newIndex);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(e);
+                    } finally {
+                        updateComplete.countDown();
+                    }
+                });
+
+                engine.withSnapshot(view -> {
+                    Assertions.assertArrayEquals(oldGlobal, view.get(RocksDBColumnFamily.GLOBAL_SESSION, globalKey));
+                    snapshotRead.countDown();
+                    try {
+                        Assertions.assertTrue(updateComplete.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(e);
+                    }
+                    Assertions.assertArrayEquals(oldGlobal, view.get(RocksDBColumnFamily.GLOBAL_SESSION, globalKey));
+                    Assertions.assertArrayEquals(
+                            oldIndex, view.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey));
+                    return null;
+                });
+                update.get(5, TimeUnit.SECONDS);
+            } finally {
+                executor.shutdownNow();
+                Assertions.assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            }
+
+            Assertions.assertArrayEquals(newGlobal, engine.get(RocksDBColumnFamily.GLOBAL_SESSION, globalKey));
+            Assertions.assertArrayEquals(
+                    newIndex, engine.get(RocksDBColumnFamily.TRANSACTION_ID_INDEX, transactionIdKey));
+        }
+    }
+
+    @Test
+    void testWithSnapshotReleasesResourcesWhenCallbackThrows() {
+        try (RocksDBStoreEngine engine = open("snapshot-callback-failure", true)) {
+            byte[] key = RocksDBKeyCodec.encodeXid("snapshot-failure-xid");
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, "before".getBytes(StandardCharsets.UTF_8));
+
+            Assertions.assertThrows(
+                    IllegalStateException.class,
+                    () -> engine.withSnapshot(view -> {
+                        Assertions.assertNotNull(view.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+                        throw new IllegalStateException("expected callback failure");
+                    }));
+
+            engine.put(RocksDBColumnFamily.GLOBAL_SESSION, key, "after".getBytes(StandardCharsets.UTF_8));
+            byte[] value = engine.withSnapshot(view -> view.get(RocksDBColumnFamily.GLOBAL_SESSION, key));
+            Assertions.assertArrayEquals("after".getBytes(StandardCharsets.UTF_8), value);
+        }
+    }
+
+    @Test
+    void testEscapedSnapshotReadViewFailsFastAfterCallback() {
+        try (RocksDBStoreEngine engine = open("snapshot-escaped-view", true)) {
+            byte[] key = "escaped-key".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "escaped-value".getBytes(StandardCharsets.UTF_8);
+            engine.put(RocksDBColumnFamily.DEFAULT, key, value);
+
+            RocksDBStoreEngine.SnapshotReadView escaped = engine.withSnapshot(view -> view);
+
+            Assertions.assertAll(
+                    () -> Assertions.assertThrows(
+                            IllegalStateException.class, () -> escaped.get(RocksDBColumnFamily.DEFAULT, key)),
+                    () -> Assertions.assertThrows(
+                            IllegalStateException.class,
+                            () -> escaped.scanByPrefix(
+                                    RocksDBColumnFamily.DEFAULT, key, key, 1, 0L, null, (entryKey, entryValue) -> {})));
+            engine.put(RocksDBColumnFamily.DEFAULT, key, "live-value".getBytes(StandardCharsets.UTF_8));
+            Assertions.assertArrayEquals(
+                    "live-value".getBytes(StandardCharsets.UTF_8), engine.get(RocksDBColumnFamily.DEFAULT, key));
+        }
+    }
+
+    @Test
+    void testSnapshotReadViewRejectsNonOwnerThread() throws Exception {
+        RocksDBStoreEngine engine = open("snapshot-non-owner-thread", true);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        byte[] key = "owner-key".getBytes(StandardCharsets.UTF_8);
+        try {
+            engine.put(RocksDBColumnFamily.DEFAULT, key, "owner-value".getBytes(StandardCharsets.UTF_8));
+
+            engine.withSnapshot(view -> {
+                Future<Throwable> access = executor.submit(() -> {
+                    try {
+                        view.get(RocksDBColumnFamily.DEFAULT, key);
+                        return null;
+                    } catch (Throwable throwable) {
+                        return throwable;
+                    }
+                });
+                try {
+                    Throwable failure = access.get(5, TimeUnit.SECONDS);
+                    Assertions.assertTrue(
+                            failure instanceof IllegalStateException,
+                            "non-owner snapshot access must fail with IllegalStateException, got: " + failure);
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                }
+                return null;
+            });
+
+            engine.put(RocksDBColumnFamily.DEFAULT, key, "after-owner-check".getBytes(StandardCharsets.UTF_8));
+            Assertions.assertArrayEquals(
+                    "after-owner-check".getBytes(StandardCharsets.UTF_8), engine.get(RocksDBColumnFamily.DEFAULT, key));
+        } finally {
+            executor.shutdownNow();
+            Assertions.assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            engine.close();
+        }
+        Assertions.assertTrue(engine.isClosed());
+    }
+
+    @Test
     void testBatchPutAndDelete() throws Exception {
         try (RocksDBStoreEngine engine = open("batch-put-delete", true)) {
             byte[] key = "key".getBytes(StandardCharsets.UTF_8);
