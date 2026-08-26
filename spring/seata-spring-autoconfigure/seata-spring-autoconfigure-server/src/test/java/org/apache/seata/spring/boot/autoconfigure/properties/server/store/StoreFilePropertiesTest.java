@@ -73,6 +73,7 @@ public class StoreFilePropertiesTest {
         expectedDefaults.put("fullScanMaxLimit", 10000);
         expectedDefaults.put("fullScanDeadlineMillis", 5000L);
         expectedDefaults.put("multiStatusScanPageSize", 256);
+        expectedDefaults.put("walSyncShutdownTimeoutMillis", 30000);
         expectedDefaults.put("orphanLockCleanEnabled", true);
         expectedDefaults.put("orphanLockCleanIntervalMillis", 60000L);
         expectedDefaults.put("orphanLockCleanBatchLimit", 1000);

@@ -922,6 +922,68 @@ class RocksDBStoreEngineTest {
     }
 
     @Test
+    void testWalShutdownTimeoutDefersResourceCloseAndLeavesDirtyMarker() throws Exception {
+        RocksDBStoreConfig config = config("wal-sync-close-timeout", false);
+        RocksDBStoreEngine engine = RocksDBStoreEngine.open(config);
+        BlockingShutdownWalSyncer syncer = new BlockingShutdownWalSyncer();
+        DirectScheduledExecutor walExecutor = new DirectScheduledExecutor();
+        replaceWalSyncController(
+                engine,
+                new RocksDBWalSyncController(
+                        RocksDBWalSyncMode.PERIODIC,
+                        syncer,
+                        1000L,
+                        100L,
+                        true,
+                        1000L,
+                        50L,
+                        walExecutor,
+                        true,
+                        System::currentTimeMillis,
+                        System::nanoTime));
+        ExecutorService closeExecutor = Executors.newSingleThreadExecutor();
+        AtomicReference<RocksDBStoreEngine> reopened = new AtomicReference<>();
+
+        try {
+            engine.put(
+                    RocksDBColumnFamily.GLOBAL_SESSION,
+                    RocksDBKeyCodec.encodeXid("xid-close-timeout"),
+                    "value".getBytes(StandardCharsets.UTF_8));
+            Future<StoreException> close =
+                    closeExecutor.submit(() -> Assertions.assertThrows(StoreException.class, engine::close));
+            Assertions.assertTrue(syncer.awaitFlushStarted(5, TimeUnit.SECONDS));
+
+            StoreException exception = close.get(1, TimeUnit.SECONDS);
+
+            Assertions.assertTrue(exception.getMessage().contains("50ms"));
+            Assertions.assertTrue(engine.isClosed());
+            Assertions.assertTrue(walExecutor.isShutdown());
+            Assertions.assertThrows(StoreException.class, () -> RocksDBStoreEngine.open(config));
+
+            syncer.releaseFlush();
+            waitUntil(() -> {
+                try {
+                    reopened.set(RocksDBStoreEngine.open(config));
+                    return true;
+                } catch (StoreException ignored) {
+                    return false;
+                }
+            });
+            Assertions.assertFalse(reopened.get().wasLastShutdownClean());
+        } finally {
+            syncer.releaseFlush();
+            closeExecutor.shutdownNow();
+            closeExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            if (reopened.get() != null) {
+                reopened.get().close();
+            }
+            if (!engine.isClosed()) {
+                engine.close();
+            }
+        }
+    }
+
+    @Test
     void testFactoryCanRecreateEngineAfterPreControllerCloseFailure() throws Exception {
         RocksDBStoreConfig config = config("pre-controller-close-failure-reopen", false);
         RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance(config);
@@ -1262,6 +1324,32 @@ class RocksDBStoreEngineTest {
         @Override
         public long latestSequenceNumber() {
             return sequence;
+        }
+    }
+
+    private static final class BlockingShutdownWalSyncer implements RocksDBWalSyncController.WalSyncer {
+        private final CountDownLatch flushStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseFlush = new CountDownLatch(1);
+        private long sequence;
+
+        @Override
+        public void flushWal(boolean sync) {
+            flushStarted.countDown();
+            awaitLatch(releaseFlush, "blocked shutdown WAL sync was not released");
+            sequence++;
+        }
+
+        @Override
+        public long latestSequenceNumber() {
+            return sequence;
+        }
+
+        private boolean awaitFlushStarted(long timeout, TimeUnit unit) throws InterruptedException {
+            return flushStarted.await(timeout, unit);
+        }
+
+        private void releaseFlush() {
+            releaseFlush.countDown();
         }
     }
 

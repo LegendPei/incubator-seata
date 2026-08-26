@@ -288,6 +288,12 @@ public interface ConfigurationKeys {
     String STORE_FILE_ROCKSDB_WAL_SYNC_ON_SHUTDOWN = STORE_FILE_ROCKSDB_PREFIX + "walSyncOnShutdown";
 
     /**
+     * The constant STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS.
+     */
+    String STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS =
+            STORE_FILE_ROCKSDB_PREFIX + "walSyncShutdownTimeoutMillis";
+
+    /**
      * The constant STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS.
      */
     String STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS = STORE_FILE_ROCKSDB_PREFIX + "walSyncWarnThresholdMillis";

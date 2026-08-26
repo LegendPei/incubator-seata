@@ -42,6 +42,7 @@ public class RocksDBStoreConfig {
     static final int DEFAULT_WAL_SYNC_INTERVAL_MILLIS = 2000;
     static final long DEFAULT_WAL_SYNC_WRITE_THRESHOLD = 10L;
     static final boolean DEFAULT_WAL_SYNC_ON_SHUTDOWN = true;
+    static final int DEFAULT_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS = 30000;
     static final int DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS = 1000;
 
     private final String dbPath;
@@ -72,6 +73,7 @@ public class RocksDBStoreConfig {
     private final int walSyncIntervalMillis;
     private final long walSyncWriteThreshold;
     private final boolean walSyncOnShutdown;
+    private final int walSyncShutdownTimeoutMillis;
     private final int walSyncWarnThresholdMillis;
 
     public RocksDBStoreConfig(String dbPath, boolean syncWrite) {
@@ -275,6 +277,7 @@ public class RocksDBStoreConfig {
                 walSyncIntervalMillis,
                 walSyncWriteThreshold,
                 walSyncOnShutdown,
+                DEFAULT_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS,
                 walSyncWarnThresholdMillis,
                 DEFAULT_LONG_OPTION,
                 DEFAULT_LONG_OPTION,
@@ -376,6 +379,70 @@ public class RocksDBStoreConfig {
             long indexWriteBufferSize,
             long metadataWriteBufferSize,
             long maxTotalWalSize) {
+        this(
+                dbPath,
+                syncWrite,
+                blockCacheSize,
+                writeBufferSize,
+                maxWriteBufferNumber,
+                minWriteBufferNumberToMerge,
+                maxBackgroundJobs,
+                maxOpenFiles,
+                targetFileSizeBase,
+                level0FileNumCompactionTrigger,
+                level0SlowdownWritesTrigger,
+                level0StopWritesTrigger,
+                enableStatistics,
+                optimizeFiltersForHits,
+                compressionType,
+                enableRangeDelete,
+                rangeDeleteCompactAfterDelete,
+                walSyncMode,
+                walSyncIntervalMillis,
+                walSyncWriteThreshold,
+                walSyncOnShutdown,
+                DEFAULT_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS,
+                walSyncWarnThresholdMillis,
+                dbWriteBufferSize,
+                globalWriteBufferSize,
+                branchWriteBufferSize,
+                lockWriteBufferSize,
+                indexWriteBufferSize,
+                metadataWriteBufferSize,
+                maxTotalWalSize);
+    }
+
+    public RocksDBStoreConfig(
+            String dbPath,
+            boolean syncWrite,
+            long blockCacheSize,
+            long writeBufferSize,
+            int maxWriteBufferNumber,
+            int minWriteBufferNumberToMerge,
+            int maxBackgroundJobs,
+            int maxOpenFiles,
+            long targetFileSizeBase,
+            int level0FileNumCompactionTrigger,
+            int level0SlowdownWritesTrigger,
+            int level0StopWritesTrigger,
+            boolean enableStatistics,
+            boolean optimizeFiltersForHits,
+            String compressionType,
+            boolean enableRangeDelete,
+            boolean rangeDeleteCompactAfterDelete,
+            RocksDBWalSyncMode walSyncMode,
+            int walSyncIntervalMillis,
+            long walSyncWriteThreshold,
+            boolean walSyncOnShutdown,
+            int walSyncShutdownTimeoutMillis,
+            int walSyncWarnThresholdMillis,
+            long dbWriteBufferSize,
+            long globalWriteBufferSize,
+            long branchWriteBufferSize,
+            long lockWriteBufferSize,
+            long indexWriteBufferSize,
+            long metadataWriteBufferSize,
+            long maxTotalWalSize) {
         this.dbPath = dbPath;
         this.syncWrite = syncWrite;
         this.blockCacheSize = nonNegative(blockCacheSize, ConfigurationKeys.STORE_FILE_ROCKSDB_BLOCK_CACHE_SIZE);
@@ -420,6 +487,8 @@ public class RocksDBStoreConfig {
         this.walSyncWriteThreshold =
                 positive(walSyncWriteThreshold, ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD);
         this.walSyncOnShutdown = walSyncOnShutdown;
+        this.walSyncShutdownTimeoutMillis = positive(
+                walSyncShutdownTimeoutMillis, ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS);
         this.walSyncWarnThresholdMillis = positive(
                 walSyncWarnThresholdMillis, ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS);
     }
@@ -470,6 +539,11 @@ public class RocksDBStoreConfig {
                         ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD),
                 config.getBoolean(
                         ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_ON_SHUTDOWN, DEFAULT_WAL_SYNC_ON_SHUTDOWN),
+                positive(
+                        config.getInt(
+                                ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS,
+                                DEFAULT_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS),
+                        ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS),
                 positive(
                         config.getInt(
                                 ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS,
@@ -599,6 +673,10 @@ public class RocksDBStoreConfig {
         return walSyncOnShutdown;
     }
 
+    public int getWalSyncShutdownTimeoutMillis() {
+        return walSyncShutdownTimeoutMillis;
+    }
+
     public int getWalSyncWarnThresholdMillis() {
         return walSyncWarnThresholdMillis;
     }
@@ -660,6 +738,8 @@ public class RocksDBStoreConfig {
                 + walSyncWriteThreshold
                 + ", walSyncOnShutdown="
                 + walSyncOnShutdown
+                + ", walSyncShutdownTimeoutMillis="
+                + walSyncShutdownTimeoutMillis
                 + ", walSyncWarnThresholdMillis="
                 + walSyncWarnThresholdMillis;
     }
@@ -698,6 +778,7 @@ public class RocksDBStoreConfig {
                 && walSyncIntervalMillis == that.walSyncIntervalMillis
                 && walSyncWriteThreshold == that.walSyncWriteThreshold
                 && walSyncOnShutdown == that.walSyncOnShutdown
+                && walSyncShutdownTimeoutMillis == that.walSyncShutdownTimeoutMillis
                 && walSyncWarnThresholdMillis == that.walSyncWarnThresholdMillis
                 && walSyncMode == that.walSyncMode
                 && Objects.equals(dbPath, that.dbPath)
@@ -735,6 +816,7 @@ public class RocksDBStoreConfig {
                 walSyncIntervalMillis,
                 walSyncWriteThreshold,
                 walSyncOnShutdown,
+                walSyncShutdownTimeoutMillis,
                 walSyncWarnThresholdMillis);
     }
 

@@ -221,6 +221,7 @@ seata:
         wal-sync-interval-millis: 2000
         wal-sync-write-threshold: 10
         wal-sync-on-shutdown: true
+        wal-sync-shutdown-timeout-millis: 30000
         wal-sync-warn-threshold-millis: 1000
         # background orphan lock cleanup: bounded rounds with persisted cursor instead of one full-pass stall.
         orphan-lock-clean-enabled: true

@@ -153,6 +153,98 @@ class RocksDBWalSyncControllerTest {
     }
 
     @Test
+    void testCloseReportsTimeoutWhenFinalWalSyncDoesNotReturn() throws Exception {
+        AtomicLong nowMillis = new AtomicLong(1000L);
+        AtomicLong nowNanos = new AtomicLong(10_000L);
+        FakeWalSyncer syncer = new FakeWalSyncer();
+        syncer.blockFlush();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
+        RocksDBWalSyncController controller = controller(syncer, executor, nowMillis, nowNanos, 1000L, 100L, true);
+        ExecutorService closeExecutor = Executors.newSingleThreadExecutor();
+
+        try {
+            controller.afterWrite();
+            Future<CloseResult> close = closeExecutor.submit(() -> {
+                Thread.currentThread().interrupt();
+                StoreException exception = Assertions.assertThrows(StoreException.class, controller::close);
+                return new CloseResult(exception, Thread.currentThread().isInterrupted());
+            });
+            Assertions.assertTrue(syncer.awaitFlushStarted(5, TimeUnit.SECONDS));
+
+            CloseResult result = close.get(1, TimeUnit.SECONDS);
+
+            Assertions.assertTrue(result.exception.getMessage().contains("50ms"));
+            Assertions.assertTrue(result.interrupted);
+        } finally {
+            syncer.releaseFlush();
+            closeExecutor.shutdownNow();
+            closeExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            controller.close();
+        }
+    }
+
+    @Test
+    void testConcurrentCloseCallersShareBoundedShutdownFailure() throws Exception {
+        AtomicLong nowMillis = new AtomicLong(1000L);
+        AtomicLong nowNanos = new AtomicLong(10_000L);
+        FakeWalSyncer syncer = new FakeWalSyncer();
+        syncer.blockFlush();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
+        RocksDBWalSyncController controller = new RocksDBWalSyncController(
+                RocksDBWalSyncMode.PERIODIC,
+                syncer,
+                1000L,
+                100L,
+                true,
+                1000L,
+                75L,
+                executor,
+                true,
+                nowMillis::get,
+                nowNanos::get);
+        ExecutorService closeExecutor = Executors.newFixedThreadPool(2);
+
+        try {
+            controller.afterWrite();
+            Future<StoreException> first =
+                    closeExecutor.submit(() -> Assertions.assertThrows(StoreException.class, controller::close));
+            Assertions.assertTrue(syncer.awaitFlushStarted(5, TimeUnit.SECONDS));
+            Future<StoreException> second =
+                    closeExecutor.submit(() -> Assertions.assertThrows(StoreException.class, controller::close));
+
+            Assertions.assertTrue(first.get(1, TimeUnit.SECONDS).getMessage().contains("75ms"));
+            Assertions.assertTrue(second.get(1, TimeUnit.SECONDS).getMessage().contains("75ms"));
+            Assertions.assertEquals(1, syncer.flushCount);
+        } finally {
+            syncer.releaseFlush();
+            closeExecutor.shutdownNow();
+            closeExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            controller.close();
+        }
+    }
+
+    @Test
+    void testPostShutdownActionNeverRunsOnRegisteringThread() throws Exception {
+        AtomicLong nowMillis = new AtomicLong(1000L);
+        AtomicLong nowNanos = new AtomicLong(10_000L);
+        FakeWalSyncer syncer = new FakeWalSyncer();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
+        RocksDBWalSyncController controller = controller(syncer, executor, nowMillis, nowNanos, 1000L, 100L, true);
+        AtomicReference<Thread> actionThread = new AtomicReference<>();
+        CountDownLatch actionCompleted = new CountDownLatch(1);
+
+        controller.close();
+        Thread registeringThread = Thread.currentThread();
+        controller.executeAfterShutdownAsync(() -> {
+            actionThread.set(Thread.currentThread());
+            actionCompleted.countDown();
+        });
+
+        Assertions.assertTrue(actionCompleted.await(5, TimeUnit.SECONDS));
+        Assertions.assertNotSame(registeringThread, actionThread.get());
+    }
+
+    @Test
     void testCloseWaitsForInFlightBackgroundSyncWhenFinalSyncIsDisabled() throws Exception {
         BlockingWalSyncer syncer = new BlockingWalSyncer();
         TrackingScheduledExecutor executor = new TrackingScheduledExecutor();
@@ -168,17 +260,12 @@ class RocksDBWalSyncControllerTest {
                 System::currentTimeMillis,
                 System::nanoTime);
         ExecutorService closeExecutor = Executors.newSingleThreadExecutor();
-        AtomicReference<Thread> closeThread = new AtomicReference<>();
 
         try {
             controller.afterWrite();
             Assertions.assertTrue(syncer.awaitSyncStarted(5, TimeUnit.SECONDS));
-            Future<?> close = closeExecutor.submit(() -> {
-                closeThread.set(Thread.currentThread());
-                controller.close();
-            });
+            Future<?> close = closeExecutor.submit(controller::close);
             Assertions.assertTrue(executor.awaitShutdownNow(5, TimeUnit.SECONDS));
-            waitUntil(() -> close.isDone() || closeThread.get().getState() == Thread.State.BLOCKED);
 
             Assertions.assertFalse(close.isDone());
             syncer.releaseSync();
@@ -190,6 +277,46 @@ class RocksDBWalSyncControllerTest {
             controller.close();
             closeExecutor.shutdownNow();
             closeExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void testShutdownSchedulingFailureDoesNotSkipInFlightSyncBarrier() throws Exception {
+        BlockingWalSyncer syncer = new BlockingWalSyncer();
+        TrackingScheduledExecutor executor = new TrackingScheduledExecutor();
+        StoreException shutdownFailure = new StoreException("shutdown scheduling failure");
+        executor.failShutdownNowWith(shutdownFailure);
+        RocksDBWalSyncController controller = new RocksDBWalSyncController(
+                RocksDBWalSyncMode.PERIODIC,
+                syncer,
+                25L,
+                1L,
+                false,
+                1000L,
+                executor,
+                true,
+                System::currentTimeMillis,
+                System::nanoTime);
+        ExecutorService closeExecutor = Executors.newSingleThreadExecutor();
+
+        try {
+            controller.afterWrite();
+            Assertions.assertTrue(syncer.awaitSyncStarted(5, TimeUnit.SECONDS));
+            Future<StoreException> close =
+                    closeExecutor.submit(() -> Assertions.assertThrows(StoreException.class, controller::close));
+            Assertions.assertTrue(executor.awaitShutdownNow(5, TimeUnit.SECONDS));
+
+            Assertions.assertFalse(close.isDone());
+            syncer.releaseSync();
+
+            Assertions.assertSame(shutdownFailure, close.get(5, TimeUnit.SECONDS));
+        } finally {
+            syncer.releaseSync();
+            closeExecutor.shutdownNow();
+            closeExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            executor.failShutdownNowWith(null);
             executor.shutdownNow();
             executor.awaitTermination(5, TimeUnit.SECONDS);
         }
@@ -254,36 +381,48 @@ class RocksDBWalSyncControllerTest {
                 writeThreshold,
                 syncOnShutdown,
                 1000L,
+                50L,
                 executor,
                 true,
                 nowMillis::get,
                 nowNanos::get);
     }
 
-    private void waitUntil(Condition condition) throws Exception {
-        long deadline = System.currentTimeMillis() + 3000L;
-        while (System.currentTimeMillis() < deadline) {
-            if (condition.evaluate()) {
-                return;
-            }
-            Thread.sleep(20L);
-        }
-        Assertions.fail("condition was not satisfied before timeout");
-    }
+    private static final class CloseResult {
+        private final StoreException exception;
+        private final boolean interrupted;
 
-    @FunctionalInterface
-    private interface Condition {
-        boolean evaluate();
+        private CloseResult(StoreException exception, boolean interrupted) {
+            this.exception = exception;
+            this.interrupted = interrupted;
+        }
     }
 
     private static final class FakeWalSyncer implements RocksDBWalSyncController.WalSyncer {
         private int flushCount;
         private long sequence;
         private boolean fail;
+        private CountDownLatch flushStarted;
+        private CountDownLatch releaseFlush;
 
         @Override
         public void flushWal(boolean sync) throws Exception {
             flushCount++;
+            if (flushStarted != null) {
+                flushStarted.countDown();
+                boolean interrupted = false;
+                while (true) {
+                    try {
+                        releaseFlush.await();
+                        break;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             if (fail) {
                 throw new Exception("boom");
             }
@@ -293,6 +432,21 @@ class RocksDBWalSyncControllerTest {
         @Override
         public long latestSequenceNumber() {
             return sequence;
+        }
+
+        private void blockFlush() {
+            flushStarted = new CountDownLatch(1);
+            releaseFlush = new CountDownLatch(1);
+        }
+
+        private boolean awaitFlushStarted(long timeout, TimeUnit unit) throws InterruptedException {
+            return flushStarted.await(timeout, unit);
+        }
+
+        private void releaseFlush() {
+            if (releaseFlush != null) {
+                releaseFlush.countDown();
+            }
         }
     }
 
@@ -335,6 +489,7 @@ class RocksDBWalSyncControllerTest {
 
     private static final class TrackingScheduledExecutor extends ScheduledThreadPoolExecutor {
         private final CountDownLatch shutdownNowCalled = new CountDownLatch(1);
+        private RuntimeException shutdownNowFailure;
 
         private TrackingScheduledExecutor() {
             super(1);
@@ -343,11 +498,19 @@ class RocksDBWalSyncControllerTest {
         @Override
         public List<Runnable> shutdownNow() {
             shutdownNowCalled.countDown();
-            return super.shutdownNow();
+            List<Runnable> queuedTasks = super.shutdownNow();
+            if (shutdownNowFailure != null) {
+                throw shutdownNowFailure;
+            }
+            return queuedTasks;
         }
 
         private boolean awaitShutdownNow(long timeout, TimeUnit unit) throws InterruptedException {
             return shutdownNowCalled.await(timeout, unit);
+        }
+
+        private void failShutdownNowWith(RuntimeException failure) {
+            shutdownNowFailure = failure;
         }
     }
 

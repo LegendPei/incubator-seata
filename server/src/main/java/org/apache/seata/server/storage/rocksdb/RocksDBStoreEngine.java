@@ -901,6 +901,7 @@ public class RocksDBStoreEngine implements AutoCloseable {
             closed = true;
             RocksDBStoreMetrics.unregister(this);
             RuntimeException syncFailure = null;
+            boolean shutdownTimedOut = false;
             try {
                 markCleanShutdown(true);
                 walSyncController.afterWrite();
@@ -910,11 +911,16 @@ public class RocksDBStoreEngine implements AutoCloseable {
             try {
                 walSyncController.close();
             } catch (RuntimeException e) {
+                shutdownTimedOut = e instanceof RocksDBWalSyncController.ShutdownTimeoutException;
                 if (syncFailure == null) {
                     syncFailure = e;
                 } else if (syncFailure != e) {
                     syncFailure.addSuppressed(e);
                 }
+            }
+            if (shutdownTimedOut) {
+                walSyncController.executeAfterShutdownAsync(this::cleanupAfterWalShutdownTimeout);
+                throw syncFailure;
             }
             if (syncFailure != null) {
                 try {
@@ -947,6 +953,27 @@ public class RocksDBStoreEngine implements AutoCloseable {
             }
         } finally {
             maintenanceLock.writeLock().unlock();
+        }
+    }
+
+    private void cleanupAfterWalShutdownTimeout() {
+        try {
+            markDirtyShutdownDurably(db, handle(RocksDBColumnFamily.METADATA), writeOptions);
+        } catch (Exception markerFailure) {
+            LOGGER.error("mark RocksDB shutdown dirty after WAL timeout failed", markerFailure);
+        }
+        try {
+            closeQuietly(
+                    new ArrayList<>(handles.values()),
+                    db,
+                    writeOptions,
+                    readOptions,
+                    columnFamilyOptions,
+                    dbOptions,
+                    blockCache,
+                    statistics);
+        } catch (RuntimeException closeFailure) {
+            LOGGER.error("close RocksDB resources after WAL timeout failed", closeFailure);
         }
     }
 

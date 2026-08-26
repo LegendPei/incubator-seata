@@ -69,6 +69,8 @@ class RocksDBStoreConfigTest {
         Assertions.assertEquals(RocksDBStoreConfig.DEFAULT_WAL_SYNC_WRITE_THRESHOLD, config.getWalSyncWriteThreshold());
         Assertions.assertTrue(config.isWalSyncOnShutdown());
         Assertions.assertEquals(
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS, config.getWalSyncShutdownTimeoutMillis());
+        Assertions.assertEquals(
                 RocksDBStoreConfig.DEFAULT_WAL_SYNC_WARN_THRESHOLD_MILLIS, config.getWalSyncWarnThresholdMillis());
         Assertions.assertFalse(config.isPeriodicWalSyncEnabled());
     }
@@ -105,6 +107,7 @@ class RocksDBStoreConfigTest {
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_INTERVAL_MILLIS, "500");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WRITE_THRESHOLD, "5000");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_ON_SHUTDOWN, "false");
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS, "750");
         values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_WARN_THRESHOLD_MILLIS, "200");
 
         RocksDBStoreConfig config = RocksDBStoreConfig.fromConfiguration(configuration(values), false);
@@ -137,6 +140,7 @@ class RocksDBStoreConfigTest {
         Assertions.assertEquals(500, config.getWalSyncIntervalMillis());
         Assertions.assertEquals(5000L, config.getWalSyncWriteThreshold());
         Assertions.assertFalse(config.isWalSyncOnShutdown());
+        Assertions.assertEquals(750, config.getWalSyncShutdownTimeoutMillis());
         Assertions.assertEquals(200, config.getWalSyncWarnThresholdMillis());
         Assertions.assertTrue(config.isPeriodicWalSyncEnabled());
     }
@@ -216,6 +220,18 @@ class RocksDBStoreConfigTest {
 
         Assertions.assertThrows(
                 StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+    }
+
+    @Test
+    void testRejectsNonPositiveWalSyncShutdownTimeout() {
+        Map<String, String> values = new HashMap<>();
+        values.put(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS, "0");
+
+        StoreException exception = Assertions.assertThrows(
+                StoreException.class, () -> RocksDBStoreConfig.fromConfiguration(configuration(values), false));
+
+        Assertions.assertTrue(
+                exception.getMessage().contains(ConfigurationKeys.STORE_FILE_ROCKSDB_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS));
     }
 
     private Configuration configuration(Map<String, String> values) {

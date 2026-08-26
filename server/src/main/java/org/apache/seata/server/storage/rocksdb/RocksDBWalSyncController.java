@@ -17,15 +17,19 @@
 package org.apache.seata.server.storage.rocksdb;
 
 import org.apache.seata.common.exception.StoreException;
+import org.apache.seata.common.thread.NamedThreadFactory;
 import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -43,6 +47,10 @@ final class RocksDBWalSyncController implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBWalSyncController.class);
     private static final RocksDBWalSyncController DISABLED = new RocksDBWalSyncController();
+    private static final ThreadFactory WAL_SYNC_THREAD_FACTORY = new NamedThreadFactory("rocksdb-wal-sync", true);
+    private static final ThreadFactory WAL_SHUTDOWN_THREAD_FACTORY =
+            new NamedThreadFactory("rocksdb-wal-shutdown", true);
+    private static final ThreadFactory WAL_CLEANUP_THREAD_FACTORY = new NamedThreadFactory("rocksdb-wal-cleanup", true);
 
     private final RocksDBWalSyncMode mode;
     private final WalSyncer syncer;
@@ -50,6 +58,7 @@ final class RocksDBWalSyncController implements AutoCloseable {
     private final long writeThreshold;
     private final boolean syncOnShutdown;
     private final long warnThresholdMillis;
+    private final long shutdownTimeoutMillis;
     private final ScheduledExecutorService executor;
     private final boolean shutdownExecutor;
     private final LongSupplier currentTimeMillis;
@@ -69,6 +78,8 @@ final class RocksDBWalSyncController implements AutoCloseable {
     private final AtomicLong lastSyncedSequenceNumber = new AtomicLong();
     private final AtomicBoolean syncScheduled = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean shutdownStarted = new AtomicBoolean();
+    private final CompletableFuture<Void> shutdownCompletion = new CompletableFuture<>();
 
     private volatile String lastSyncError;
 
@@ -79,10 +90,13 @@ final class RocksDBWalSyncController implements AutoCloseable {
         this.writeThreshold = 0L;
         this.syncOnShutdown = false;
         this.warnThresholdMillis = 0L;
+        this.shutdownTimeoutMillis = 0L;
         this.executor = null;
         this.shutdownExecutor = false;
         this.currentTimeMillis = System::currentTimeMillis;
         this.nanoTime = System::nanoTime;
+        this.shutdownStarted.set(true);
+        this.shutdownCompletion.complete(null);
     }
 
     RocksDBWalSyncController(
@@ -96,12 +110,39 @@ final class RocksDBWalSyncController implements AutoCloseable {
             boolean shutdownExecutor,
             LongSupplier currentTimeMillis,
             LongSupplier nanoTime) {
+        this(
+                mode,
+                syncer,
+                intervalMillis,
+                writeThreshold,
+                syncOnShutdown,
+                warnThresholdMillis,
+                RocksDBStoreConfig.DEFAULT_WAL_SYNC_SHUTDOWN_TIMEOUT_MILLIS,
+                executor,
+                shutdownExecutor,
+                currentTimeMillis,
+                nanoTime);
+    }
+
+    RocksDBWalSyncController(
+            RocksDBWalSyncMode mode,
+            WalSyncer syncer,
+            long intervalMillis,
+            long writeThreshold,
+            boolean syncOnShutdown,
+            long warnThresholdMillis,
+            long shutdownTimeoutMillis,
+            ScheduledExecutorService executor,
+            boolean shutdownExecutor,
+            LongSupplier currentTimeMillis,
+            LongSupplier nanoTime) {
         this.mode = mode == null ? RocksDBWalSyncMode.NONE : mode;
         this.syncer = syncer;
         this.intervalMillis = intervalMillis;
         this.writeThreshold = writeThreshold;
         this.syncOnShutdown = syncOnShutdown;
         this.warnThresholdMillis = warnThresholdMillis;
+        this.shutdownTimeoutMillis = shutdownTimeoutMillis;
         this.executor = executor;
         this.shutdownExecutor = shutdownExecutor;
         this.currentTimeMillis = currentTimeMillis == null ? System::currentTimeMillis : currentTimeMillis;
@@ -125,7 +166,7 @@ final class RocksDBWalSyncController implements AutoCloseable {
             return disabled();
         }
         WalSyncer syncer = new RocksDBWalSyncer(db);
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(new WalSyncThreadFactory());
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(WAL_SYNC_THREAD_FACTORY);
         return new RocksDBWalSyncController(
                 config.getWalSyncMode(),
                 syncer,
@@ -133,6 +174,7 @@ final class RocksDBWalSyncController implements AutoCloseable {
                 config.getWalSyncWriteThreshold(),
                 config.isWalSyncOnShutdown(),
                 config.getWalSyncWarnThresholdMillis(),
+                config.getWalSyncShutdownTimeoutMillis(),
                 executor,
                 true,
                 System::currentTimeMillis,
@@ -308,28 +350,103 @@ final class RocksDBWalSyncController implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!isPeriodic() || !closed.compareAndSet(false, true)) {
+        if (!isPeriodic()) {
             return;
         }
-        if (shutdownExecutor) {
-            executor.shutdownNow();
+        startShutdown();
+        awaitShutdownCompletion();
+    }
+
+    void executeAfterShutdownAsync(Runnable action) {
+        if (!isPeriodic()) {
+            startCleanupThread(action);
+            return;
         }
-        RuntimeException syncFailure = null;
+        startShutdown();
+        shutdownCompletion.whenComplete((ignored, failure) -> startCleanupThread(action));
+    }
+
+    private void startCleanupThread(Runnable action) {
+        Thread cleanupThread = WAL_CLEANUP_THREAD_FACTORY.newThread(() -> {
+            try {
+                action.run();
+            } catch (Throwable cleanupFailure) {
+                LOGGER.error("RocksDB cleanup after WAL shutdown failed", cleanupFailure);
+            }
+        });
+        cleanupThread.start();
+    }
+
+    private void startShutdown() {
+        if (!shutdownStarted.compareAndSet(false, true)) {
+            return;
+        }
+        closed.set(true);
+        Thread shutdownThread = WAL_SHUTDOWN_THREAD_FACTORY.newThread(this::runShutdown);
+        shutdownThread.start();
+    }
+
+    private void runShutdown() {
+        Throwable shutdownFailure = null;
+        if (shutdownExecutor) {
+            try {
+                executor.shutdownNow();
+            } catch (Throwable failure) {
+                shutdownFailure = failure;
+            }
+        }
         try {
             if (syncOnShutdown) {
                 syncIfNeeded("shutdown", true);
             } else {
                 awaitInFlightSync();
             }
-        } catch (RuntimeException e) {
-            syncFailure = e;
-        } finally {
-            if (shutdownExecutor) {
-                awaitExecutorTermination();
+        } catch (Throwable failure) {
+            if (shutdownFailure == null) {
+                shutdownFailure = failure;
+            } else if (shutdownFailure != failure) {
+                shutdownFailure.addSuppressed(failure);
             }
         }
-        if (syncFailure != null) {
-            throw syncFailure;
+        if (shutdownFailure == null) {
+            shutdownCompletion.complete(null);
+        } else {
+            shutdownCompletion.completeExceptionally(shutdownFailure);
+        }
+    }
+
+    private void awaitShutdownCompletion() {
+        boolean interrupted = Thread.interrupted();
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis);
+        long deadline = System.nanoTime() + timeoutNanos;
+        try {
+            while (true) {
+                long remainingNanos = deadline - System.nanoTime();
+                if (remainingNanos <= 0L) {
+                    throw new ShutdownTimeoutException(shutdownTimeoutMillis);
+                }
+                try {
+                    shutdownCompletion.get(remainingNanos, TimeUnit.NANOSECONDS);
+                    return;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                } catch (TimeoutException e) {
+                    throw new ShutdownTimeoutException(shutdownTimeoutMillis);
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof RuntimeException) {
+                        throw (RuntimeException) cause;
+                    }
+                    if (cause instanceof Error) {
+                        throw (Error) cause;
+                    }
+                    throw new StoreException(cause, "RocksDB WAL shutdown failed");
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -337,18 +454,9 @@ final class RocksDBWalSyncController implements AutoCloseable {
         // Acquiring the sync monitor is the shutdown barrier for an active native flushWal call.
     }
 
-    private void awaitExecutorTermination() {
-        boolean interrupted = false;
-        while (!executor.isTerminated()) {
-            try {
-                executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-            } catch (InterruptedException e) {
-                interrupted = true;
-                executor.shutdownNow();
-            }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
+    static final class ShutdownTimeoutException extends StoreException {
+        private ShutdownTimeoutException(long timeoutMillis) {
+            super("RocksDB WAL shutdown did not complete within " + timeoutMillis + "ms");
         }
     }
 
@@ -367,17 +475,6 @@ final class RocksDBWalSyncController implements AutoCloseable {
         @Override
         public long latestSequenceNumber() {
             return db.getLatestSequenceNumber();
-        }
-    }
-
-    private static final class WalSyncThreadFactory implements ThreadFactory {
-        private final AtomicLong counter = new AtomicLong();
-
-        @Override
-        public Thread newThread(Runnable task) {
-            Thread thread = new Thread(task, "rocksdb-wal-sync-" + counter.incrementAndGet());
-            thread.setDaemon(true);
-            return thread;
         }
     }
 }

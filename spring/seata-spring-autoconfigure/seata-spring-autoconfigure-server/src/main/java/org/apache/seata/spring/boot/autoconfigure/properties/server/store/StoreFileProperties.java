@@ -130,6 +130,7 @@ public class StoreFileProperties {
         private Integer walSyncIntervalMillis = 2000;
         private Long walSyncWriteThreshold = 10L;
         private Boolean walSyncOnShutdown = true;
+        private Integer walSyncShutdownTimeoutMillis = 30000;
         private Integer walSyncWarnThresholdMillis = 1000;
         private Boolean orphanLockCleanEnabled = true;
         private Long orphanLockCleanIntervalMillis = 60000L;
@@ -404,6 +405,15 @@ public class StoreFileProperties {
 
         public RocksDB setWalSyncOnShutdown(Boolean walSyncOnShutdown) {
             this.walSyncOnShutdown = walSyncOnShutdown;
+            return this;
+        }
+
+        public Integer getWalSyncShutdownTimeoutMillis() {
+            return walSyncShutdownTimeoutMillis;
+        }
+
+        public RocksDB setWalSyncShutdownTimeoutMillis(Integer walSyncShutdownTimeoutMillis) {
+            this.walSyncShutdownTimeoutMillis = walSyncShutdownTimeoutMillis;
             return this;
         }
 
