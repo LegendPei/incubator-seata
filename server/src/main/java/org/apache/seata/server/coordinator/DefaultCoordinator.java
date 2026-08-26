@@ -482,8 +482,8 @@ public class DefaultCoordinator extends AbstractTCInboundHandler implements Tran
         if (!(rootSessionManager instanceof RocksDBSessionManager)) {
             return false;
         }
-        sessionCondition.setLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
-        sessionCondition.setScanLimit(SESSION_BACKGROUND_TASK_QUERY_LIMIT);
+        sessionCondition.setLimit(backgroundSessionQueryLimit);
+        sessionCondition.setScanLimit(backgroundSessionQueryLimit);
         sessionCondition.setMaxTimeoutDeadlineMillis(timeoutDeadlineUpperBound());
         byte[] cursor = timeoutCheckCursor;
         if (cursor != null) {

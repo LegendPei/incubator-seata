@@ -381,6 +381,28 @@ public class DefaultCoordinatorTest extends BaseSpringBootTest {
     }
 
     @Test
+    public void timeoutCheckUsesCoordinatorInstanceQueryLimitForRocksDBSessionManager() throws Exception {
+        DefaultCoordinator coordinator = new DefaultCoordinator(remotingServer, 7);
+        RocksDBSessionManager sessionManager = mock(RocksDBSessionManager.class);
+        List<SessionCondition> conditions = new ArrayList<>();
+        when(sessionManager.findGlobalSessions(any(SessionCondition.class))).thenAnswer(invocation -> {
+            conditions.add(invocation.getArgument(0));
+            return Collections.emptyList();
+        });
+
+        try (MockedStatic<SessionHolder> sessionHolderMock = Mockito.mockStatic(SessionHolder.class)) {
+            sessionHolderMock.when(SessionHolder::getRootSessionManager).thenReturn(sessionManager);
+            coordinator.timeoutCheck();
+        } finally {
+            shutdownCoordinatorExecutors(coordinator);
+        }
+
+        Assertions.assertEquals(1, conditions.size());
+        Assertions.assertEquals(7, conditions.get(0).getLimit());
+        Assertions.assertEquals(7, conditions.get(0).getScanLimit());
+    }
+
+    @Test
     public void timeoutCheckKeepsFullScanForGenericSessionManager() {
         SessionManager sessionManager = mock(SessionManager.class);
         List<SessionCondition> conditions = new ArrayList<>();

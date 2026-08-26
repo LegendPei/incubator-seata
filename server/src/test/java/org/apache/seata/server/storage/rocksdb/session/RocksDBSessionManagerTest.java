@@ -29,11 +29,13 @@ import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.session.BranchSession;
 import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.session.SessionCondition;
+import org.apache.seata.server.session.SessionScanStats;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.lock.RocksDBLockManager;
+import org.apache.seata.server.store.TransactionStoreManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,6 +49,8 @@ import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -315,6 +319,373 @@ class RocksDBSessionManagerTest {
     }
 
     @Test
+    void testUnboundedQueriesConsumeContinuationsAndBoundedQueriesExposeThem() throws Exception {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "1");
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("query-continuations")) {
+            RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine);
+            Set<String> beginXids = new HashSet<>();
+            Set<String> allXids = new HashSet<>();
+            for (int i = 0; i < 300; i++) {
+                GlobalSession begin = globalSession("tx-continuation-begin-" + i, GlobalStatus.Begin);
+                begin.setBeginTime(i + 1L);
+                begin.setTimeout(1);
+                sessionManager.addGlobalSession(begin);
+                beginXids.add(begin.getXid());
+                allXids.add(begin.getXid());
+
+                GlobalSession committing = globalSession("tx-continuation-committing-" + i, GlobalStatus.Committing);
+                committing.setBeginTime(1_000L + i);
+                sessionManager.addGlobalSession(committing);
+                allXids.add(committing.getXid());
+            }
+
+            assertEveryXidExactlyOnce(
+                    sessionManager.findGlobalSessions(new SessionCondition(GlobalStatus.Begin)), beginXids);
+            assertEveryXidExactlyOnce(
+                    sessionManager.findGlobalSessions(
+                            new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing)),
+                    allXids);
+            assertEveryXidExactlyOnce(sessionManager.allSessions(), allXids);
+
+            SessionCondition timeoutCondition = new SessionCondition(GlobalStatus.Begin);
+            timeoutCondition.setMaxTimeoutDeadlineMillis(System.currentTimeMillis());
+            assertEveryXidExactlyOnce(sessionManager.findGlobalSessions(timeoutCondition), beginXids);
+
+            SessionCondition boundedStatus = new SessionCondition(GlobalStatus.Begin);
+            boundedStatus.setLimit(1);
+            Assertions.assertEquals(
+                    1, sessionManager.findGlobalSessions(boundedStatus).size());
+            Assertions.assertEquals(
+                    SessionCondition.ScanContinuation.RESUMABLE, boundedStatus.getStatusScanContinuation());
+            Assertions.assertNotNull(boundedStatus.getNextStatusScanCursor());
+
+            SessionCondition boundedMultiStatus = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            boundedMultiStatus.setScanLimit(1);
+            Assertions.assertEquals(
+                    1, sessionManager.findGlobalSessions(boundedMultiStatus).size());
+            Assertions.assertFalse(boundedMultiStatus.getNextStatusScanCursors().isEmpty());
+
+            SessionCondition boundedTimeout = new SessionCondition(GlobalStatus.Begin);
+            boundedTimeout.setLimit(1);
+            boundedTimeout.setMaxTimeoutDeadlineMillis(System.currentTimeMillis());
+            Assertions.assertEquals(
+                    1, sessionManager.findGlobalSessions(boundedTimeout).size());
+            Assertions.assertEquals(
+                    SessionCondition.ScanContinuation.RESUMABLE, boundedTimeout.getTimeoutScanContinuation());
+            Assertions.assertNotNull(boundedTimeout.getNextTimeoutScanCursor());
+        }
+    }
+
+    @Test
+    void testResumableMultiStatusPageWithEmptyCursorsIsProtocolViolation() {
+        try (RocksDBStoreEngine engine = open("scripted-empty-multi-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                publishMultiStatusContinuation(
+                        condition, Collections.emptyMap(), SessionCondition.ScanContinuation.RESUMABLE);
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("multi-status scan continuation did not advance", exception.getMessage());
+            Mockito.verify(storeManager).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testResumableMultiStatusPageCannotClearExistingCursors() {
+        try (RocksDBStoreEngine engine = open("scripted-cleared-multi-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            Map<GlobalStatus, byte[]> callerCursors = new EnumMap<>(GlobalStatus.class);
+            callerCursors.put(GlobalStatus.Begin, new byte[] {1});
+            condition.setStatusScanCursors(callerCursors);
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                publishMultiStatusContinuation(
+                        condition, Collections.emptyMap(), SessionCondition.ScanContinuation.RESUMABLE);
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("multi-status scan continuation did not advance", exception.getMessage());
+            assertStatusCursorsEqual(callerCursors, condition.getStatusScanCursors());
+            Mockito.verify(storeManager).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testResumableMultiStatusPageCannotRemoveExistingStatusCursor() {
+        try (RocksDBStoreEngine engine = open("scripted-removed-status-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            Map<GlobalStatus, byte[]> callerCursors = new EnumMap<>(GlobalStatus.class);
+            callerCursors.put(GlobalStatus.Begin, new byte[] {2});
+            callerCursors.put(GlobalStatus.Committing, new byte[] {3});
+            condition.setStatusScanCursors(callerCursors);
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
+                nextCursors.put(GlobalStatus.Begin, new byte[] {4});
+                publishMultiStatusContinuation(condition, nextCursors, SessionCondition.ScanContinuation.RESUMABLE);
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("multi-status scan continuation did not advance", exception.getMessage());
+            assertStatusCursorsEqual(callerCursors, condition.getStatusScanCursors());
+            Mockito.verify(storeManager).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testResumableMultiStatusCursorCannotRegressAfterUnsignedProgress() {
+        try (RocksDBStoreEngine engine = open("scripted-regressed-multi-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            Map<GlobalStatus, byte[]> callerCursors = new EnumMap<>(GlobalStatus.class);
+            callerCursors.put(GlobalStatus.Begin, new byte[] {0x7f});
+            condition.setStatusScanCursors(callerCursors);
+            GlobalSession duplicate = globalSession("tx-scripted-regressed-cursor", GlobalStatus.Begin);
+            AtomicInteger pages = new AtomicInteger();
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
+                int page = pages.getAndIncrement();
+                if (page == 0) {
+                    nextCursors.put(GlobalStatus.Begin, new byte[] {(byte) 0x80});
+                    publishMultiStatusContinuation(condition, nextCursors, SessionCondition.ScanContinuation.RESUMABLE);
+                } else if (page == 1) {
+                    nextCursors.put(GlobalStatus.Begin, new byte[] {0x7f});
+                    publishMultiStatusContinuation(condition, nextCursors, SessionCondition.ScanContinuation.RESUMABLE);
+                } else {
+                    publishMultiStatusContinuation(
+                            condition, Collections.emptyMap(), SessionCondition.ScanContinuation.EXHAUSTED);
+                }
+                return Collections.singletonList(duplicate);
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("multi-status scan continuation did not advance", exception.getMessage());
+            assertStatusCursorsEqual(callerCursors, condition.getStatusScanCursors());
+            Mockito.verify(storeManager, Mockito.times(2)).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testClonedEqualStatusCursorFailsImmediatelyAndRestoresCallerCursor() {
+        try (RocksDBStoreEngine engine = open("scripted-stalled-status-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            byte[] callerCursor = new byte[] {1};
+            condition.setStatusScanCursor(callerCursor);
+            AtomicInteger pages = new AtomicInteger();
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                if (pages.getAndIncrement() == 0) {
+                    condition.setNextStatusScanCursor(new byte[] {2});
+                } else {
+                    condition.setNextStatusScanCursor(
+                            Arrays.copyOf(condition.getStatusScanCursor(), condition.getStatusScanCursor().length));
+                }
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("status scan continuation did not advance", exception.getMessage());
+            Assertions.assertArrayEquals(callerCursor, condition.getStatusScanCursor());
+            Mockito.verify(storeManager, Mockito.times(2)).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testClonedEqualMultiStatusCursorMapFailsImmediately() {
+        try (RocksDBStoreEngine engine = open("scripted-stalled-multi-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            Map<GlobalStatus, byte[]> callerCursors = new EnumMap<>(GlobalStatus.class);
+            callerCursors.put(GlobalStatus.Begin, new byte[] {3});
+            callerCursors.put(GlobalStatus.Committing, new byte[] {4});
+            condition.setStatusScanCursors(callerCursors);
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                Map<GlobalStatus, byte[]> clonedCursors = new EnumMap<>(GlobalStatus.class);
+                clonedCursors.put(GlobalStatus.Begin, new byte[] {3});
+                clonedCursors.put(GlobalStatus.Committing, new byte[] {4});
+                publishMultiStatusContinuation(condition, clonedCursors, SessionCondition.ScanContinuation.RESUMABLE);
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("multi-status scan continuation did not advance", exception.getMessage());
+            assertStatusCursorsEqual(callerCursors, condition.getStatusScanCursors());
+            Mockito.verify(storeManager).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testClonedEqualTimeoutCursorFailsImmediately() {
+        try (RocksDBStoreEngine engine = open("scripted-stalled-timeout-continuation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setMaxTimeoutDeadlineMillis(1_000L);
+            byte[] callerCursor = new byte[] {5};
+            condition.setTimeoutScanCursor(callerCursor);
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                condition.setNextTimeoutScanCursor(
+                        Arrays.copyOf(condition.getTimeoutScanCursor(), condition.getTimeoutScanCursor().length));
+                return Collections.emptyList();
+            });
+
+            IllegalStateException exception = Assertions.assertThrows(
+                    IllegalStateException.class, () -> sessionManager.findGlobalSessions(condition));
+
+            Assertions.assertEquals("timeout scan continuation did not advance", exception.getMessage());
+            Assertions.assertArrayEquals(callerCursor, condition.getTimeoutScanCursor());
+            Mockito.verify(storeManager).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testStatusPagesDeduplicateAndAggregateStatsAndRestoreCallerCursor() {
+        try (RocksDBStoreEngine engine = open("scripted-status-page-aggregation")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            byte[] callerCursor = new byte[] {6};
+            condition.setStatusScanCursor(callerCursor);
+            GlobalSession first = globalSession("tx-scripted-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("tx-scripted-second", GlobalStatus.Begin);
+            AtomicInteger pages = new AtomicInteger();
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                if (pages.getAndIncrement() == 0) {
+                    condition.setNextStatusScanCursor(new byte[] {7});
+                    condition.setScanStats(new SessionScanStats(1, 2, 3, 1, 4, false));
+                    return Collections.singletonList(first);
+                }
+                condition.setNextStatusScanCursor(null);
+                condition.setScanStats(new SessionScanStats(10, 20, 30, 2, 40, true));
+                return Arrays.asList(first, second);
+            });
+
+            List<GlobalSession> actual = sessionManager.findGlobalSessions(condition);
+
+            Assertions.assertEquals(
+                    Arrays.asList(first.getXid(), second.getXid()),
+                    actual.stream().map(GlobalSession::getXid).collect(Collectors.toList()));
+            Assertions.assertArrayEquals(callerCursor, condition.getStatusScanCursor());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.EXHAUSTED, condition.getStatusScanContinuation());
+            assertScanStats(condition.getScanStats(), 11, 22, 33, 2, 44, true);
+            Mockito.verify(storeManager, Mockito.times(2)).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testMultiStatusPagesRestoreCallerCursorsAfterExhaustion() {
+        try (RocksDBStoreEngine engine = open("scripted-multi-cursor-restoration")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            Map<GlobalStatus, byte[]> callerCursors = new EnumMap<>(GlobalStatus.class);
+            callerCursors.put(GlobalStatus.Begin, new byte[] {8});
+            callerCursors.put(GlobalStatus.Committing, new byte[] {9});
+            condition.setStatusScanCursors(callerCursors);
+            GlobalSession first = globalSession("tx-scripted-multi-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("tx-scripted-multi-second", GlobalStatus.Committing);
+            AtomicInteger pages = new AtomicInteger();
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                if (pages.getAndIncrement() == 0) {
+                    Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
+                    nextCursors.put(GlobalStatus.Begin, new byte[] {10});
+                    nextCursors.put(GlobalStatus.Committing, new byte[] {11});
+                    publishMultiStatusContinuation(condition, nextCursors, SessionCondition.ScanContinuation.RESUMABLE);
+                    return Collections.singletonList(first);
+                }
+                publishMultiStatusContinuation(
+                        condition, Collections.emptyMap(), SessionCondition.ScanContinuation.EXHAUSTED);
+                return Collections.singletonList(second);
+            });
+
+            List<GlobalSession> actual = sessionManager.findGlobalSessions(condition);
+
+            Assertions.assertEquals(Arrays.asList(first, second), actual);
+            assertStatusCursorsEqual(callerCursors, condition.getStatusScanCursors());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.EXHAUSTED, condition.getStatusScanContinuation());
+            Mockito.verify(storeManager, Mockito.times(2)).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testTimeoutPagesRestoreCallerCursorAfterExhaustion() {
+        try (RocksDBStoreEngine engine = open("scripted-timeout-cursor-restoration")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin);
+            condition.setMaxTimeoutDeadlineMillis(1_000L);
+            byte[] callerCursor = new byte[] {12};
+            condition.setTimeoutScanCursor(callerCursor);
+            GlobalSession first = globalSession("tx-scripted-timeout-first", GlobalStatus.Begin);
+            GlobalSession second = globalSession("tx-scripted-timeout-second", GlobalStatus.Begin);
+            AtomicInteger pages = new AtomicInteger();
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                if (pages.getAndIncrement() == 0) {
+                    condition.setNextTimeoutScanCursor(new byte[] {13});
+                    return Collections.singletonList(first);
+                }
+                condition.setNextTimeoutScanCursor(null);
+                return Collections.singletonList(second);
+            });
+
+            List<GlobalSession> actual = sessionManager.findGlobalSessions(condition);
+
+            Assertions.assertEquals(Arrays.asList(first, second), actual);
+            Assertions.assertArrayEquals(callerCursor, condition.getTimeoutScanCursor());
+            Assertions.assertEquals(
+                    SessionCondition.ScanContinuation.EXHAUSTED, condition.getTimeoutScanContinuation());
+            Mockito.verify(storeManager, Mockito.times(2)).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
+    void testBoundedMultiStatusQueryCallsStoreOnceAndExposesContinuation() {
+        try (RocksDBStoreEngine engine = open("scripted-bounded-multi-query")) {
+            TransactionStoreManager storeManager = Mockito.mock(TransactionStoreManager.class);
+            RocksDBSessionManager sessionManager = scriptedManager(engine, storeManager);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Begin, GlobalStatus.Committing);
+            condition.setScanLimit(1);
+            GlobalSession first = globalSession("tx-scripted-bounded", GlobalStatus.Begin);
+            Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
+            nextCursors.put(GlobalStatus.Begin, new byte[] {14});
+            Mockito.when(storeManager.readSession(Mockito.same(condition))).thenAnswer(invocation -> {
+                publishMultiStatusContinuation(condition, nextCursors, SessionCondition.ScanContinuation.RESUMABLE);
+                return Collections.singletonList(first);
+            });
+
+            Assertions.assertEquals(Collections.singletonList(first), sessionManager.findGlobalSessions(condition));
+            Assertions.assertEquals(SessionCondition.ScanContinuation.RESUMABLE, condition.getStatusScanContinuation());
+            assertStatusCursorsEqual(nextCursors, condition.getNextStatusScanCursors());
+            Mockito.verify(storeManager).readSession(Mockito.same(condition));
+        }
+    }
+
+    @Test
     void testLockAndExecute() throws Exception {
         try (RocksDBStoreEngine engine = open("lock")) {
             RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine);
@@ -408,6 +779,40 @@ class RocksDBSessionManagerTest {
                 new RocksDBStoreConfig(tempDir.resolve(name).toString(), true));
     }
 
+    private RocksDBSessionManager scriptedManager(RocksDBStoreEngine engine, TransactionStoreManager storeManager) {
+        RocksDBSessionManager sessionManager = new RocksDBSessionManager("root.data", engine);
+        sessionManager.setTransactionStoreManager(storeManager);
+        return sessionManager;
+    }
+
+    private void publishMultiStatusContinuation(
+            SessionCondition condition,
+            Map<GlobalStatus, byte[]> cursors,
+            SessionCondition.ScanContinuation continuation) {
+        condition.setNextStatusScanCursors(cursors, continuation);
+    }
+
+    private void assertStatusCursorsEqual(Map<GlobalStatus, byte[]> expected, Map<GlobalStatus, byte[]> actual) {
+        Assertions.assertEquals(expected.keySet(), actual.keySet());
+        expected.forEach((status, cursor) -> Assertions.assertArrayEquals(cursor, actual.get(status)));
+    }
+
+    private void assertScanStats(
+            SessionScanStats stats,
+            long rowsScanned,
+            long rowsReturned,
+            long pointReads,
+            long sessionsReturned,
+            long elapsedMillis,
+            boolean limitReached) {
+        Assertions.assertEquals(rowsScanned, stats.getRowsScanned());
+        Assertions.assertEquals(rowsReturned, stats.getRowsReturned());
+        Assertions.assertEquals(pointReads, stats.getPointReads());
+        Assertions.assertEquals(sessionsReturned, stats.getSessionsReturned());
+        Assertions.assertEquals(elapsedMillis, stats.getElapsedMillis());
+        Assertions.assertEquals(limitReached, stats.isLimitReached());
+    }
+
     private GlobalSession globalSession(String name, GlobalStatus status) {
         GlobalSession globalSession = new GlobalSession("app", "group", name, 60000);
         globalSession.setStatus(status);
@@ -433,6 +838,13 @@ class RocksDBSessionManagerTest {
         Assertions.assertEquals(xids.length, sessions.size());
         Set<String> actual = sessions.stream().map(GlobalSession::getXid).collect(Collectors.toSet());
         Assertions.assertEquals(new HashSet<>(Arrays.asList(xids)), actual);
+    }
+
+    private void assertEveryXidExactlyOnce(Collection<GlobalSession> sessions, Set<String> expectedXids) {
+        Map<String, Integer> xidCounts = new HashMap<>();
+        sessions.forEach(session -> xidCounts.merge(session.getXid(), 1, Integer::sum));
+        Assertions.assertEquals(expectedXids, xidCounts.keySet());
+        Assertions.assertTrue(xidCounts.values().stream().allMatch(count -> count == 1));
     }
 
     private void installLockManager(LockManager lockManager) throws Exception {

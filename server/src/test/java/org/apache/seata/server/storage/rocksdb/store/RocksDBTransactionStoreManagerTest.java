@@ -864,6 +864,103 @@ class RocksDBTransactionStoreManagerTest {
     }
 
     @Test
+    void testUnboundedSingleStatusDeadlineStillPerformsOneScanPass() {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-single-status-expired-deadline-progress")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession session = globalSession("tx-single-expired-deadline", GlobalStatus.Begin);
+            session.setBeginTime(100L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, session);
+            SessionCondition condition = new DeadlineExpiringCondition(true, false, GlobalStatus.Begin);
+            condition.setLazyLoadBranch(true);
+
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(
+                    Collections.singletonList(session.getXid()),
+                    actual.stream().map(GlobalSession::getXid).collect(Collectors.toList()));
+            Assertions.assertEquals(SessionCondition.ScanContinuation.EXHAUSTED, condition.getStatusScanContinuation());
+            Assertions.assertTrue(condition.getScanStats().getRowsScanned() > 0);
+        }
+    }
+
+    @Test
+    void testUnboundedMultiStatusDeadlineStillAdvancesContinuation() {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "1");
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-multi-status-expired-deadline-progress")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committed = globalSession("tx-multi-expired-committed", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            GlobalSession rollbacked = globalSession("tx-multi-expired-rollbacked", GlobalStatus.Rollbacked);
+            rollbacked.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbacked);
+            SessionCondition condition =
+                    new DeadlineExpiringCondition(false, true, GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            condition.setLazyLoadBranch(true);
+
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(1, actual.size());
+            Assertions.assertEquals(committed.getXid(), actual.get(0).getXid());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.RESUMABLE, condition.getStatusScanContinuation());
+            Assertions.assertFalse(condition.getNextStatusScanCursors().isEmpty());
+        }
+    }
+
+    @Test
+    void testMultiStatusPublishesExplicitExhaustedAndResumableStates() {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "1");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-multi-status-continuation-state")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            SessionCondition exhausted = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+
+            Assertions.assertTrue(storeManager.readSession(exhausted).isEmpty());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.EXHAUSTED, exhausted.getStatusScanContinuation());
+
+            GlobalSession committed = globalSession("tx-continuation-state-committed", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            GlobalSession rollbacked = globalSession("tx-continuation-state-rollbacked", GlobalStatus.Rollbacked);
+            rollbacked.setBeginTime(200L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, rollbacked);
+            SessionCondition resumable = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            resumable.setLimit(1);
+
+            Assertions.assertEquals(1, storeManager.readSession(resumable).size());
+            Assertions.assertEquals(SessionCondition.ScanContinuation.RESUMABLE, resumable.getStatusScanContinuation());
+            Assertions.assertFalse(resumable.getNextStatusScanCursors().isEmpty());
+        }
+    }
+
+    @Test
+    void testDataBearingFinalMultiStatusPagePublishesEmptyExhaustedCursors() {
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "1");
+        environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "60000");
+        ConfigurationCache.clear();
+        try (RocksDBStoreEngine engine = open("condition-multi-status-data-bearing-exhaustion")) {
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession committed = globalSession("tx-data-bearing-exhausted", GlobalStatus.Committed);
+            committed.setBeginTime(100L);
+            storeManager.writeSession(LogOperation.GLOBAL_ADD, committed);
+            SessionCondition condition = new SessionCondition(GlobalStatus.Committed, GlobalStatus.Rollbacked);
+            condition.setLazyLoadBranch(true);
+
+            List<GlobalSession> actual = storeManager.readSession(condition);
+
+            Assertions.assertEquals(
+                    Collections.singletonList(committed.getXid()),
+                    actual.stream().map(GlobalSession::getXid).collect(Collectors.toList()));
+            Assertions.assertEquals(SessionCondition.ScanContinuation.EXHAUSTED, condition.getStatusScanContinuation());
+            Assertions.assertTrue(condition.getNextStatusScanCursors().isEmpty());
+        }
+    }
+
+    @Test
     void testRecoveryPagesContinueAfterDeadlineUntilExhaustedWithoutDuplicates() throws Exception {
         environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_MULTI_STATUS_SCAN_PAGE_SIZE, "3");
         environment.withProperty("seata." + ConfigurationKeys.STORE_FILE_ROCKSDB_FULL_SCAN_DEADLINE_MILLIS, "1");
@@ -1156,10 +1253,13 @@ class RocksDBTransactionStoreManagerTest {
                 condition.setStatusScanCursors(cursors);
                 List<GlobalSession> actual = storeManager.readSession(condition);
                 cursors = condition.getNextStatusScanCursors();
-                if (actual.isEmpty()) {
+                if (condition.getStatusScanContinuation() == SessionCondition.ScanContinuation.EXHAUSTED) {
                     exhausted = true;
+                    actual.forEach(session -> seenXids.add(session.getXid()));
                     break;
                 }
+                Assertions.assertEquals(
+                        SessionCondition.ScanContinuation.RESUMABLE, condition.getStatusScanContinuation());
                 seenXids.add(actual.get(0).getXid());
             }
 
@@ -1423,6 +1523,44 @@ class RocksDBTransactionStoreManagerTest {
                 GlobalStatus status, long minBeginTimeInclusive, long maxBeginTimeInclusive, byte[] cursor, int limit) {
             pagedStatusScanCalls++;
             return super.scanXidsByStatus(status, minBeginTimeInclusive, maxBeginTimeInclusive, cursor, limit);
+        }
+    }
+
+    private static final class DeadlineExpiringCondition extends SessionCondition {
+        private boolean expireOnStatusCursorRead;
+        private boolean expireOnStatusCursorMapRead;
+
+        private DeadlineExpiringCondition(
+                boolean expireOnStatusCursorRead, boolean expireOnStatusCursorMapRead, GlobalStatus... statuses) {
+            super(statuses);
+            this.expireOnStatusCursorRead = expireOnStatusCursorRead;
+            this.expireOnStatusCursorMapRead = expireOnStatusCursorMapRead;
+        }
+
+        @Override
+        public byte[] getStatusScanCursor() {
+            if (expireOnStatusCursorRead) {
+                expireOnStatusCursorRead = false;
+                waitPastConfiguredDeadline();
+            }
+            return super.getStatusScanCursor();
+        }
+
+        @Override
+        public Map<GlobalStatus, byte[]> getStatusScanCursors() {
+            if (expireOnStatusCursorMapRead) {
+                expireOnStatusCursorMapRead = false;
+                waitPastConfiguredDeadline();
+            }
+            return super.getStatusScanCursors();
+        }
+
+        private void waitPastConfiguredDeadline() {
+            long startedAt = System.nanoTime();
+            long elapsed;
+            do {
+                elapsed = System.nanoTime() - startedAt;
+            } while (elapsed < TimeUnit.MILLISECONDS.toNanos(5));
         }
     }
 

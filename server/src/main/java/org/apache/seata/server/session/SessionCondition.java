@@ -221,11 +221,22 @@ public class SessionCondition {
     }
 
     public void setNextStatusScanCursors(Map<GlobalStatus, byte[]> nextStatusScanCursors) {
+        setNextStatusScanCursors(
+                nextStatusScanCursors,
+                nextStatusScanCursors == null || nextStatusScanCursors.isEmpty()
+                        ? ScanContinuation.EXHAUSTED
+                        : ScanContinuation.RESUMABLE);
+    }
+
+    public void setNextStatusScanCursors(
+            Map<GlobalStatus, byte[]> nextStatusScanCursors, ScanContinuation statusScanContinuation) {
         this.nextStatusScanCursors = copyStatusScanCursors(nextStatusScanCursors);
+        this.statusScanContinuation = statusScanContinuation;
     }
 
     public void clearNextStatusScanCursors() {
         nextStatusScanCursors = Collections.emptyMap();
+        statusScanContinuation = ScanContinuation.UNSET;
     }
 
     public Long getMaxTimeoutDeadlineMillis() {

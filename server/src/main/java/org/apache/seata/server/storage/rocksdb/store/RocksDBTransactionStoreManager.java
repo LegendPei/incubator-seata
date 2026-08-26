@@ -466,6 +466,12 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
                         status,
                         xid -> appendMatchingSession(sessionCondition, seenXids, result, xid, status, null, scanStats));
             }
+            if (sessionCondition.getStatuses().length > 1) {
+                sessionCondition.setNextStatusScanCursors(
+                        Collections.emptyMap(), SessionCondition.ScanContinuation.EXHAUSTED);
+            } else {
+                sessionCondition.setNextStatusScanCursor(null);
+            }
             sessionCondition.setScanStats(scanStats.toStats(result.size()));
             return result;
         }
@@ -477,26 +483,38 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         boolean deadlineReached = false;
         if (sessionCondition.getStatuses().length > 1) {
             MultiStatusScanResult merged = readByStatusesWithKWayMerge(
-                    sessionCondition, maxBeginTime, limit, scanBudget, deadlineNanos, scanStats);
+                    sessionCondition,
+                    maxBeginTime,
+                    limit,
+                    scanBudget,
+                    deadlineNanos,
+                    scanStats,
+                    (limit == null || limit <= 0) && !scanBudget.isBounded());
             if (merged.isDeadlineReached()) {
                 logStatusScanDeadline(sessionCondition, merged.getSessions().size());
             }
-            sessionCondition.setNextStatusScanCursors(merged.getNextStatusScanCursors());
+            sessionCondition.setNextStatusScanCursors(
+                    merged.getNextStatusScanCursors(),
+                    merged.isFullyExhausted()
+                            ? SessionCondition.ScanContinuation.EXHAUSTED
+                            : SessionCondition.ScanContinuation.RESUMABLE);
             sessionCondition.setScanStats(scanStats.toStats(merged.getSessions().size()));
             return merged.getSessions();
         }
+        boolean scannedPage = false;
         for (GlobalStatus status : sessionCondition.getStatuses()) {
             byte[] cursor = sessionCondition.getStatusScanCursor();
             do {
                 if (scanBudget.isExhausted()) {
                     break;
                 }
-                if (deadlineNanos > 0 && System.nanoTime() >= deadlineNanos) {
+                if (scannedPage && deadlineNanos > 0 && System.nanoTime() >= deadlineNanos) {
                     deadlineReached = true;
                     break;
                 }
                 RocksDBIndexManager.StatusScanResult scanResult = indexManager.scanXidsByStatus(
                         status, 0L, effectiveMaxBeginTime, cursor, scanBudget.clamp(nextPageLimit(limit, result)));
+                scannedPage = true;
                 scanBudget.record(scanResult.getRowsScanned());
                 scanStats.record(scanResult);
                 appendMatchingSessionsBatch(sessionCondition, seenXids, result, scanResult.getEntries(), scanStats);
@@ -599,7 +617,7 @@ public class RocksDBTransactionStoreManager extends AbstractTransactionStoreMana
         boolean fullyExhausted = passMayBeComplete
                 && !cursors.isEmpty()
                 && cursors.stream().allMatch(StatusScanCursor::isFullyExhausted);
-        if (fullyExhausted && sessions.isEmpty()) {
+        if (fullyExhausted) {
             return new MultiStatusScanResult(sessions, Collections.emptyMap(), deadlineReached, true);
         }
         Map<GlobalStatus, byte[]> nextCursors = new EnumMap<>(GlobalStatus.class);
