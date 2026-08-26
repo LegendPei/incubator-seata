@@ -46,6 +46,17 @@ public class FileSessionLogReplayer {
         return Files.isRegularFile(migrationMarkerPath(currentLogPath));
     }
 
+    /**
+     * Refuses to start the legacy file store after its logs have been migrated to RocksDB.
+     */
+    public void ensureLegacyFileModeAllowed(Path currentLogPath) {
+        if (hasMigrationMarker(currentLogPath)) {
+            throw new StoreException("legacy file session logs cannot be opened after one-way RocksDB migration. "
+                    + "Restore the pre-migration checkpoint or use the verified export recovery path, file:"
+                    + currentLogPath);
+        }
+    }
+
     public void markMigrated(Path currentLogPath) {
         Path markerPath = migrationMarkerPath(currentLogPath);
         try {

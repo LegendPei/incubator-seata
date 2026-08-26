@@ -60,6 +60,8 @@ import static org.mockito.Mockito.spy;
 
 class RocksDBMigrationServiceTest {
 
+    private static final String REMOVED_XID_METADATA_PREFIX = "migration_removed_xid:";
+
     @TempDir
     Path tempDir;
 
@@ -191,16 +193,163 @@ class RocksDBMigrationServiceTest {
     }
 
     @Test
-    void testDoesNotMarkMigrationWhenFlushBarrierFails() throws Exception {
+    void testLegacyFileModeRejectsMigratedMarkerWithRecoveryGuidance() {
         Path fileLog = tempDir.resolve("file").resolve("root.data");
-        appendLog(fileLog, globalSession("tx-active", GlobalStatus.Begin), LogOperation.GLOBAL_ADD);
+        FileSessionLogReplayer replayer = new FileSessionLogReplayer();
+        replayer.markMigrated(fileLog);
+
+        StoreException exception =
+                Assertions.assertThrows(StoreException.class, () -> replayer.ensureLegacyFileModeAllowed(fileLog));
+
+        Assertions.assertTrue(exception.getMessage().contains("one-way"));
+        Assertions.assertTrue(exception.getMessage().contains("checkpoint"));
+        Assertions.assertTrue(exception.getMessage().contains("export"));
+    }
+
+    @Test
+    void testMigrationReplaysCurrentStateWithoutRevivingRemovedTransactions() throws Exception {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        GlobalSession active = globalSession("tx-active-ordered", GlobalStatus.Begin);
+        BranchSession activeBranch = branchSession(active, 1L);
+        GlobalSession removed = globalSession("tx-removed", GlobalStatus.Begin);
+        BranchSession removedBranch = branchSession(removed, 2L);
+        GlobalSession orphan = globalSession("tx-orphan", GlobalStatus.Begin);
+        BranchSession orphanBranch = branchSession(orphan, 3L);
+
+        appendLog(fileLog, activeBranch, LogOperation.BRANCH_ADD);
+        appendLog(fileLog, active, LogOperation.GLOBAL_ADD);
+        appendLog(fileLog, removed, LogOperation.GLOBAL_ADD);
+        appendLog(fileLog, removedBranch, LogOperation.BRANCH_ADD);
+        appendLog(fileLog, removed, LogOperation.GLOBAL_REMOVE);
+        appendLog(fileLog, removed, LogOperation.GLOBAL_UPDATE);
+        appendLog(fileLog, removedBranch, LogOperation.BRANCH_UPDATE);
+        appendLog(fileLog, orphanBranch, LogOperation.BRANCH_ADD);
+        for (int i = 0; i < 2048; i++) {
+            GlobalSession historical = globalSession("tx-history-" + i, GlobalStatus.Begin);
+            appendLog(fileLog, historical, LogOperation.GLOBAL_ADD);
+            appendLog(fileLog, historical, LogOperation.GLOBAL_REMOVE);
+        }
+
+        try (RocksDBStoreEngine engine = open("rocksdb-streaming-replay")) {
+            Assertions.assertTrue(new RocksDBMigrationService().migrate(fileLog, engine));
+
+            RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(engine);
+            GlobalSession actual = storeManager.readSession(active.getXid(), true);
+            Assertions.assertNotNull(actual);
+            Assertions.assertEquals(
+                    activeBranch.getBranchId(),
+                    actual.getBranchSessions().get(0).getBranchId());
+            Assertions.assertNull(storeManager.readSession(removed.getXid(), true));
+            Assertions.assertNull(storeManager.readSession(orphan.getXid(), true));
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(orphan.getXid())));
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.METADATA, REMOVED_XID_METADATA_PREFIX.getBytes(StandardCharsets.UTF_8)));
+        }
+    }
+
+    @Test
+    void testInterruptedMigrationClearsRemovedTransactionTombstonesBeforeReplay() throws Exception {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        GlobalSession active = globalSession("tx-replayed", GlobalStatus.Begin);
+        appendLog(fileLog, active, LogOperation.GLOBAL_ADD);
+
+        try (RocksDBStoreEngine engine = open("rocksdb-replay-tombstone-cleanup")) {
+            engine.put(
+                    RocksDBColumnFamily.METADATA,
+                    (REMOVED_XID_METADATA_PREFIX + "interrupted").getBytes(StandardCharsets.UTF_8),
+                    new byte[] {1});
+            putMigrationStatus(engine, RocksDBMigrationService.MIGRATION_STATUS_IN_PROGRESS);
+
+            Assertions.assertTrue(new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.METADATA, REMOVED_XID_METADATA_PREFIX.getBytes(StandardCharsets.UTF_8)));
+        }
+    }
+
+    @Test
+    void testFlushFailureKeepsMigrationRetryableAndEventuallyGuardsLegacyMode() throws Exception {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        GlobalSession active = globalSession("tx-active", GlobalStatus.Begin);
+        appendLog(fileLog, active, LogOperation.GLOBAL_ADD);
 
         try (RocksDBStoreEngine engine = spy(open("rocksdb-flush-failure"))) {
-            doThrow(new StoreException("flush failed")).when(engine).flush();
+            doThrow(new StoreException("flush failed"))
+                    .doCallRealMethod()
+                    .when(engine)
+                    .flush();
+            RocksDBMigrationService migrationService = new RocksDBMigrationService();
 
-            Assertions.assertThrows(StoreException.class, () -> new RocksDBMigrationService().migrate(fileLog, engine));
+            Assertions.assertThrows(StoreException.class, () -> migrationService.migrate(fileLog, engine));
 
+            Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_IN_PROGRESS, getMigrationStatus(engine));
             Assertions.assertFalse(Files.exists(migrationMarker(fileLog)));
+
+            Assertions.assertTrue(migrationService.migrate(fileLog, engine));
+            Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_COMPLETED, getMigrationStatus(engine));
+            Assertions.assertNotNull(new RocksDBTransactionStoreManager(engine).readSession(active.getXid(), true));
+            Assertions.assertThrows(
+                    StoreException.class, () -> new FileSessionLogReplayer().ensureLegacyFileModeAllowed(fileLog));
+        }
+    }
+
+    @Test
+    void testCompletedStatusWithoutMarkerRepairsOneWayGuard() {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+
+        try (RocksDBStoreEngine engine = open("rocksdb-completed-without-marker")) {
+            putMigrationStatus(engine, RocksDBMigrationService.MIGRATION_STATUS_COMPLETED);
+
+            Assertions.assertFalse(new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertTrue(Files.isRegularFile(migrationMarker(fileLog)));
+            Assertions.assertThrows(
+                    StoreException.class, () -> new FileSessionLogReplayer().ensureLegacyFileModeAllowed(fileLog));
+        }
+    }
+
+    @Test
+    void testMarkerWithInProgressStatusFinishesWithoutSourceWhileLegacyModeIsRejected() {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        GlobalSession active = globalSession("tx-marker-before-completed", GlobalStatus.Begin);
+        FileSessionLogReplayer replayer = new FileSessionLogReplayer();
+
+        try (RocksDBStoreEngine engine = open("rocksdb-marker-before-completed")) {
+            new RocksDBTransactionStoreManager(engine).writeSession(LogOperation.GLOBAL_ADD, active);
+            engine.flush();
+            putMigrationStatus(engine, RocksDBMigrationService.MIGRATION_STATUS_IN_PROGRESS);
+            replayer.markMigrated(fileLog);
+            Assertions.assertThrows(StoreException.class, () -> replayer.ensureLegacyFileModeAllowed(fileLog));
+
+            Assertions.assertDoesNotThrow(() -> new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertEquals(RocksDBMigrationService.MIGRATION_STATUS_COMPLETED, getMigrationStatus(engine));
+            Assertions.assertNotNull(new RocksDBTransactionStoreManager(engine).readSession(active.getXid(), true));
+            Assertions.assertThrows(StoreException.class, () -> replayer.ensureLegacyFileModeAllowed(fileLog));
+        }
+    }
+
+    @Test
+    void testTerminalGlobalUpdatePreventsStaleGlobalAndBranchUpdatesFromRevivingTransaction() throws Exception {
+        Path fileLog = tempDir.resolve("file").resolve("root.data");
+        GlobalSession globalSession = globalSession("tx-terminal-update", GlobalStatus.Begin);
+        BranchSession staleBranch = branchSession(globalSession, 7L);
+        appendLog(fileLog, globalSession, LogOperation.GLOBAL_ADD);
+        globalSession.setStatus(GlobalStatus.Committed);
+        appendLog(fileLog, globalSession, LogOperation.GLOBAL_UPDATE);
+        globalSession.setStatus(GlobalStatus.Begin);
+        appendLog(fileLog, globalSession, LogOperation.GLOBAL_UPDATE);
+        appendLog(fileLog, staleBranch, LogOperation.BRANCH_UPDATE);
+
+        try (RocksDBStoreEngine engine = open("rocksdb-terminal-update-tombstone")) {
+            Assertions.assertTrue(new RocksDBMigrationService().migrate(fileLog, engine));
+
+            Assertions.assertNull(new RocksDBTransactionStoreManager(engine).readSession(globalSession.getXid(), true));
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.BRANCH_SESSION, RocksDBKeyCodec.encodeXidPrefix(globalSession.getXid())));
+            Assertions.assertFalse(engine.prefixExists(
+                    RocksDBColumnFamily.METADATA, REMOVED_XID_METADATA_PREFIX.getBytes(StandardCharsets.UTF_8)));
         }
     }
 

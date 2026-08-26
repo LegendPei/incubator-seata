@@ -24,21 +24,21 @@ import org.apache.seata.server.session.GlobalSession;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
 import org.apache.seata.server.storage.file.store.FileSessionLogReplayer;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
+import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.store.RocksDBTransactionStoreManager;
 import org.apache.seata.server.store.SessionStorable;
 import org.apache.seata.server.store.TransactionStoreManager.LogOperation;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.util.Collection;
+import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.util.List;
 
 /**
  * Migrates legacy file-mode session logs to RocksDB current-state storage.
@@ -48,6 +48,9 @@ public class RocksDBMigrationService {
     public static final String MIGRATION_STATUS_KEY = "migration_status";
     public static final String MIGRATION_STATUS_IN_PROGRESS = "in_progress";
     public static final String MIGRATION_STATUS_COMPLETED = "completed";
+
+    private static final String REMOVED_XID_METADATA_PREFIX = "migration_removed_xid:";
+    private static final int CLEANUP_BATCH_SIZE = 1024;
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBMigrationService.class);
 
@@ -73,6 +76,16 @@ public class RocksDBMigrationService {
     public boolean migrate(Path fileSessionLogPath, RocksDBStoreEngine storeEngine) {
         String migrationStatus = getMetadata(storeEngine, MIGRATION_STATUS_KEY);
         if (MIGRATION_STATUS_COMPLETED.equals(migrationStatus)) {
+            if (!fileSessionLogReplayer.hasMigrationMarker(fileSessionLogPath)) {
+                storeEngine.flush();
+                fileSessionLogReplayer.markMigrated(fileSessionLogPath);
+                putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
+            }
+            return false;
+        }
+        if (MIGRATION_STATUS_IN_PROGRESS.equals(migrationStatus)
+                && fileSessionLogReplayer.hasMigrationMarker(fileSessionLogPath)) {
+            putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
             return false;
         }
         if (StringUtils.isBlank(migrationStatus) && fileSessionLogReplayer.hasMigrationMarker(fileSessionLogPath)) {
@@ -98,140 +111,103 @@ public class RocksDBMigrationService {
 
         putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_IN_PROGRESS);
         clearCurrentState(storeEngine);
+        clearRemovedXidTombstones(storeEngine);
 
-        MigrationState migrationState = new MigrationState();
-        int replayed =
-                fileSessionLogReplayer.replay(fileSessionLogPath, writeStore -> apply(writeStore, migrationState));
-        writeCurrentState(storeEngine, migrationState.globalSessions.values());
-        putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
+        RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(storeEngine);
+        int replayed = fileSessionLogReplayer.replay(
+                fileSessionLogPath, writeStore -> apply(writeStore, storeEngine, storeManager));
+        cleanupOrphanBranches(storeEngine);
+        clearRemovedXidTombstones(storeEngine);
         storeEngine.flush();
         fileSessionLogReplayer.markMigrated(fileSessionLogPath);
+        putMetadata(storeEngine, MIGRATION_STATUS_KEY, MIGRATION_STATUS_COMPLETED);
 
-        LOGGER.info(
-                "Migrated file session logs to RocksDB, file:{}, records:{}, globalSessions:{}",
-                fileSessionLogPath,
-                replayed,
-                migrationState.globalSessions.size());
+        LOGGER.info("Migrated file session logs to RocksDB, file:{}, records:{}", fileSessionLogPath, replayed);
         return true;
     }
 
-    private void apply(TransactionWriteStore writeStore, MigrationState migrationState) {
+    private void apply(
+            TransactionWriteStore writeStore,
+            RocksDBStoreEngine storeEngine,
+            RocksDBTransactionStoreManager storeManager) {
         LogOperation logOperation = writeStore.getOperate();
         SessionStorable sessionStorable = writeStore.getSessionRequest();
         switch (logOperation) {
             case GLOBAL_ADD:
             case GLOBAL_UPDATE:
-                applyGlobalUpdate((GlobalSession) sessionStorable, migrationState);
+                applyGlobalUpdate((GlobalSession) sessionStorable, storeEngine, storeManager);
                 break;
             case GLOBAL_REMOVE:
-                applyGlobalRemove((GlobalSession) sessionStorable, migrationState);
+                applyGlobalRemove((GlobalSession) sessionStorable, storeEngine, storeManager);
                 break;
             case BRANCH_ADD:
             case BRANCH_UPDATE:
-                applyBranchUpdate((BranchSession) sessionStorable, migrationState);
+                applyBranchUpdate((BranchSession) sessionStorable, storeEngine, storeManager, logOperation);
                 break;
             case BRANCH_REMOVE:
-                applyBranchRemove((BranchSession) sessionStorable, migrationState);
+                applyBranchRemove((BranchSession) sessionStorable, storeEngine, storeManager);
                 break;
             default:
                 throw new StoreException("Unknown LogOperation:" + logOperation);
         }
     }
 
-    private void applyGlobalUpdate(GlobalSession globalSession, MigrationState migrationState) {
+    private void applyGlobalUpdate(
+            GlobalSession globalSession, RocksDBStoreEngine storeEngine, RocksDBTransactionStoreManager storeManager) {
         if (!validTransactionId(globalSession.getTransactionId(), globalSession.getXid(), "globalSession")) {
             return;
         }
-        String xid = globalSession.getXid();
-        if (migrationState.removedGlobals.contains(xid)) {
-            return;
-        }
-        GlobalSession existing = migrationState.globalSessions.get(xid);
-        if (existing == null) {
-            if (shouldKeep(globalSession)) {
-                migrationState.globalSessions.put(xid, globalSession);
-                attachUnhandledBranches(globalSession, migrationState);
-            } else {
-                removeGlobalState(xid, migrationState);
-            }
+        if (isRemovedGlobal(storeEngine, globalSession.getXid())) {
             return;
         }
         if (shouldKeep(globalSession)) {
-            existing.setStatus(globalSession.getStatus());
+            storeManager.writeSession(LogOperation.GLOBAL_UPDATE, globalSession);
         } else {
-            removeGlobalState(xid, migrationState);
+            removeGlobalAndWriteTombstone(globalSession, storeEngine, storeManager);
         }
     }
 
-    private void applyGlobalRemove(GlobalSession globalSession, MigrationState migrationState) {
+    private void applyGlobalRemove(
+            GlobalSession globalSession, RocksDBStoreEngine storeEngine, RocksDBTransactionStoreManager storeManager) {
         if (!validTransactionId(globalSession.getTransactionId(), globalSession.getXid(), "globalSession")) {
             return;
         }
-        removeGlobalState(globalSession.getXid(), migrationState);
+        removeGlobalAndWriteTombstone(globalSession, storeEngine, storeManager);
     }
 
-    private void applyBranchUpdate(BranchSession branchSession, MigrationState migrationState) {
+    private void removeGlobalAndWriteTombstone(
+            GlobalSession globalSession, RocksDBStoreEngine storeEngine, RocksDBTransactionStoreManager storeManager) {
+        storeManager.writeSession(LogOperation.GLOBAL_REMOVE, globalSession);
+        storeEngine.put(RocksDBColumnFamily.METADATA, removedGlobalMetadataKey(globalSession.getXid()), new byte[] {1});
+    }
+
+    private void applyBranchUpdate(
+            BranchSession branchSession,
+            RocksDBStoreEngine storeEngine,
+            RocksDBTransactionStoreManager storeManager,
+            LogOperation logOperation) {
         if (!validTransactionId(branchSession.getTransactionId(), branchSession.getXid(), "branchSession")) {
             return;
         }
-        String xid = branchSession.getXid();
-        if (migrationState.removedGlobals.contains(xid)) {
+        if (isRemovedGlobal(storeEngine, branchSession.getXid())) {
             return;
         }
-        GlobalSession globalSession = migrationState.globalSessions.get(xid);
-        if (globalSession == null) {
-            migrationState
-                    .unhandledBranches
-                    .computeIfAbsent(xid, key -> new HashMap<>())
-                    .put(branchSession.getBranchId(), branchSession);
-            return;
-        }
-        addOrUpdateBranch(globalSession, branchSession);
+        storeManager.writeSession(logOperation, branchSession);
     }
 
-    private void applyBranchRemove(BranchSession branchSession, MigrationState migrationState) {
+    private void applyBranchRemove(
+            BranchSession branchSession, RocksDBStoreEngine storeEngine, RocksDBTransactionStoreManager storeManager) {
         if (!validTransactionId(branchSession.getTransactionId(), branchSession.getXid(), "branchSession")) {
             return;
         }
-        String xid = branchSession.getXid();
-        if (migrationState.removedGlobals.contains(xid)) {
+        if (isRemovedGlobal(storeEngine, branchSession.getXid())) {
             return;
         }
-        Map<Long, BranchSession> bufferedBranches = migrationState.unhandledBranches.get(xid);
-        if (bufferedBranches != null) {
-            bufferedBranches.remove(branchSession.getBranchId());
-        }
-        GlobalSession globalSession = migrationState.globalSessions.get(xid);
-        if (globalSession == null) {
-            return;
-        }
-        BranchSession existing = globalSession.getBranch(branchSession.getBranchId());
-        if (existing != null) {
-            globalSession.remove(existing);
-        }
+        storeManager.writeSession(LogOperation.BRANCH_REMOVE, branchSession);
     }
 
-    private void attachUnhandledBranches(GlobalSession globalSession, MigrationState migrationState) {
-        Map<Long, BranchSession> branches = migrationState.unhandledBranches.remove(globalSession.getXid());
-        if (branches == null) {
-            return;
-        }
-        branches.values().forEach(branchSession -> addOrUpdateBranch(globalSession, branchSession));
-    }
-
-    private void addOrUpdateBranch(GlobalSession globalSession, BranchSession branchSession) {
-        BranchSession existing = globalSession.getBranch(branchSession.getBranchId());
-        if (existing == null) {
-            globalSession.add(branchSession);
-        } else {
-            existing.setStatus(branchSession.getStatus());
-        }
-    }
-
-    private void removeGlobalState(String xid, MigrationState migrationState) {
-        migrationState.globalSessions.remove(xid);
-        migrationState.unhandledBranches.remove(xid);
-        migrationState.removedGlobals.add(xid);
+    private boolean isRemovedGlobal(RocksDBStoreEngine storeEngine, String xid) {
+        return storeEngine.get(RocksDBColumnFamily.METADATA, removedGlobalMetadataKey(xid)) != null;
     }
 
     private boolean shouldKeep(GlobalSession globalSession) {
@@ -260,16 +236,6 @@ public class RocksDBMigrationService {
         return false;
     }
 
-    private void writeCurrentState(RocksDBStoreEngine storeEngine, Collection<GlobalSession> globalSessions) {
-        RocksDBTransactionStoreManager storeManager = new RocksDBTransactionStoreManager(storeEngine);
-        for (GlobalSession globalSession : globalSessions) {
-            storeManager.writeSession(LogOperation.GLOBAL_ADD, globalSession);
-            globalSession
-                    .getSortedBranches()
-                    .forEach(branchSession -> storeManager.writeSession(LogOperation.BRANCH_ADD, branchSession));
-        }
-    }
-
     private boolean hasCurrentState(RocksDBStoreEngine storeEngine) {
         return CURRENT_STATE_COLUMN_FAMILIES.stream()
                 .anyMatch(columnFamily -> storeEngine.prefixExists(columnFamily, new byte[0]));
@@ -277,6 +243,92 @@ public class RocksDBMigrationService {
 
     private void clearCurrentState(RocksDBStoreEngine storeEngine) {
         CURRENT_STATE_COLUMN_FAMILIES.forEach(columnFamily -> storeEngine.deleteByPrefix(columnFamily, new byte[0]));
+    }
+
+    private void cleanupOrphanBranches(RocksDBStoreEngine storeEngine) {
+        byte[] branchPrefix = new byte[0];
+        byte[] seekKey = branchPrefix;
+        while (true) {
+            List<RocksDBStoreEngine.RocksDBEntry> branches = new ArrayList<>(CLEANUP_BATCH_SIZE);
+            storeEngine.scanByPrefix(
+                    RocksDBColumnFamily.BRANCH_SESSION,
+                    seekKey,
+                    branchPrefix,
+                    CLEANUP_BATCH_SIZE,
+                    null,
+                    (key, value) -> branches.add(new RocksDBStoreEngine.RocksDBEntry(key, value)));
+            if (branches.isEmpty()) {
+                return;
+            }
+            deleteOrphanBranches(storeEngine, branches);
+            if (branches.size() < CLEANUP_BATCH_SIZE) {
+                return;
+            }
+            seekKey = nextKey(branches.get(branches.size() - 1).getKey());
+        }
+    }
+
+    private void deleteOrphanBranches(RocksDBStoreEngine storeEngine, List<RocksDBStoreEngine.RocksDBEntry> branches) {
+        try (WriteBatch batch = new WriteBatch()) {
+            boolean hasOrphans = false;
+            for (RocksDBStoreEngine.RocksDBEntry branch : branches) {
+                String xid = RocksDBKeyCodec.extractXidFromBranchKey(branch.getKey());
+                if (xid == null
+                        || storeEngine.get(RocksDBColumnFamily.GLOBAL_SESSION, RocksDBKeyCodec.encodeXid(xid))
+                                == null) {
+                    storeEngine.delete(batch, RocksDBColumnFamily.BRANCH_SESSION, branch.getKey());
+                    hasOrphans = true;
+                }
+            }
+            if (hasOrphans) {
+                storeEngine.write(batch);
+            }
+        } catch (RocksDBException e) {
+            throw new StoreException(e, "remove orphan branch sessions after migration failed");
+        }
+    }
+
+    private void clearRemovedXidTombstones(RocksDBStoreEngine storeEngine) {
+        deleteMetadataByPrefix(storeEngine, REMOVED_XID_METADATA_PREFIX.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void deleteMetadataByPrefix(RocksDBStoreEngine storeEngine, byte[] prefix) {
+        byte[] seekKey = prefix;
+        while (true) {
+            List<byte[]> keys = new ArrayList<>(CLEANUP_BATCH_SIZE);
+            storeEngine.scanByPrefix(
+                    RocksDBColumnFamily.METADATA,
+                    seekKey,
+                    prefix,
+                    CLEANUP_BATCH_SIZE,
+                    null,
+                    (key, value) -> keys.add(key));
+            if (keys.isEmpty()) {
+                return;
+            }
+            try (WriteBatch batch = new WriteBatch()) {
+                for (byte[] key : keys) {
+                    storeEngine.delete(batch, RocksDBColumnFamily.METADATA, key);
+                }
+                storeEngine.write(batch);
+            } catch (RocksDBException e) {
+                throw new StoreException(e, "remove migration tombstones failed");
+            }
+            if (keys.size() < CLEANUP_BATCH_SIZE) {
+                return;
+            }
+            seekKey = nextKey(keys.get(keys.size() - 1));
+        }
+    }
+
+    private byte[] removedGlobalMetadataKey(String xid) {
+        return (REMOVED_XID_METADATA_PREFIX + xid).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] nextKey(byte[] key) {
+        byte[] next = new byte[key.length + 1];
+        System.arraycopy(key, 0, next, 0, key.length);
+        return next;
     }
 
     private String getMetadata(RocksDBStoreEngine storeEngine, String key) {
@@ -289,11 +341,5 @@ public class RocksDBMigrationService {
                 RocksDBColumnFamily.METADATA,
                 key.getBytes(StandardCharsets.UTF_8),
                 value.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static class MigrationState {
-        private final Map<String, GlobalSession> globalSessions = new HashMap<>();
-        private final Map<String, Map<Long, BranchSession>> unhandledBranches = new HashMap<>();
-        private final Set<String> removedGlobals = new HashSet<>();
     }
 }

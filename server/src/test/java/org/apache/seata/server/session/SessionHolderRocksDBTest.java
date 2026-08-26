@@ -31,6 +31,7 @@ import org.apache.seata.server.coordinator.DefaultCoordinator;
 import org.apache.seata.server.lock.LockManager;
 import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.storage.file.TransactionWriteStore;
+import org.apache.seata.server.storage.file.store.FileSessionLogReplayer;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
@@ -125,6 +126,23 @@ class SessionHolderRocksDBTest {
         GlobalSession actual = SessionHolder.getRootSessionManager().findGlobalSession(globalSession.getXid(), true);
         Assertions.assertNotNull(actual);
         Assertions.assertEquals(globalSession.getXid(), actual.getXid());
+    }
+
+    @Test
+    void testLegacyFileEngineRejectsMigratedLogBeforeCreatingSessionManager() {
+        configureRocksDBFileMode();
+        System.setProperty(ConfigurationKeys.STORE_FILE_ENGINE, "file");
+        Path fileLog = tempDir.resolve("file")
+                .resolve(String.valueOf(XID.getPort()))
+                .resolve(SessionHolder.ROOT_SESSION_MANAGER_NAME);
+        new FileSessionLogReplayer().markMigrated(fileLog);
+
+        StoreException exception =
+                Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+
+        Assertions.assertTrue(exception.getMessage().contains("one-way"));
+        Assertions.assertTrue(exception.getMessage().contains("checkpoint"));
+        Assertions.assertTrue(exception.getMessage().contains("export"));
     }
 
     @Test

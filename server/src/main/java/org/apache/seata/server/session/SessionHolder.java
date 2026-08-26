@@ -36,6 +36,7 @@ import org.apache.seata.server.cluster.raft.context.SeataClusterContext;
 import org.apache.seata.server.lock.LockManager;
 import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.lock.distributed.DistributedLockerFactory;
+import org.apache.seata.server.storage.file.store.FileSessionLogReplayer;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
 import org.apache.seata.server.storage.rocksdb.index.RocksDBIndexManager;
@@ -147,6 +148,10 @@ public class SessionHolder {
                                 + XID.getPort();
                 if (StringUtils.isBlank(sessionStorePath) || StringUtils.isBlank(vGroupMappingStorePath)) {
                     throw new StoreException("the {store.file.dir} is empty.");
+                }
+                if (FileStoreEngine.ROCKSDB != fileStoreEngine) {
+                    new FileSessionLogReplayer()
+                            .ensureLegacyFileModeAllowed(Paths.get(sessionStorePath, ROOT_SESSION_MANAGER_NAME));
                 }
                 ROOT_VGROUP_MAPPING_MANAGER = EnhancedServiceLoader.load(
                         VGroupMappingStoreManager.class,
