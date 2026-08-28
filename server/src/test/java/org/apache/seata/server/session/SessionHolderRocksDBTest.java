@@ -34,8 +34,10 @@ import org.apache.seata.server.storage.file.TransactionWriteStore;
 import org.apache.seata.server.storage.file.store.FileSessionLogReplayer;
 import org.apache.seata.server.storage.rocksdb.RocksDBColumnFamily;
 import org.apache.seata.server.storage.rocksdb.RocksDBKeyCodec;
+import org.apache.seata.server.storage.rocksdb.RocksDBStoreConfig;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngine;
 import org.apache.seata.server.storage.rocksdb.RocksDBStoreEngineFactory;
+import org.apache.seata.server.storage.rocksdb.lock.RocksDBOrphanLockCleanupController;
 import org.apache.seata.server.storage.rocksdb.migration.RocksDBMigrationService;
 import org.apache.seata.server.storage.rocksdb.session.RocksDBSessionManager;
 import org.apache.seata.server.store.SessionStorable;
@@ -205,6 +207,34 @@ class SessionHolderRocksDBTest {
     }
 
     @Test
+    void testRocksDBFileEngineReleasesResourcesWhenStartupRecoveryFails() throws Exception {
+        configurePagedRocksDBFileMode(1, 1);
+        RocksDBStoreEngine engine = RocksDBStoreEngineFactory.getInstance();
+        RocksDBSessionManager writer = new RocksDBSessionManager("failed-startup-writer", engine);
+        GlobalSession corrupt = globalSession(4101L);
+        writer.addGlobalSession(corrupt);
+        byte[] globalKey = RocksDBKeyCodec.encodeXid(corrupt.getXid());
+        byte[] validGlobalValue = engine.get(RocksDBColumnFamily.GLOBAL_SESSION, globalKey);
+        engine.put(RocksDBColumnFamily.GLOBAL_SESSION, globalKey, new byte[] {0});
+        markMigrationCompleted(engine);
+
+        Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+
+        Assertions.assertNull(SessionHolder.getRootSessionManager());
+        Assertions.assertNull(getRawVGroupMappingManager());
+        Assertions.assertNull(getRawLockManager());
+        Assertions.assertNull(getOrphanLockCleanupController());
+        try (RocksDBStoreEngine reopened = RocksDBStoreEngine.open(RocksDBStoreConfig.fromConfiguration())) {
+            reopened.put(RocksDBColumnFamily.GLOBAL_SESSION, globalKey, validGlobalValue);
+        }
+
+        SessionHolder.init(SessionMode.FILE);
+
+        Assertions.assertTrue(SessionHolder.getRootSessionManager() instanceof RocksDBSessionManager);
+        Assertions.assertNotNull(SessionHolder.getRootSessionManager().findGlobalSession(corrupt.getXid(), false));
+    }
+
+    @Test
     void testRocksDBFileEngineFailsWhenLaterPageTerminalReloadFails() throws Exception {
         DefaultCoordinator originalCoordinator = getDefaultCoordinator();
         try {
@@ -320,6 +350,24 @@ class SessionHolderRocksDBTest {
         Field field = DefaultCoordinator.class.getDeclaredField("instance");
         field.setAccessible(true);
         return (DefaultCoordinator) field.get(null);
+    }
+
+    private RocksDBOrphanLockCleanupController getOrphanLockCleanupController() throws Exception {
+        Field field = SessionHolder.class.getDeclaredField("ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER");
+        field.setAccessible(true);
+        return (RocksDBOrphanLockCleanupController) field.get(null);
+    }
+
+    private Object getRawVGroupMappingManager() throws Exception {
+        Field field = SessionHolder.class.getDeclaredField("ROOT_VGROUP_MAPPING_MANAGER");
+        field.setAccessible(true);
+        return field.get(null);
+    }
+
+    private LockManager getRawLockManager() throws Exception {
+        Field field = LockerManagerFactory.class.getDeclaredField("LOCK_MANAGER");
+        field.setAccessible(true);
+        return (LockManager) field.get(null);
     }
 
     private void markMigrationCompleted(RocksDBStoreEngine engine) {

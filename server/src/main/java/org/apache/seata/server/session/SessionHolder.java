@@ -159,17 +159,22 @@ public class SessionHolder {
                         new Object[] {vGroupMappingStorePath});
 
                 if (FileStoreEngine.ROCKSDB == fileStoreEngine) {
-                    RocksDBStoreEngine rocksDBStoreEngine = RocksDBStoreEngineFactory.getInstance();
-                    new RocksDBMigrationService()
-                            .migrate(Paths.get(sessionStorePath, ROOT_SESSION_MANAGER_NAME), rocksDBStoreEngine);
-                    new RocksDBIndexManager(rocksDBStoreEngine).ensureReady();
-                    ROOT_SESSION_MANAGER = EnhancedServiceLoader.load(
-                            SessionManager.class,
-                            FileStoreEngine.ROCKSDB.getName(),
-                            new Object[] {ROOT_SESSION_MANAGER_NAME});
-                    cleanRocksDBOrphanLocks();
-                    startRocksDBOrphanLockCleanup(rocksDBStoreEngine);
-                    reloadRocksDBSessions((RocksDBSessionManager) ROOT_SESSION_MANAGER, sessionMode);
+                    try {
+                        RocksDBStoreEngine rocksDBStoreEngine = RocksDBStoreEngineFactory.getInstance();
+                        new RocksDBMigrationService()
+                                .migrate(Paths.get(sessionStorePath, ROOT_SESSION_MANAGER_NAME), rocksDBStoreEngine);
+                        new RocksDBIndexManager(rocksDBStoreEngine).ensureReady();
+                        ROOT_SESSION_MANAGER = EnhancedServiceLoader.load(
+                                SessionManager.class,
+                                FileStoreEngine.ROCKSDB.getName(),
+                                new Object[] {ROOT_SESSION_MANAGER_NAME});
+                        cleanRocksDBOrphanLocks();
+                        startRocksDBOrphanLockCleanup(rocksDBStoreEngine);
+                        reloadRocksDBSessions((RocksDBSessionManager) ROOT_SESSION_MANAGER, sessionMode);
+                    } catch (RuntimeException | Error startupFailure) {
+                        rollbackFailedRocksDBInitialization(startupFailure);
+                        throw startupFailure;
+                    }
                 } else {
                     ROOT_SESSION_MANAGER =
                             EnhancedServiceLoader.load(SessionManager.class, SessionMode.FILE.getName(), new Object[] {
@@ -201,8 +206,38 @@ public class SessionHolder {
         }
         RocksDBOrphanLockCleanupController controller =
                 RocksDBOrphanLockCleanupController.create((RocksDBLockManager) lockManager, rocksDBStoreEngine);
-        controller.start();
         ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER = controller;
+        controller.start();
+    }
+
+    private static void rollbackFailedRocksDBInitialization(Throwable startupFailure) {
+        RocksDBOrphanLockCleanupController cleanupController = ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER;
+        ROCKSDB_ORPHAN_LOCK_CLEANUP_CONTROLLER = null;
+        if (cleanupController != null) {
+            cleanupAfterFailedRocksDBInitialization(startupFailure, cleanupController::close);
+        }
+
+        cleanupAfterFailedRocksDBInitialization(startupFailure, () -> {
+            LockerManagerFactory.destroy();
+            EnhancedServiceLoader.unload(LockManager.class);
+        });
+
+        SessionManager sessionManager = ROOT_SESSION_MANAGER;
+        ROOT_SESSION_MANAGER = null;
+        if (sessionManager != null) {
+            cleanupAfterFailedRocksDBInitialization(startupFailure, sessionManager::destroy);
+        }
+
+        ROOT_VGROUP_MAPPING_MANAGER = null;
+        cleanupAfterFailedRocksDBInitialization(startupFailure, RocksDBStoreEngineFactory::destroy);
+    }
+
+    private static void cleanupAfterFailedRocksDBInitialization(Throwable startupFailure, Runnable cleanup) {
+        try {
+            cleanup.run();
+        } catch (RuntimeException | Error cleanupFailure) {
+            startupFailure.addSuppressed(cleanupFailure);
+        }
     }
 
     private static void cleanRocksDBOrphanLocks() {
