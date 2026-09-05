@@ -123,7 +123,7 @@ class SessionHolderFileStoreRuntimeTest {
     void testRecoveryConsumerRemovesTerminalSession() throws Exception {
         FileSessionManager sessions = new FileSessionManager("root.data");
         GlobalSession terminal = new GlobalSession("app", "group", "transaction", 60000);
-        terminal.setStatus(GlobalStatus.CommitRetryTimeout);
+        terminal.setStatus(GlobalStatus.Finished);
         sessions.addGlobalSession(terminal);
         SessionHolderFaultFileStoreProvider.configure(
                 FailurePoint.NONE, null, null, sessions, Mockito.mock(FileLockStore.class));
@@ -143,7 +143,7 @@ class SessionHolderFileStoreRuntimeTest {
             }
         };
         GlobalSession terminal = new GlobalSession("app", "group", "transaction", 60000);
-        terminal.setStatus(GlobalStatus.CommitRetryTimeout);
+        terminal.setStatus(GlobalStatus.Finished);
         sessions.addGlobalSession(terminal);
         SessionHolderFaultFileStoreProvider.configure(
                 FailurePoint.NONE, null, null, sessions, Mockito.mock(FileLockStore.class));

@@ -293,8 +293,6 @@ public class SessionHolder {
                     case CommitFailed:
                     case RollbackFailed:
                     case TimeoutRollbackFailed:
-                    case CommitRetryTimeout:
-                    case RollbackRetryTimeout:
                         removeInErrorState(globalSession, failFast);
                         break;
                     case AsyncCommitting:
