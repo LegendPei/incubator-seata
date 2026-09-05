@@ -16,7 +16,9 @@
  */
 package org.apache.seata.server.storage.file.spi;
 
+import org.apache.seata.common.exception.StoreException;
 import org.apache.seata.common.loader.LoadLevel;
+import org.apache.seata.core.exception.TransactionException;
 import org.apache.seata.server.session.SessionManager;
 
 @LoadLevel(name = "session-holder-fault")
@@ -91,6 +93,11 @@ public final class SessionHolderFaultFileStoreProvider implements FileStoreProvi
             public void recover(SessionRecoveryConsumer consumer) {
                 if (failurePoint == FailurePoint.RECOVERY) {
                     throw startupFailure;
+                }
+                try {
+                    consumer.accept(sessionManager.allSessions());
+                } catch (TransactionException e) {
+                    throw new StoreException(e, "recover test file store sessions failed");
                 }
             }
 

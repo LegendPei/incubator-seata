@@ -108,7 +108,10 @@ public class SessionHolder {
      * @param sessionMode the store mode: file, db, redis
      * @throws IOException the io exception
      */
-    public static void init(SessionMode sessionMode) {
+    public static synchronized void init(SessionMode sessionMode) {
+        if (FILE_STORE_RUNTIME != null) {
+            throw new StoreException("FileStoreRuntime is already initialized; destroy it before reinitializing");
+        }
         if (null == sessionMode) {
             sessionMode = StoreConfig.getSessionMode();
         }

@@ -37,6 +37,7 @@ import java.util.List;
 
 import static org.mockito.Mockito.*;
 
+@SuppressWarnings("checkstyle:AbstractClassName")
 public class AbstractServiceTest extends BaseSpringBootTest {
 
     private TestAbstractService service;

@@ -24,13 +24,18 @@ import org.apache.seata.common.loader.EnhancedServiceLoader;
 import org.apache.seata.common.store.LockMode;
 import org.apache.seata.common.store.SessionMode;
 import org.apache.seata.config.ConfigurationCache;
+import org.apache.seata.core.exception.TransactionException;
+import org.apache.seata.core.model.GlobalStatus;
 import org.apache.seata.server.lock.LockManager;
 import org.apache.seata.server.lock.LockerManagerFactory;
 import org.apache.seata.server.storage.file.FileStoreProviderFactory;
+import org.apache.seata.server.storage.file.session.FileSessionManager;
 import org.apache.seata.server.storage.file.spi.FileLockStore;
 import org.apache.seata.server.storage.file.spi.FileStoreProvider;
+import org.apache.seata.server.storage.file.spi.FileStoreRuntime;
 import org.apache.seata.server.storage.file.spi.SessionHolderFaultFileStoreProvider;
 import org.apache.seata.server.storage.file.spi.SessionHolderFaultFileStoreProvider.FailurePoint;
+import org.apache.seata.server.store.StoreConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -39,6 +44,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.lang.reflect.Field;
 import java.nio.file.Path;
@@ -50,9 +56,12 @@ class SessionHolderFileStoreRuntimeTest {
     Path tempDir;
 
     private Object originalEnvironment;
+    private LockMode originalLockMode;
 
     @BeforeEach
     void setUp() throws Exception {
+        originalLockMode = (LockMode) ReflectionTestUtils.getField(StoreConfig.class, "lockMode");
+        ReflectionTestUtils.setField(StoreConfig.class, "lockMode", null);
         originalEnvironment = ObjectHolder.INSTANCE.getObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT);
         ObjectHolder.INSTANCE.setObject(Constants.OBJECT_KEY_SPRING_CONFIGURABLE_ENVIRONMENT, new MockEnvironment());
         System.setProperty(
@@ -72,9 +81,79 @@ class SessionHolderFileStoreRuntimeTest {
         System.clearProperty(ConfigurationKeys.STORE_FILE_DIR);
         System.clearProperty(ConfigurationKeys.STORE_FILE_ENGINE);
         System.clearProperty(ConfigurationKeys.STORE_LOCK_MODE);
+        ReflectionTestUtils.setField(StoreConfig.class, "lockMode", originalLockMode);
         ConfigurationCache.clear();
         clearProviderCaches();
         restoreEnvironment();
+    }
+
+    @Test
+    void testRepeatedInitializationPreservesRunningRuntimeAndItsResources() throws Exception {
+        FileSessionManager sessions = new FileSessionManager("root.data");
+        SessionHolderFaultFileStoreProvider.configure(
+                FailurePoint.NONE, null, null, sessions, Mockito.mock(FileLockStore.class));
+        SessionHolder.init(SessionMode.FILE);
+        FileStoreRuntime runtime = (FileStoreRuntime) rawField("FILE_STORE_RUNTIME");
+        LockManager lockManager = LockerManagerFactory.getLockManager();
+        Object mappingManager = rawField("ROOT_VGROUP_MAPPING_MANAGER");
+        Object distributedLocker = rawField("DISTRIBUTED_LOCKER");
+        GlobalSession session = new GlobalSession("app", "group", "transaction", 60000);
+        sessions.addGlobalSession(session);
+        try {
+            Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+
+            Assertions.assertAll(
+                    () -> Assertions.assertSame(runtime, rawField("FILE_STORE_RUNTIME")),
+                    () -> Assertions.assertSame(sessions, SessionHolder.getRootSessionManager()),
+                    () -> Assertions.assertSame(session, SessionHolder.findGlobalSession(session.getXid())),
+                    () -> Assertions.assertSame(lockManager, LockerManagerFactory.getLockManager()),
+                    () -> Assertions.assertSame(mappingManager, rawField("ROOT_VGROUP_MAPPING_MANAGER")),
+                    () -> Assertions.assertSame(distributedLocker, rawField("DISTRIBUTED_LOCKER")),
+                    () -> Assertions.assertEquals(0, SessionHolderFaultFileStoreProvider.closeCount()));
+
+            SessionHolder.destroy();
+            Assertions.assertEquals(1, SessionHolderFaultFileStoreProvider.closeCount());
+            assertFileModeReferencesCleared();
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
+    void testRecoveryConsumerRemovesTerminalSession() throws Exception {
+        FileSessionManager sessions = new FileSessionManager("root.data");
+        GlobalSession terminal = new GlobalSession("app", "group", "transaction", 60000);
+        terminal.setStatus(GlobalStatus.CommitRetryTimeout);
+        sessions.addGlobalSession(terminal);
+        SessionHolderFaultFileStoreProvider.configure(
+                FailurePoint.NONE, null, null, sessions, Mockito.mock(FileLockStore.class));
+
+        SessionHolder.init(SessionMode.FILE);
+
+        Assertions.assertNull(SessionHolder.findGlobalSession(terminal.getXid()));
+    }
+
+    @Test
+    void testRecoveryConsumerFailureRollsBackRuntime() throws Exception {
+        TransactionException recoveryFailure = new TransactionException("remove recovered session failed");
+        FileSessionManager sessions = new FileSessionManager("root.data") {
+            @Override
+            public void removeGlobalSession(GlobalSession session) throws TransactionException {
+                throw recoveryFailure;
+            }
+        };
+        GlobalSession terminal = new GlobalSession("app", "group", "transaction", 60000);
+        terminal.setStatus(GlobalStatus.CommitRetryTimeout);
+        sessions.addGlobalSession(terminal);
+        SessionHolderFaultFileStoreProvider.configure(
+                FailurePoint.NONE, null, null, sessions, Mockito.mock(FileLockStore.class));
+
+        StoreException thrown =
+                Assertions.assertThrows(StoreException.class, () -> SessionHolder.init(SessionMode.FILE));
+
+        Assertions.assertSame(recoveryFailure, thrown.getCause());
+        Assertions.assertEquals(1, SessionHolderFaultFileStoreProvider.closeCount());
+        assertFileModeReferencesCleared();
     }
 
     @Test
